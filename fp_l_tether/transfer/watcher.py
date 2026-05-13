@@ -1066,6 +1066,31 @@ class TetherDaemon:
                         self._resume_liveview()
                         time.sleep(poll_idle_s)
                         continue
+                    except ValueError as e:
+                        # PictFileInfo2 parse sanity check tripped — the
+                        # response from the camera didn't match the
+                        # expected single-file layout (e.g. DNG+JPG mode
+                        # returns a different struct). The bridge has
+                        # NOT initiated a GetBigPartialPictFile, so the
+                        # bulk endpoint is intact. Log, advance past
+                        # this slot, re-arm LV, and continue — the user
+                        # can switch back to JPG or DNG-only.
+                        self.log.error(
+                            "download_parse_failed",
+                            error=str(e),
+                            slot=self._next_slot,
+                            image_id=status.image_id,
+                            db_head=status.image_db_head,
+                            db_tail=status.image_db_tail,
+                        )
+                        self._emit_status(
+                            "error",
+                            f"画像情報の解析失敗 (DNG+JPG layout?): {e}",
+                        )
+                        self._next_slot = (self._next_slot + 1) & 0xFF
+                        self._resume_liveview()
+                        time.sleep(poll_idle_s)
+                        continue
                     # USBBridgeError propagates → reconnect
 
                     # NOTE: We deliberately do NOT resume LV here.

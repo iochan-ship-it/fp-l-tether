@@ -18,8 +18,21 @@ See ``DEFAULT_CHECKSUM_ALGORITHM`` below.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
+
+_logger = logging.getLogger(__name__)
+
+# Sanity ceiling for sigma_download — anything larger than this returned
+# by GetPictFileInfo2 is almost certainly a parser misalignment, not a
+# real file. The largest fp L raw is ~80 MB (DNG), so 200 MB gives
+# plenty of headroom while still catching the "1.9 GB garbage" failure
+# mode seen in the DNG+JPG dual-file test (2026-05-13).
+_MAX_REASONABLE_FILESIZE = 200 * 1024 * 1024
+
+# Known fp / fp L file extensions returned by GetPictFileInfo2.
+_KNOWN_FILE_EXTS = {"JPG", "JPEG", "DNG", "TIF", "TIFF", "MOV", "MP4"}
 
 # ---------------------------------------------------------------------------
 # USB identifiers
@@ -486,6 +499,52 @@ class SigmaFpPictFileInfo2Ex:
         if 0 < name_off < len(data):
             name_bytes = data[name_off : name_off + 9]
             name = name_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+
+        # -----------------------------------------------------------------
+        # Defensive sanity guards (added 2026-05-13 after DNG+JPG wedge):
+        #
+        # In DNG+JPG mode the response layout appears to differ from the
+        # documented 60-byte single-file format (possibly a leading
+        # entry-count or two concatenated entries). When the parser
+        # misaligns, filesize comes out near 1.9 GB and the resulting
+        # GetBigPartialPictFile attempt wedges the bulk endpoint.
+        #
+        # These guards raise BEFORE returning so the caller never
+        # initiates a download with bogus parameters, and they dump the
+        # raw response bytes so the layout can be reverse-engineered
+        # without bricking the session.
+        # -----------------------------------------------------------------
+        suspicious = (
+            filesize <= 0
+            or filesize > _MAX_REASONABLE_FILESIZE
+            or fileext.upper() not in _KNOWN_FILE_EXTS
+        )
+        if suspicious:
+            hex_head = data[: min(96, len(data))].hex(" ")
+            _logger.error(
+                "SigmaFpPictFileInfo2Ex: suspicious parse "
+                "(declared_len=%d total_len=%d "
+                "addr=0x%X size=%d ext=%r path=%r name=%r width=%d height=%d) "
+                "raw_head=%s",
+                declared, len(data), fileaddress, filesize, fileext,
+                path, name, width, height, hex_head,
+            )
+            raise ValueError(
+                "SigmaFpPictFileInfo2Ex parse failed sanity check "
+                f"(size={filesize}, ext={fileext!r}); raw bytes logged. "
+                "Likely a DNG+JPG / multi-file layout the parser does "
+                "not yet handle — download aborted to protect the bulk "
+                "endpoint."
+            )
+
+        # Always trace the raw head at DEBUG so successful parses also
+        # leave a record we can compare against the suspicious cases.
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug(
+                "SigmaFpPictFileInfo2Ex: ok (size=%d ext=%s name=%s) raw_head=%s",
+                filesize, fileext, name,
+                data[: min(64, len(data))].hex(" "),
+            )
 
         return cls(
             fileaddress=fileaddress,
