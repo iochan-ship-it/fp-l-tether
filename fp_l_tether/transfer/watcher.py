@@ -38,6 +38,13 @@ from typing import Callable
 
 import usb.core  # type: ignore[import-not-found]
 
+from fp_l_tether.camera.sigma_datagroup import (
+    CanSetInfo,
+    ExposureSettings,
+    read_can_set_info,
+    read_exposure,
+    read_focus_point,
+)
 from fp_l_tether.camera.usb_bridge import (
     PTPError,
     USBBridge,
@@ -81,8 +88,56 @@ class StatusEvent:
     message: str = ""
 
 
+@dataclass
+class ExposureEvent:
+    """Emitted when the camera reports new exposure dial values.
+
+    Fired once on ``ready`` after init and once after every successful
+    shot, so the floating panel can show the live SS/ISO/Aperture/WB.
+    """
+
+    settings: ExposureSettings
+
+
+@dataclass
+class CanSetInfoEvent:
+    """Emitted once per connection — what each dial *may* be set to."""
+
+    info: CanSetInfo
+
+
+@dataclass
+class FocusPointEvent:
+    """Emitted with the camera's reported AF point (or None if unknown)."""
+
+    x: int | None
+    y: int | None
+
+
+@dataclass
+class _SetExposureRequest:
+    """Internal queue item: change a single exposure dial."""
+
+    # ``group`` is 1 or 2 — which SetCamDataGroup to use.
+    group: int
+    # Single {field_name: int_value} pair. Field names match sigma-ptpy
+    # schema (ShutterSpeed, Aperture, ISOSpeed, ISOAuto, WhiteBalance, …).
+    values: dict[str, int]
+
+
+@dataclass
+class _SetFocusRequest:
+    """Internal queue item: move the AF point."""
+
+    x: int
+    y: int
+
+
 ShotCallback = Callable[[ShotEvent], None]
 StatusCallback = Callable[[StatusEvent], None]
+ExposureCallback = Callable[[ExposureEvent], None]
+CanSetInfoCallback = Callable[[CanSetInfoEvent], None]
+FocusPointCallback = Callable[[FocusPointEvent], None]
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +170,8 @@ class TetherDaemon:
         self._stop_event = threading.Event()
         self._snap_queue: Queue[None] = Queue()
         self._af_queue: Queue[None] = Queue()
+        self._set_exposure_queue: Queue[_SetExposureRequest] = Queue()
+        self._set_focus_queue: Queue[_SetFocusRequest] = Queue()
         self._thread: threading.Thread | None = None
         self._shot_count = 0
         self._next_slot = 0  # camera's db_head — advances after each capture
@@ -126,6 +183,9 @@ class TetherDaemon:
 
         self.on_shot: ShotCallback | None = None
         self.on_status: StatusCallback | None = None
+        self.on_exposure: ExposureCallback | None = None
+        self.on_can_set_info: CanSetInfoCallback | None = None
+        self.on_focus_point: FocusPointCallback | None = None
 
     # ----- lifecycle ---------------------------------------------------
 
@@ -167,6 +227,24 @@ class TetherDaemon:
         """
         self._af_queue.put(None)
         self.log.info("af_requested", source="pc")
+
+    def request_set_exposure(self, group: int, values: dict[str, int]) -> None:
+        """Queue a SetCamDataGroup{1,2} write. Non-blocking.
+
+        ``values`` is keyed by sigma-ptpy field names. The daemon writes
+        the field, waits briefly for the camera to settle, re-reads
+        DG1+DG2, and emits a fresh ExposureEvent so the UI shows what
+        actually took effect (not the requested value).
+        """
+        if group not in (1, 2):
+            raise ValueError(f"group must be 1 or 2, got {group}")
+        self._set_exposure_queue.put(_SetExposureRequest(group=group, values=values))
+        self.log.info("set_exposure_requested", group=group, fields=list(values))
+
+    def request_set_focus_point(self, x: int, y: int) -> None:
+        """Queue a SetCamDataGroupFocus write to move the AF point."""
+        self._set_focus_queue.put(_SetFocusRequest(x=x, y=y))
+        self.log.info("set_focus_requested", x=x, y=y)
 
     @property
     def current_item(self) -> str:
@@ -227,6 +305,113 @@ class TetherDaemon:
                 self.on_shot(event)
             except Exception as e:  # noqa: BLE001
                 self.log.warning("shot_callback_raised", error=str(e))
+
+    def _drain_set_exposure(self, bridge: USBBridge) -> None:
+        """Apply queued exposure dial writes, then re-read for ground truth.
+
+        Per the user's request: do NOT optimistically update the UI from
+        the requested value. Always send → wait → read → emit, so the
+        panel reflects what the camera actually accepted.
+        """
+        applied_any = False
+        while True:
+            try:
+                req = self._set_exposure_queue.get_nowait()
+            except Empty:
+                break
+            try:
+                if req.group == 1:
+                    bridge.sigma_set_datagroup_1(req.values)
+                else:
+                    bridge.sigma_set_datagroup_2(req.values)
+                applied_any = True
+                self.log.info(
+                    "set_exposure_sent", group=req.group, fields=req.values,
+                )
+            except PTPError as e:
+                # Camera rejected. Re-read so the UI snaps back to the
+                # old (still-current) value — that's the "revert" path.
+                self.log.error(
+                    "set_exposure_failed",
+                    group=req.group, fields=req.values, error=str(e),
+                )
+                self._emit_status("error", f"設定変更失敗: {e}")
+                applied_any = True  # still need to re-emit for UI revert
+        if applied_any:
+            # Brief settle so the camera's internal state catches up.
+            # 200ms matches the user's hint and is well below LV polling.
+            time.sleep(0.2)
+            self._emit_exposure(bridge)
+
+    def _drain_set_focus(self, bridge: USBBridge) -> None:
+        """Apply queued AF-point moves, then publish the new position."""
+        latest: _SetFocusRequest | None = None
+        while True:
+            try:
+                latest = self._set_focus_queue.get_nowait()
+            except Empty:
+                break
+        if latest is None:
+            return
+        try:
+            bridge.sigma_set_cam_datagroup_focus(latest.x, latest.y)
+            self.log.info("set_focus_sent", x=latest.x, y=latest.y)
+        except PTPError as e:
+            self.log.error(
+                "set_focus_failed", x=latest.x, y=latest.y, error=str(e),
+            )
+            self._emit_status("error", f"AF点送信失敗: {e}")
+            return
+        # Re-publish; the camera's Get is a static cache (per memory) so
+        # this just reflects "last commanded" — that's fine for the dot.
+        self._emit_focus_point(bridge)
+
+    def _emit_can_set_info(self, bridge: USBBridge) -> None:
+        """Read and publish CamCanSetInfo5 — list of allowed dial values."""
+        if self.on_can_set_info is None:
+            return
+        try:
+            info = read_can_set_info(bridge)
+        except (PTPError, ValueError) as e:
+            self.log.warning("can_set_info_read_failed", error=str(e))
+            return
+        try:
+            self.on_can_set_info(CanSetInfoEvent(info=info))
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("can_set_info_callback_raised", error=str(e))
+
+    def _emit_focus_point(self, bridge: USBBridge) -> None:
+        """Read and publish the current AF point coordinates."""
+        if self.on_focus_point is None:
+            return
+        try:
+            xy = read_focus_point(bridge)
+        except PTPError as e:
+            self.log.warning("focus_point_read_failed", error=str(e))
+            return
+        x, y = (xy if xy else (None, None))
+        try:
+            self.on_focus_point(FocusPointEvent(x=x, y=y))
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("focus_point_callback_raised", error=str(e))
+
+    def _emit_exposure(self, bridge: USBBridge) -> None:
+        """Read DG1+DG2 from the camera and publish an ExposureEvent.
+
+        Swallows PTPError (camera transient state) — exposure display is
+        best-effort, not flow-critical.
+        """
+        if self.on_exposure is None:
+            return
+        try:
+            settings = read_exposure(bridge)
+        except PTPError as e:
+            self.log.warning("exposure_read_failed", error=str(e))
+            return
+        try:
+            self.on_exposure(ExposureEvent(settings=settings))
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("exposure_callback_raised", error=str(e))
 
     # ----- main loop ---------------------------------------------------
 
@@ -295,6 +480,11 @@ class TetherDaemon:
                           db_head=pre.image_db_head,
                           db_tail=pre.image_db_tail)
             self._emit_status("ready", f"Watching slot 0x{self._next_slot:02X}")
+            # Populate the UI dropdowns + AF popover from camera capabilities.
+            self._emit_can_set_info(bridge)
+            # Initial exposure read so the panel populates before the first shot.
+            self._emit_exposure(bridge)
+            self._emit_focus_point(bridge)
 
             poll_idle_s = self.cfg.camera.poll_idle_ms / 1000.0
             poll_active_s = self.cfg.camera.poll_active_ms / 1000.0
@@ -304,8 +494,24 @@ class TetherDaemon:
             # after a PC-side request is fired.
             pending_trigger: str = "camera_button"
             t_shot_start: float | None = None  # time the current pending shot started
+            # Watchdog: if a pending shot doesn't produce a downloadable
+            # frame within this window, treat it as stuck and reset so
+            # AF/snap drains can fire again. Slightly longer than the
+            # worst long-exposure case (30s shutter + buffer write).
+            snap_watchdog_s = 35.0
+            # Throttle the diagnostic "still polling" log so we don't
+            # spam — every N seconds at most while a shot is pending.
+            polling_log_interval_s = 3.0
+            t_last_polling_log: float = 0.0
 
             while not self._stop_event.is_set():
+                # ----- 1a-pre. Drain exposure/focus queues -----
+                # Exposure/AF-point writes are cheap and not coupled to
+                # capture state, so we always process pending requests
+                # before considering snap/AF triggers.
+                self._drain_set_exposure(bridge)
+                self._drain_set_focus(bridge)
+
                 # ----- 1a. Drain AF queue (only when no shot is in flight) ---
                 # AF-only drive (SnapCommand mode 3) produces no image,
                 # so we don't set t_shot_start / pending_trigger after it.
@@ -347,12 +553,43 @@ class TetherDaemon:
                     try:
                         # Re-arm PC capture mode (per fp trace) then fire
                         bridge.sigma_set_datagroup_3_pc_capture()
+
+                        # Re-sync next_slot from camera state before snap.
+                        #
+                        # Per the 2026-05-13 hardware traces, the camera
+                        # writes the next snap to ``image_db_tail`` (the
+                        # next-write slot), NOT ``image_db_head``. Head is
+                        # the oldest-unread pointer; it sits at 0 when
+                        # nothing is pending and only catches up after
+                        # the capture commits ~hundreds of ms later. So
+                        # polling head pre-snap finds an empty slot and
+                        # the loop spins until the watchdog fires.
+                        try:
+                            sync_state = bridge.sigma_get_capture_status(0)
+                            target = sync_state.image_db_tail
+                            if target != self._next_slot:
+                                self.log.info(
+                                    "slot_resync",
+                                    cached=self._next_slot,
+                                    actual=target,
+                                    db_head=sync_state.image_db_head,
+                                    db_tail=sync_state.image_db_tail,
+                                )
+                                self._next_slot = target
+                        except (PTPError, USBBridgeError) as e:
+                            self.log.warning(
+                                "slot_resync_failed", error=str(e)
+                            )
+
                         bridge.sigma_snap(
                             mode=self.cfg.camera.snap_mode,
                             amount=1,
                         )
                         pending_trigger = "pc_snap"
                         t_shot_start = time.monotonic()
+                        # Force the first polling log to fire ASAP
+                        # (otherwise we wait polling_log_interval_s).
+                        t_last_polling_log = 0.0
                     except PTPError as e:
                         # Camera-side error (e.g. 0x6001 capture failure).
                         # Camera is still alive, just rejected this snap.
@@ -466,6 +703,9 @@ class TetherDaemon:
                     )
                     self._emit_shot(event)
                     self._emit_status("ready", f"Saved #{self._shot_count}: {saved.name}")
+                    # Refresh exposure display — the user may have rolled a
+                    # dial between shots.
+                    self._emit_exposure(bridge)
 
                     # Advance to next slot, reset trigger marker
                     self._next_slot = (self._next_slot + 1) & 0xFF
@@ -474,7 +714,44 @@ class TetherDaemon:
                     # Tight loop — image may already be there for next shot
                     continue
 
-                # No image yet → sleep & loop
+                # No image yet → sleep & loop.
+                # Diagnostic: while a shot is pending, log the capt_status
+                # every few seconds so we can see what the camera is
+                # returning when shots get "stuck" mid-flight.
+                if t_shot_start is not None:
+                    now = time.monotonic()
+                    if now - t_last_polling_log >= polling_log_interval_s:
+                        self.log.debug(
+                            "snap_polling",
+                            slot=self._next_slot,
+                            capt_status=f"0x{status.capt_status:04X}",
+                            image_db_head=status.image_db_head,
+                            image_db_tail=status.image_db_tail,
+                            image_id=getattr(status, "image_id", None),
+                            elapsed_s=round(now - t_shot_start, 2),
+                        )
+                        t_last_polling_log = now
+
+                    # Watchdog: if the shot has been pending too long,
+                    # reset so the next snap can fire. The camera will
+                    # eventually catch up (or the user can re-trigger).
+                    if now - t_shot_start > snap_watchdog_s:
+                        self.log.warning(
+                            "snap_watchdog_timeout",
+                            slot=self._next_slot,
+                            capt_status=f"0x{status.capt_status:04X}",
+                            image_db_head=status.image_db_head,
+                            image_db_tail=status.image_db_tail,
+                            elapsed_s=round(now - t_shot_start, 2),
+                        )
+                        self._emit_status(
+                            "error",
+                            f"Snap timeout — status 0x{status.capt_status:04X}",
+                        )
+                        t_shot_start = None
+                        pending_trigger = "camera_button"
+                        t_last_polling_log = 0.0
+
                 # Use active interval when we're waiting on a pending shot,
                 # idle interval when just watching for a manual button press.
                 interval = poll_active_s if t_shot_start else poll_idle_s

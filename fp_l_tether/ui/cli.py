@@ -388,6 +388,38 @@ def set_af_point(
         bridge.close()
 
 
+@app.command()
+def status(
+    config: Optional[Path] = typer.Option(None, "--config", "-c"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Print current SS / ISO / Aperture / WB read from the camera."""
+    _load(config, verbose)
+
+    from fp_l_tether.camera.sigma_datagroup import read_exposure
+    from fp_l_tether.camera.usb_bridge import USBBridge
+
+    bridge = USBBridge.find_sigma_fp_l()
+    bridge.open()
+    bridge.open_session()
+    try:
+        bridge.sigma_init()
+        exposure = read_exposure(bridge)
+        print(f"  {exposure.short()}")
+        print(
+            f"    raw: SS=0x{exposure.shutter_raw:02X}  "
+            f"Av=0x{exposure.aperture_raw:02X}  "
+            f"ISO=0x{exposure.iso_raw:02X}  "
+            f"WB=0x{exposure.wb_raw:02X}"
+        )
+    finally:
+        try:
+            bridge.close_session()
+        except Exception:  # noqa: BLE001
+            pass
+        bridge.close()
+
+
 def _compare_snapshots(files: list[Path], target_groups: list[str]) -> None:
     """N-way snapshot comparison for the AF-point probe and similar tasks.
 

@@ -694,6 +694,36 @@ class USBBridge:
             bytes([0x03, 0x04, 0x00, 0x04]),
         )
 
+    def sigma_set_datagroup_1(self, values: dict[str, int]) -> None:
+        """0x9016 ``SetCamDataGroup1`` — write any subset of DG1 fields.
+
+        ``values`` is keyed by sigma-ptpy schema field names (e.g.
+        ``{"ShutterSpeed": 0x70, "ISOSpeed": 0x28}``). The FieldPresent
+        bitmask is derived from the keys so the camera only updates
+        what's actually supplied. Wire format mirrors the fp init traces:
+        ``_Header(0x03) + FP_BE + fields + sum_checksum``.
+        """
+        from fp_l_tether.camera.sigma_datagroup import build_set_datagroup1
+
+        payload = build_set_datagroup1(values)
+        self.sigma_send_raw_setdatagroup(
+            SigmaOperationCode.SET_CAM_DATA_GROUP_1,
+            payload,
+        )
+
+    def sigma_set_datagroup_2(self, values: dict[str, int]) -> None:
+        """0x9017 ``SetCamDataGroup2`` — write any subset of DG2 fields.
+
+        See ``sigma_set_datagroup_1`` for wire format details.
+        """
+        from fp_l_tether.camera.sigma_datagroup import build_set_datagroup2
+
+        payload = build_set_datagroup2(values)
+        self.sigma_send_raw_setdatagroup(
+            SigmaOperationCode.SET_CAM_DATA_GROUP_2,
+            payload,
+        )
+
     def sigma_set_datagroup_3_pc_capture(self) -> None:
         """0x9018 ``SetDataGroup3`` — **the critical PC-capture-mode switch**.
 
