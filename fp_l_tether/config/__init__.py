@@ -108,7 +108,10 @@ class LiveViewConfig(BaseModel):
     """
 
     enabled: bool = True
-    target_fps: int = 15
+    # 10 fps is the sustained ceiling for fp L (rate-tested 2026-05-13).
+    # 15 fps reliably triggers PTP_RC_DeviceBusy (0x2019) and stalls
+    # the bulk endpoint; 12 fps untested. Stay conservative.
+    target_fps: int = 10
     pause_during_snap: bool = True
 
 

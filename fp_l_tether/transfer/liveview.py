@@ -63,6 +63,20 @@ class LiveViewFrame:
 DEFAULT_BACKOFF_S = 0.5
 MAX_CONSECUTIVE_FAILURES = 20  # ~10 seconds at the default back-off
 
+# fp L rate-test (2026-05-13) findings:
+#   - Sustained ceiling is 10 fps; 15 fps reliably degrades to 0x2019
+#     DeviceBusy and stalls the bulk endpoint.
+#   - The very first GetCamViewFrame after sigma_init() frequently
+#     busies out — the camera needs ~half a second to start producing
+#     frames. We wait that long once up front rather than waste a
+#     back-off cycle on a known transient.
+WARMUP_S = 0.5
+
+# PTP_RC_DeviceBusy (ISO 15740 §11.4.16). Sigma fp L returns this when
+# its view-frame producer can't keep up with the request rate. Treat
+# specially in logs so it's distinguishable from real PTP failures.
+PTP_RC_DEVICE_BUSY = 0x2019
+
 
 def _jpeg_dimensions(jpeg: bytes) -> tuple[int, int]:
     """Walk JPEG segments to find SOF (start-of-frame) and extract WxH.
@@ -183,6 +197,10 @@ class LiveViewStream:
         period_s = 1.0 / self._target_fps
         consecutive_failures = 0
 
+        # Warm-up: skip the well-known first-call busy by waiting once.
+        if self._stop_event.wait(WARMUP_S):
+            return
+
         while not self._stop_event.is_set():
             loop_start = time.monotonic()
 
@@ -193,10 +211,15 @@ class LiveViewStream:
                 with self._ptp_lock:
                     jpeg = self._bridge.sigma_get_view_frame()
             except (PTPError, USBBridgeError) as e:
+                msg = str(e)
+                is_busy = f"0x{PTP_RC_DEVICE_BUSY:04X}" in msg
                 consecutive_failures += 1
+                # Busy is the camera's "I can't keep up" signal — not
+                # a real failure. Log it under a separate event so it
+                # doesn't get conflated with USB / PTP errors.
                 self.log.warning(
-                    "liveview_failed",
-                    error=str(e),
+                    "liveview_busy" if is_busy else "liveview_failed",
+                    error=msg,
                     consecutive=consecutive_failures,
                 )
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
@@ -206,6 +229,7 @@ class LiveViewStream:
                     )
                     return
                 # Brief back-off, then retry — but honour stop_event.
+                # 500 ms recovers from DeviceBusy in our rate tests.
                 if self._stop_event.wait(self._backoff_s):
                     return
                 continue
