@@ -54,6 +54,8 @@ from AppKit import (
     NSEventMaskKeyDown,
     NSFloatingWindowLevel,
     NSFont,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
     NSMakeRect,
     NSMakeSize,
     NSMinYEdge,
@@ -96,7 +98,18 @@ logger = logging.getLogger(__name__)
 
 
 PANEL_WIDTH = 320
-PANEL_HEIGHT = 280
+# CONTROLS_HEIGHT is the height of the original (pre-LV) control area.
+# Existing widget Y offsets are computed against this constant so that
+# growing the panel to add a live-view viewport at the top doesn't
+# require touching every NSMakeRect below.
+CONTROLS_HEIGHT = 280
+# Live-view viewport — placed above the controls area. Sized for the
+# fp L's 3:2 capture ratio so frames don't distort when scaled to fit.
+LV_WIDTH = 220
+LV_HEIGHT = 140  # 220x140 ≈ 3:1.9 — close to 3:2, avoids letterboxing
+LV_PAD_TOP = 12
+LV_PAD_BOTTOM = 10
+PANEL_HEIGHT = CONTROLS_HEIGHT + LV_PAD_BOTTOM + LV_HEIGHT + LV_PAD_TOP
 
 # AF popover dimensions (px) and the camera's AF coordinate bounds. The
 # camera bounds are dynamic — populated from CamCanSetInfo5 on connect —
@@ -169,16 +182,42 @@ class FloatingTetherPanel(NSObject):
 
         content = panel.contentView()
 
-        # Status indicator label (top)
+        # Live-view viewport (top of the panel, above the controls area).
+        # 3.3a only constructs the view and wires the callback; the
+        # JPEG → NSImage conversion + setImage_ marshalling lands in
+        # 3.3b. Until then the view shows an empty frame, but the
+        # callback fires (verifiable via logs) so we know the pipe is
+        # connected end-to-end.
+        lv_x = (PANEL_WIDTH - LV_WIDTH) // 2
+        lv_y = CONTROLS_HEIGHT + LV_PAD_BOTTOM
+        self._live_view = NSImageView.alloc().initWithFrame_(
+            NSMakeRect(lv_x, lv_y, LV_WIDTH, LV_HEIGHT)
+        )
+        # Proportional scaling so non-3:2 frames (e.g. cropped sensor
+        # modes) don't distort.
+        self._live_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        # Dark backdrop so the viewport reads as "screen" before the
+        # first frame arrives (and during pause windows in 3.3c).
+        self._live_view.setWantsLayer_(True)
+        layer = self._live_view.layer()
+        if layer is not None:
+            layer.setBackgroundColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(0.08, 1.0).CGColor()
+            )
+        content.addSubview_(self._live_view)
+
+        # Status indicator label (top of the controls area — LV viewport
+        # sits ABOVE this and uses its own y range so all existing
+        # widgets stay at their original on-panel coordinates).
         self._status_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, PANEL_HEIGHT - 38, PANEL_WIDTH - 24, 20)
+            NSMakeRect(12, CONTROLS_HEIGHT - 38, PANEL_WIDTH - 24, 20)
         )
         _make_label(self._status_label, "● connecting…", bold=True, size=13)
         content.addSubview_(self._status_label)
 
         # Session label
         self._session_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, PANEL_HEIGHT - 60, PANEL_WIDTH - 24, 18)
+            NSMakeRect(12, CONTROLS_HEIGHT - 60, PANEL_WIDTH - 24, 18)
         )
         _make_label(self._session_label, f"Session: {self._daemon.session_name}", size=11)
         self._session_label.setTextColor_(NSColor.secondaryLabelColor())
@@ -190,26 +229,26 @@ class FloatingTetherPanel(NSObject):
         # write via the daemon; the UI is then re-synced from the
         # subsequent ExposureEvent (no optimistic update).
         iso_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, PANEL_HEIGHT - 82, 28, 18)
+            NSMakeRect(12, CONTROLS_HEIGHT - 82, 28, 18)
         )
         _make_label(iso_caption, "ISO", size=10)
         iso_caption.setTextColor_(NSColor.secondaryLabelColor())
         content.addSubview_(iso_caption)
         self._iso_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(42, PANEL_HEIGHT - 86, 110, 24), False
+            NSMakeRect(42, CONTROLS_HEIGHT - 86, 110, 24), False
         )
         self._iso_dropdown.setTarget_(self)
         self._iso_dropdown.setAction_("isoChanged:")
         content.addSubview_(self._iso_dropdown)
 
         ss_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(160, PANEL_HEIGHT - 82, 28, 18)
+            NSMakeRect(160, CONTROLS_HEIGHT - 82, 28, 18)
         )
         _make_label(ss_caption, "SS", size=10)
         ss_caption.setTextColor_(NSColor.secondaryLabelColor())
         content.addSubview_(ss_caption)
         self._ss_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(186, PANEL_HEIGHT - 86, 122, 24), False
+            NSMakeRect(186, CONTROLS_HEIGHT - 86, 122, 24), False
         )
         self._ss_dropdown.setTarget_(self)
         self._ss_dropdown.setAction_("ssChanged:")
@@ -217,26 +256,26 @@ class FloatingTetherPanel(NSObject):
 
         # Exposure dropdowns row 2: Aperture + WB
         av_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, PANEL_HEIGHT - 110, 28, 18)
+            NSMakeRect(12, CONTROLS_HEIGHT - 110, 28, 18)
         )
         _make_label(av_caption, "Av", size=10)
         av_caption.setTextColor_(NSColor.secondaryLabelColor())
         content.addSubview_(av_caption)
         self._av_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(42, PANEL_HEIGHT - 114, 110, 24), False
+            NSMakeRect(42, CONTROLS_HEIGHT - 114, 110, 24), False
         )
         self._av_dropdown.setTarget_(self)
         self._av_dropdown.setAction_("avChanged:")
         content.addSubview_(self._av_dropdown)
 
         wb_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(160, PANEL_HEIGHT - 110, 28, 18)
+            NSMakeRect(160, CONTROLS_HEIGHT - 110, 28, 18)
         )
         _make_label(wb_caption, "WB", size=10)
         wb_caption.setTextColor_(NSColor.secondaryLabelColor())
         content.addSubview_(wb_caption)
         self._wb_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(186, PANEL_HEIGHT - 114, 122, 24), False
+            NSMakeRect(186, CONTROLS_HEIGHT - 114, 122, 24), False
         )
         self._wb_dropdown.setTarget_(self)
         self._wb_dropdown.setAction_("wbChanged:")
@@ -244,7 +283,7 @@ class FloatingTetherPanel(NSObject):
 
         # Last-shot label
         self._shot_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, PANEL_HEIGHT - 138, PANEL_WIDTH - 24, 18)
+            NSMakeRect(12, CONTROLS_HEIGHT - 138, PANEL_WIDTH - 24, 18)
         )
         _make_label(self._shot_label, "No shots yet", size=11)
         self._shot_label.setTextColor_(NSColor.secondaryLabelColor())
@@ -359,6 +398,7 @@ class FloatingTetherPanel(NSObject):
         self._daemon.on_exposure = self._on_exposure_threadsafe
         self._daemon.on_can_set_info = self._on_can_set_info_threadsafe
         self._daemon.on_focus_point = self._on_focus_point_threadsafe
+        self._daemon.on_live_frame = self._on_live_frame_threadsafe
 
     def _on_status_threadsafe(self, event) -> None:  # type: ignore[no-untyped-def]
         # Cross-thread call → marshal to main thread
@@ -400,6 +440,24 @@ class FloatingTetherPanel(NSObject):
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
             "updateFocusPoint:",
             (event.x, event.y),
+            False,
+        )
+
+    def _on_live_frame_threadsafe(self, event) -> None:  # type: ignore[no-untyped-def]
+        """Marshal a live-view frame from the LV thread to the main thread.
+
+        Called from ``LiveViewStream`` (via ``TetherDaemon._emit_live_frame``)
+        every 100 ms or so. We hand a single-element tuple to
+        ``performSelectorOnMainThread_`` because ObjC selectors take
+        exactly one ``id``-typed argument.
+
+        3.3a wiring: ``updateLiveFrame_`` is a stub. 3.3b will turn
+        ``event.jpeg`` into an NSImage and call ``setImage_`` on
+        ``self._live_view``.
+        """
+        self.performSelectorOnMainThread_withObject_waitUntilDone_(
+            "updateLiveFrame:",
+            (event.jpeg, event.width, event.height),
             False,
         )
 
@@ -528,6 +586,21 @@ class FloatingTetherPanel(NSObject):
         # If the popover is open, repaint it.
         if getattr(self, "_af_popover", None) is not None and self._af_popover.isShown():
             self._af_popover_ctrl.refresh()
+
+    @objc.signature(b"v@:@")
+    def updateLiveFrame_(self, tup) -> None:
+        """Main-thread stub for live-view frame updates.
+
+        3.3a only proves the callback fires on the main thread. 3.3b
+        will decode ``jpeg`` into an NSImage and call
+        ``self._live_view.setImage_(image)``. Until then we just
+        record that a frame arrived so an aliveness check in tests
+        / logs can confirm wiring.
+        """
+        jpeg, width, height = tup
+        # Cheap aliveness counter — useful from the debugger / a future
+        # debug overlay. Not used yet.
+        self._lv_frame_count = getattr(self, "_lv_frame_count", 0) + 1
 
     # ----- dropdown helpers -------------------------------------------
 
