@@ -50,6 +50,31 @@ class CameraConfig(BaseModel):
     #   6 = START_CAPTURE         — begin sequence shooting
     snap_mode: int = 1
 
+    # USB keep-alive heartbeat. The fp L slips into an internal
+    # power-saving state after ~5 min of bus idle (even in PC capture
+    # mode) and starts returning 0-byte data phases for vendor get-*
+    # opcodes. A periodic benign ping (sigma_get_camera_info) keeps
+    # the camera awake; failures are logged but not retried since
+    # the watcher's recovery path will catch any drift on the next
+    # status poll.
+    keep_alive_enabled: bool = True
+    keep_alive_interval_s: float = 60.0
+
+    # Burst-aware post-capture quiet window (see TetherDaemon._arm_quiet_window).
+    # After a burst settles (snap queue drains), the daemon enforces
+    # a no-PTP-traffic window of
+    #   ``commit_window_base_s + commit_window_per_shot_s * (burst-1)``
+    # to let the camera finish its internal ImageDB consolidation
+    # without being pushed into a wedged endpoint by retries.
+    # ``burst`` is the number of shots in the just-finished
+    # contiguous run (counter resets when the window arms). A
+    # contiguous run = shots downloaded back-to-back without a
+    # quiet window between them, regardless of wall-clock gap.
+    # Tuned against the 2026-05-13 10-shot live test (~13 s
+    # commit tail observed → per-shot=1.0 picks 14 s of safety).
+    commit_window_base_s: float = 5.0
+    commit_window_per_shot_s: float = 1.0
+
 
 class OutputConfig(BaseModel):
     """File naming and conflict resolution."""
@@ -151,6 +176,11 @@ class LiveViewConfig(BaseModel):
     # effective_fps down — within this window from stream start,
     # busies are tolerated without demotion.
     first_storm_grace_s: float = 30.0
+    # Note: the old ``resume_delay_after_capture_s`` knob was superseded
+    # by the burst-aware quiet window in CameraConfig
+    # (commit_window_base_s / commit_window_per_shot_s). LV resume is
+    # now centrally lifted by the daemon's main loop once the quiet
+    # window expires, so this LiveViewConfig field is no longer needed.
 
 
 class TelemetryConfig(BaseModel):

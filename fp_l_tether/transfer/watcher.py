@@ -46,6 +46,7 @@ from fp_l_tether.camera.sigma_datagroup import (
     read_focus_point,
 )
 from fp_l_tether.camera.usb_bridge import (
+    CameraIdleError,
     PTPError,
     USBBridge,
     USBBridgeError,
@@ -54,6 +55,7 @@ from fp_l_tether.config import AppConfig
 from fp_l_tether.lightroom import build_destination
 from fp_l_tether.telemetry import get_logger, log_shot
 from fp_l_tether.transfer.atomic import write_atomic
+from fp_l_tether.transfer.heartbeat import HeartbeatThread
 from fp_l_tether.transfer.liveview import LiveViewFrame, LiveViewStream
 
 
@@ -205,6 +207,31 @@ class TetherDaemon:
         self._ptp_lock = threading.RLock()
         # Live-view stream — created on connect, torn down on stop.
         self._liveview: LiveViewStream | None = None
+        # USB keep-alive heartbeat — same lifecycle as the LV stream.
+        self._heartbeat: HeartbeatThread | None = None
+
+        # ----- Burst-aware quiet-window state -----
+        # After a burst settles (snap queue drains), the camera's
+        # internal ImageDB consolidation needs quiet time on the
+        # bulk endpoint to avoid getting wedged into Errno 60 by
+        # retries. We enforce a hard no-PTP window whose size
+        # scales with the just-finished burst length.
+        # ``_bus_quiet_until`` is the monotonic deadline; until
+        # then the main loop suppresses status polling, LV resume,
+        # heartbeat pings, and snap-queue drain. Updated only via
+        # _arm_quiet_window under ``_bus_quiet_lock`` to avoid
+        # races between the daemon thread and any consumer
+        # (heartbeat).
+        self._bus_quiet_until: float = 0.0
+        self._bus_quiet_lock = threading.Lock()
+        # Burst counter — incremented on every successful download,
+        # reset to 0 by _arm_quiet_window. Counts shots in the
+        # current contiguous run (between two quiet windows).
+        # NOTE: the earlier "shots in last N seconds" heuristic
+        # always returned 1 because fp L per-shot processing time
+        # (~5 s) exceeded any sane lookback window. Counting
+        # explicit run length is unambiguous.
+        self._burst_in_progress: int = 0
 
         self.on_shot: ShotCallback | None = None
         self.on_status: StatusCallback | None = None
@@ -332,6 +359,51 @@ class TetherDaemon:
             except Exception as e:  # noqa: BLE001
                 self.log.warning("shot_callback_raised", error=str(e))
 
+    # ----- Burst-aware quiet-window helpers ----------------------------
+
+    def bus_quiet_remaining(self) -> float:
+        """Seconds until the post-capture quiet window expires, or 0.
+
+        Public (no leading underscore) so external threads — notably
+        :class:`HeartbeatThread` — can consult the same gate the
+        main loop uses. Read is lock-protected because the daemon
+        thread updates ``_bus_quiet_until`` from
+        :meth:`_arm_quiet_window`.
+        """
+        with self._bus_quiet_lock:
+            return max(0.0, self._bus_quiet_until - time.monotonic())
+
+    def _arm_quiet_window(self) -> None:
+        """Set the quiet-window deadline for the just-completed burst.
+
+        Reads ``_burst_in_progress`` (number of contiguous shots
+        since the previous quiet window) to compute window length:
+        ``base + per_shot * max(0, burst - 1)``. Always EXTENDS,
+        never shortens — a freshly observed burst that overlaps an
+        existing window won't clip the quiet time prematurely.
+        Resets ``_burst_in_progress`` so the next burst starts at 0.
+        """
+        burst = self._burst_in_progress
+        self._burst_in_progress = 0
+        base = self.cfg.camera.commit_window_base_s
+        per = self.cfg.camera.commit_window_per_shot_s
+        window_s = base + per * max(0, burst - 1)
+        with self._bus_quiet_lock:
+            self._bus_quiet_until = max(
+                self._bus_quiet_until, time.monotonic() + window_s,
+            )
+        self.log.info(
+            "quiet_window_armed",
+            burst_count=burst,
+            window_s=round(window_s, 2),
+        )
+
+    def _record_shot(self) -> None:
+        """Tick the burst counter for a just-completed download."""
+        self._burst_in_progress += 1
+
+    # ----- LV pause/resume helpers ------------------------------------
+
     def _pause_liveview(self) -> None:
         """Suspend live-view for the duration of a snap+download.
 
@@ -423,7 +495,10 @@ class TetherDaemon:
         try:
             with self._ptp_lock:
                 info = read_can_set_info(bridge)
-        except (PTPError, ValueError) as e:
+        except (PTPError, CameraIdleError, ValueError) as e:
+            # CameraIdleError tolerated here — best-effort UI read,
+            # the next poll-loop iteration will see it again and the
+            # main loop's recovery path handles the wake-up.
             self.log.warning("can_set_info_read_failed", error=str(e))
             return
         try:
@@ -438,7 +513,7 @@ class TetherDaemon:
         try:
             with self._ptp_lock:
                 xy = read_focus_point(bridge)
-        except PTPError as e:
+        except (PTPError, CameraIdleError) as e:
             self.log.warning("focus_point_read_failed", error=str(e))
             return
         x, y = (xy if xy else (None, None))
@@ -469,6 +544,48 @@ class TetherDaemon:
         except Exception as e:  # noqa: BLE001
             self.log.warning("live_frame_callback_raised", error=str(e))
 
+    def _passive_idle_wait(
+        self,
+        reason: str,
+        attempt: int,
+        sleep_s: float,
+    ) -> None:
+        """Passively wait out a 0-byte read, no active PTP calls.
+
+        Initial recovery design (2026-05-13 morning) actively pinged
+        the camera with ``sigma_get_camera_info`` +
+        ``sigma_set_datagroup_3_pc_capture``. The first live test
+        showed that's the WRONG move: a 0-byte data phase often
+        precedes a half-stalled bulk endpoint, and writing more
+        commands into it just escalates to Errno 60 (OS USB timeout)
+        and forces a session reset.
+
+        The passive strategy is: pause LV (so its read loop doesn't
+        keep hammering a sick endpoint), sleep, and let the outer
+        loop retry the status poll. If the camera was just
+        commit-settling, the next poll succeeds. If it was genuinely
+        idle, the heartbeat (or the next poll itself) wakes it.
+        Three consecutive failures still escalate to a reconnect.
+        """
+        self._emit_status(
+            "recovering",
+            f"Camera quiet — waiting… (attempt {attempt})",
+        )
+        self.log.warning(
+            "camera_idle_passive_wait",
+            attempt=attempt,
+            reason=reason,
+            sleep_s=sleep_s,
+        )
+        # Pause LV during the wait so its background fetch loop
+        # doesn't keep slamming a possibly-half-stalled endpoint.
+        # We don't resume here — the LV resume gate at the top of
+        # the main loop handles resume timing centrally so we
+        # don't accidentally double-fire it during a sequence of
+        # alternating wait/poll cycles.
+        self._pause_liveview()
+        self._stop_event.wait(sleep_s)
+
     def _emit_exposure(self, bridge: USBBridge) -> None:
         """Read DG1+DG2 from the camera and publish an ExposureEvent.
 
@@ -480,7 +597,7 @@ class TetherDaemon:
         try:
             with self._ptp_lock:
                 settings = read_exposure(bridge)
-        except PTPError as e:
+        except (PTPError, CameraIdleError) as e:
             self.log.warning("exposure_read_failed", error=str(e))
             return
         try:
@@ -496,8 +613,17 @@ class TetherDaemon:
         Outer reconnect loop: if the USB bridge goes away (camera unplugged,
         powered off, or any libusb I/O error), close the bridge cleanly,
         wait, and try to re-establish. Loops until ``stop()`` is called.
+
+        Reconnect cap: once the bulk endpoint truly stalls (Errno 60 on
+        the fp L, observed when LV / status poll collides with a post-
+        snap deep commit), no amount of re-claim restores it without a
+        physical cable reseat. Spinning on session_lost forever is
+        bad UX — we cap the consecutive failures and give up with a
+        clear message.
         """
         reconnect_delay_s = 2.0
+        reconnect_failure_cap = 5
+        reconnect_failures = 0
         first_attempt = True
 
         while not self._stop_event.is_set():
@@ -508,14 +634,42 @@ class TetherDaemon:
                 if self._stop_event.wait(reconnect_delay_s):
                     break
 
+            session_start_at = time.monotonic()
             try:
                 self._run_session()
             except (USBBridgeError, usb.core.USBError) as e:
-                # USB-level error → camera gone or I/O broken. Reconnect.
-                self.log.warning("session_lost", error=str(e))
+                session_lifetime_s = time.monotonic() - session_start_at
+                # Sessions that ran for a while before dying represent
+                # "real" disconnects (e.g. user unplugged) where a
+                # retry makes sense. Sessions that die in <10 s
+                # repeatedly mean the endpoint is wedged — count those
+                # toward the cap.
+                if session_lifetime_s < 10.0:
+                    reconnect_failures += 1
+                else:
+                    reconnect_failures = 0
+                self.log.warning(
+                    "session_lost",
+                    error=str(e),
+                    lifetime_s=round(session_lifetime_s, 2),
+                    consecutive_short_failures=reconnect_failures,
+                )
+                if reconnect_failures >= reconnect_failure_cap:
+                    self.log.error(
+                        "reconnect_cap_reached",
+                        cap=reconnect_failure_cap,
+                    )
+                    self._emit_status(
+                        "error",
+                        f"カメラ wedge ({reconnect_failures} 回連続失敗) — "
+                        f"fp L 本体の電源を OFF→ON してから再起動してください "
+                        f"(USB 抜き差しだけでは復旧しません)",
+                    )
+                    break
                 self._emit_status(
                     "disconnected",
-                    f"接続切れ ({e}). 再接続を試行中…",
+                    f"接続切れ ({e}). 再接続を試行中… "
+                    f"({reconnect_failures}/{reconnect_failure_cap})",
                 )
                 # loop continues → reconnect attempt after delay
             except Exception as e:  # noqa: BLE001
@@ -564,6 +718,19 @@ class TetherDaemon:
             self._emit_exposure(bridge)
             self._emit_focus_point(bridge)
 
+            # Start the USB keep-alive heartbeat. Prevents the camera
+            # from drifting into its idle power-saving state during
+            # long quiet stretches between shots. Shares the PTP lock
+            # so its periodic ping serialises against everything else.
+            if self.cfg.camera.keep_alive_enabled:
+                self._heartbeat = HeartbeatThread(
+                    bridge,
+                    self._ptp_lock,
+                    interval_s=self.cfg.camera.keep_alive_interval_s,
+                    bus_quiet_check=self.bus_quiet_remaining,
+                )
+                self._heartbeat.start()
+
             # Start background live view if enabled. The stream shares
             # the PTP lock so its view-frame fetches serialise against
             # snaps/downloads on the single USB bulk endpoint.
@@ -590,6 +757,18 @@ class TetherDaemon:
             poll_idle_s = self.cfg.camera.poll_idle_ms / 1000.0
             poll_active_s = self.cfg.camera.poll_active_ms / 1000.0
 
+            # Idle-recovery counter. After each successful poll we reset
+            # to 0; on a CameraIdleError we passively wait (no active
+            # PTP — see _passive_idle_wait for why). Three consecutive
+            # failures escalate to a session-level disconnect. The
+            # quiet-window guard at the top of the loop prevents this
+            # path from triggering during a post-capture commit tail
+            # (which used to manifest as benign 0-bytes here), so a
+            # 0-byte that reaches this branch genuinely indicates the
+            # camera has slipped into 5-min power-save.
+            idle_recovery_attempts = 0
+            idle_recovery_max = 3
+
             # Per-iteration trigger source. Starts as "camera_button" since
             # we begin in "watching" mode; flips to "pc_snap" the iteration
             # after a PC-side request is fired.
@@ -606,6 +785,43 @@ class TetherDaemon:
             t_last_polling_log: float = 0.0
 
             while not self._stop_event.is_set():
+                # ----- 1a-pre0. Bus quiet-window guard -----
+                # After a successful download, the camera enters a
+                # deep ImageDB consolidation that lasts longer the
+                # bigger the just-completed burst. Polling the
+                # status endpoint, fetching LV frames, or pinging
+                # heartbeat DURING this window can push a
+                # half-stalled endpoint into Errno 60 — which on
+                # the fp L is only recoverable by physically
+                # power-cycling the camera body.
+                #
+                # So we enforce a hard no-PTP gate at the top of
+                # the loop: while ``bus_quiet_remaining()`` is
+                # positive, we sleep in short ticks and do nothing
+                # else. This blocks status polls AND snap-queue
+                # drain AND LV resume — pending snaps queue up
+                # and fire once the window expires.
+                quiet_remaining = self.bus_quiet_remaining()
+                if quiet_remaining > 0.0:
+                    # Sleep in <=500 ms slices so stop_event is
+                    # checked promptly. Don't continue past this
+                    # point — the window must be PTP-quiet.
+                    if self._stop_event.wait(min(quiet_remaining, 0.5)):
+                        continue
+                    continue
+
+                # ----- 1a-pre1. LV resume gate -----
+                # The window just expired (or no capture has
+                # happened yet). Lift any pending LV pause now
+                # — central place, so individual capture paths
+                # never have to worry about LV state.
+                if (
+                    self._liveview is not None
+                    and self._liveview.is_paused
+                    and t_shot_start is None
+                ):
+                    self._resume_liveview()
+
                 # ----- 1a-pre. Drain exposure/focus queues -----
                 # Exposure/AF-point writes are cheap and not coupled to
                 # capture state, so we always process pending requests
@@ -721,11 +937,38 @@ class TetherDaemon:
                 try:
                     with self._ptp_lock:
                         status = bridge.sigma_get_capture_status(self._next_slot)
+                except CameraIdleError as e:
+                    # 0-byte data phase reaching here means the
+                    # camera has genuinely slipped into 5-min
+                    # power-save (commit-tail 0-bytes are absorbed
+                    # by the quiet-window guard above). Passive
+                    # wait — no active PTP, since the previous
+                    # active-recovery design empirically pushed a
+                    # half-stalled endpoint into Errno 60. Counts
+                    # toward cap; three failures → reconnect.
+                    idle_recovery_attempts += 1
+                    if idle_recovery_attempts >= idle_recovery_max:
+                        self.log.error(
+                            "camera_idle_recovery_exhausted",
+                            attempts=idle_recovery_attempts,
+                        )
+                        raise USBBridgeError(
+                            "camera_idle_recovery_exhausted"
+                        ) from e
+                    self._passive_idle_wait(
+                        reason=str(e),
+                        attempt=idle_recovery_attempts,
+                        sleep_s=5.0,
+                    )
+                    continue
                 except PTPError as e:
                     self.log.error("status_poll_failed", error=str(e))
                     self._emit_status("error", f"poll error: {e}")
                     time.sleep(poll_idle_s)
                     continue
+                else:
+                    # Any successful poll resets the idle-recovery counter.
+                    idle_recovery_attempts = 0
                 # USBBridgeError / usb.core.USBError propagates → reconnect
 
                 # Failure status (0x6XXX range). This is sticky — the camera
@@ -780,13 +1023,24 @@ class TetherDaemon:
                         continue
                     # USBBridgeError propagates → reconnect
 
-                    # Download + clear complete — the camera's bulk
-                    # endpoint is free again, so resume LV before doing
-                    # the (slower, lock-free) atomic write and callbacks.
-                    # Per coworker spec: resume タイミングは clear 完了
-                    # 直後 (sigma_download_current() 戻り直後).
-                    self._resume_liveview()
-
+                    # NOTE: We deliberately do NOT resume LV here.
+                    # The camera's internal "deep commit" (ImageDB
+                    # consolidation) continues for several seconds
+                    # after sigma_download_current() returns — the
+                    # bigger the just-completed burst, the longer it
+                    # takes (~12 s observed for 11 shots). Resuming
+                    # LV (or polling status) during that window
+                    # collides with the deep commit on the single
+                    # bulk endpoint and stalls it into Errno 60 — a
+                    # state only recoverable by power-cycling the
+                    # camera body.
+                    #
+                    # Arming of the quiet window happens AFTER the
+                    # post-download bookkeeping below (which
+                    # includes one last PTP read to refresh the
+                    # exposure dials). Once armed, the main loop's
+                    # top-of-loop guard suppresses all PTP traffic
+                    # until the window expires.
                     self._shot_count += 1
                     # Per-item shot counter for the filename template's
                     # ``{shot}``. Resets implicitly when the user types a
@@ -844,6 +1098,18 @@ class TetherDaemon:
                     self._next_slot = (self._next_slot + 1) & 0xFF
                     pending_trigger = "camera_button"
                     t_shot_start = None
+
+                    # ----- Arm the burst-aware quiet window -----
+                    # Tick the burst counter; if no further snap is
+                    # queued, arm a window scaled to the burst
+                    # length and reset the counter. If a snap IS
+                    # queued, leave the counter ticking so the next
+                    # iteration can incorporate this shot into the
+                    # ongoing burst — the window arms after the
+                    # LAST shot of the burst with the full count.
+                    self._record_shot()
+                    if self._snap_queue.empty():
+                        self._arm_quiet_window()
                     # Tight loop — image may already be there for next shot
                     continue
 
@@ -897,6 +1163,15 @@ class TetherDaemon:
             # Always release the bridge so the next reconnect attempt
             # starts from a clean USB state. Errors here are swallowed
             # because the device may already be gone.
+            # Stop heartbeat first — it's the lowest-priority worker
+            # and we want it gone before any bridge teardown so its
+            # in-flight ping can drain cleanly.
+            if self._heartbeat is not None:
+                try:
+                    self._heartbeat.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._heartbeat = None
             # Stop the live-view thread BEFORE closing the bridge so
             # its in-flight fetch can complete (or fail cleanly) while
             # the USB endpoint is still alive.

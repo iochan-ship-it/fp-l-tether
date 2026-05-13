@@ -20,6 +20,23 @@ chunk_size = 1048576  # 1 MiB
 # true 推奨: カメラ内 ImageDB が溢れて撮影できなくなるのを防ぐ
 clear_image_db_after_download = true
 
+# USB keep-alive heartbeat
+# fp L は約5分のバス idle で内部省電力モードに入り、vendor get-*
+# が 0-byte data phase を返すようになる。1分毎に benign な ping
+# (sigma_get_camera_info) を打つことで予防。
+# true 推奨。本体メニュー System → Auto Power Off → OFF も併せて。
+keep_alive_enabled = true
+keep_alive_interval_s = 60.0
+
+# Burst-aware post-capture quiet window. After a burst settles
+# (snap queue drains) the daemon enforces a no-PTP-traffic window of:
+#   commit_window_base_s + commit_window_per_shot_s * (burst - 1)
+# where burst = number of contiguous shots since the previous
+# quiet window. Prevents Errno 60 wedge after long bursts
+# (10-shot burst → ~14 s with defaults; 13 s observed minimum).
+commit_window_base_s = 5.0
+commit_window_per_shot_s = 1.0
+
 [output]
 # 保存先のルートディレクトリ
 root = "~/Pictures/Tether"

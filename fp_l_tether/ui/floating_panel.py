@@ -522,17 +522,27 @@ class FloatingTetherPanel(NSObject):
             "ready": "●",
             "shooting": "◉",
             "downloading": "◑",
+            "recovering": "◍",
             "error": "✕",
             "stopped": "○",
+            "disconnected": "✕",
+            "focusing": "◐",
         }.get(state, "●")
         text = f"{symbol} {state}"
         if message:
             text += f"  —  {message}"
         self._status_label.setStringValue_(text)
 
-        color = NSColor.systemRedColor() if state == "error" else NSColor.labelColor()
+        # Colour priority: ready=green, error/disconnected=red,
+        # recovering=yellow (mid-wake-up), everything else=label colour.
         if state == "ready":
             color = NSColor.systemGreenColor()
+        elif state in ("error", "disconnected"):
+            color = NSColor.systemRedColor()
+        elif state == "recovering":
+            color = NSColor.systemYellowColor()
+        else:
+            color = NSColor.labelColor()
         self._status_label.setTextColor_(color)
 
     @objc.signature(b"v@:@")

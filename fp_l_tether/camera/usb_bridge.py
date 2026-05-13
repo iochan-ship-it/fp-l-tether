@@ -99,6 +99,22 @@ class USBBridgeError(RuntimeError):
     pass
 
 
+class CameraIdleError(USBBridgeError):
+    """The camera returned a 0-byte data IN for a Sigma get-* call.
+
+    Empirically the fp L does this after ~5 minutes of USB idle even
+    while it is in PC capture mode — it appears to enter an internal
+    power-saving state where vendor opcodes "succeed" at the PTP layer
+    (the response phase is delivered) but the data phase returns
+    nothing. The fix is to nudge the camera back into the active state
+    via a benign ping (e.g. ``sigma_get_camera_info``) plus a re-arm
+    of PC capture mode; the watcher recovery path handles that.
+
+    Distinct from PTPError (camera said no) and from USBBridgeError
+    (bus-level fault) so callers can pattern-match cleanly.
+    """
+
+
 class PTPError(USBBridgeError):
     def __init__(self, response_code: int, message: str = ""):
         self.response_code = response_code
@@ -113,6 +129,24 @@ def _response_name(code: int) -> str:
         return PTPResponseCode(code).name
     except ValueError:
         return f"unknown_0x{code:04X}"
+
+
+def _guard_zero_byte(data: bytes, label: str) -> None:
+    """Raise CameraIdleError if ``data`` is empty.
+
+    Sigma fp L vendor get-* opcodes empirically return an empty data
+    phase (PTP layer says OK, but the bulk IN delivers 0 bytes) after
+    ~5 minutes of USB idle even while PC capture mode is engaged. We
+    treat that as a recoverable idle, not a fatal protocol error —
+    the watcher catches CameraIdleError and runs a re-arm sequence.
+
+    ``label`` identifies which Sigma get-* call triggered the empty
+    read, for the recovery log message.
+    """
+    if not data:
+        raise CameraIdleError(
+            f"camera_idle_zero_byte_read ({label})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -520,18 +554,21 @@ class USBBridge:
         """
         resp = self.send_command_raw(SigmaOperationCode.CONFIG_API)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "camera_info")
         return resp.in_data
 
     def sigma_get_cam_can_set_info_5(self) -> bytes:
         """0x9030 ``GetCamCanSetInfo5``."""
         resp = self.send_command_raw(SigmaOperationCode.GET_CAM_CAN_SET_INFO_5)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_can_set_info_5")
         return resp.in_data
 
     def sigma_get_cam_config(self) -> bytes:
         """0x9010 ``GetCamConfig`` — global camera configuration blob."""
         resp = self.send_command_raw(SigmaOperationCode.GET_CAM_CONFIG)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_config")
         return resp.in_data
 
     def sigma_get_datagroup(self, group: int) -> bytes:
@@ -557,18 +594,21 @@ class USBBridge:
             raise ValueError(f"group must be 1..6, got {group}")
         resp = self.send_command_raw(opcode_by_group[group])
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, f"datagroup_{group}")
         return resp.in_data
 
     def sigma_get_cam_datagroup_focus(self) -> bytes:
         """0x9031 ``GetCamDataGroupFocus``."""
         resp = self.send_command_raw(SigmaOperationCode.GET_CAM_DATA_GROUP_FOCUS)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_datagroup_focus")
         return resp.in_data
 
     def sigma_get_cam_datagroup_movie(self) -> bytes:
         """0x9033 ``GetCamDataGroupMovie``."""
         resp = self.send_command_raw(SigmaOperationCode.GET_CAM_DATA_GROUP_MOVIE)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_datagroup_movie")
         return resp.in_data
 
     def sigma_get_view_frame(self) -> bytes:
@@ -604,6 +644,7 @@ class USBBridge:
             params=(canset, datagroup, other),
         )
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_status_2")
         return resp.in_data
 
     def sigma_set_cam_datagroup_focus(self, x: int, y: int) -> None:
@@ -895,6 +936,7 @@ class USBBridge:
             SigmaOperationCode.GET_CAM_CAPT_STATUS, params=(p1,)
         )
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "capture_status")
         return SgmCaptStatus.from_libgphoto2_wire(resp.in_data)
 
     def sigma_snap(self, mode: int = 1, amount: int = 1) -> None:
@@ -933,6 +975,7 @@ class USBBridge:
         """
         resp = self.send_command_raw(SigmaOperationCode.GET_PICT_FILE_INFO_2)
         resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "pict_file_info_2")
         return SigmaFpPictFileInfo2Ex.from_wire(resp.in_data)
 
     def sigma_get_big_partial_pict_file(

@@ -80,6 +80,33 @@ python -c "import ImageCaptureCore; print('OK:', ImageCaptureCore.__bundle__)"
 
 ---
 
+## 4.5 fp L 本体メニュー（テザー撮影向け推奨設定）
+
+長時間のテザー撮影で安定動作させるため、本体メニューで以下を設定してください。
+
+### Auto Power Off → **OFF**（必須推奨）
+
+**MENU → システム → Auto Power Off → OFF**
+
+fp L はテザー撮影中であっても、約5分以上 USB バスが idle になると内部
+省電力モードに入る挙動があります。この状態では Sigma 独自オペコード
+（`GetCamCaptStatus` 等）が **0-byte data phase** を返すようになり、
+本アプリの daemon は一時的に停止します。
+
+本アプリは以下の二段構えで対応していますが、根本予防として本体側の
+Auto Power Off を OFF にしておくことを強く推奨:
+
+- **予防**: 60秒毎の `sigma_get_camera_info` ping (keep-alive heartbeat) で
+  カメラを起こし続ける（`config.toml [camera] keep_alive_enabled = true`）
+- **回復**: 0-byte read を検知したら `sigma_get_camera_info` +
+  `sigma_set_datagroup_3_pc_capture` で再起動を試みる
+  （panel の status は黄色 `◍ recovering` で表示）
+
+商用ソフト（Capture One 等）も内部で同等の keep-alive を持っているため、
+本機の仕様レベルで必要な対策です。
+
+---
+
 ## 5. 干渉する他アプリを終了
 
 以下のアプリは Sigma fp L の PTP セッションを掴むので、本アプリ実行中は終了しておくこと:
