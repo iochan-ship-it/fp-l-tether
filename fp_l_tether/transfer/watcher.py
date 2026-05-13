@@ -1289,9 +1289,22 @@ class TetherDaemon:
                         )
                         t_last_polling_log = now
 
-                    # Watchdog: if the shot has been pending too long,
-                    # reset so the next snap can fire. The camera will
-                    # eventually catch up (or the user can re-trigger).
+                    # Watchdog: shot stuck > snap_watchdog_s. Previously
+                    # we just reset t_shot_start and let polling continue,
+                    # but the 2026-05-13 endurance run showed that once
+                    # the camera enters stuck 0x0001 it stays there
+                    # forever (4 consecutive 35s timeouts observed) —
+                    # the underlying ImageDB write pipeline is wedged
+                    # and only a session-level reset recovers it.
+                    #
+                    # Fix 3: raise USBBridgeError to bounce out to the
+                    # outer reconnect loop (_run), which:
+                    #   - closes the bridge cleanly
+                    #   - waits ``reconnect_delay_s`` (2 s)
+                    #   - re-opens, re-runs sigma_init, resumes
+                    # If the endpoint is truly wedged (Errno 60), the
+                    # reopen fails fast and the existing 5-failure cap
+                    # triggers the "電源 OFF→ON" message.
                     if now - t_shot_start > snap_watchdog_s:
                         self.log.warning(
                             "snap_watchdog_timeout",
@@ -1302,15 +1315,21 @@ class TetherDaemon:
                             elapsed_s=round(now - t_shot_start, 2),
                         )
                         self._emit_status(
-                            "error",
-                            f"Snap timeout — status 0x{status.capt_status:04X}",
+                            "recovering",
+                            f"Snap timeout (0x{status.capt_status:04X}) — "
+                            "セッションをリセット中…",
                         )
-                        t_shot_start = None
-                        pending_trigger = "camera_button"
-                        t_last_polling_log = 0.0
-                        # Snap is being abandoned → resume LV so the
-                        # user still sees the viewfinder.
-                        self._resume_liveview()
+                        # Try to release LV cleanly before bouncing —
+                        # the outer reconnect will tear it down anyway,
+                        # but a tidy pause helps if the camera is
+                        # actually alive and just slow.
+                        self._pause_liveview()
+                        raise USBBridgeError(
+                            f"snap_watchdog_timeout: capt_status="
+                            f"0x{status.capt_status:04X}, "
+                            f"slot={self._next_slot}, "
+                            f"elapsed_s={round(now - t_shot_start, 2)}"
+                        )
 
                 # Use active interval when we're waiting on a pending shot,
                 # idle interval when just watching for a manual button press.
