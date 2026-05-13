@@ -49,7 +49,9 @@ DURATION_S = 30.0
 SNAP_COUNT = 5
 SNAP_INTERVAL_S = 5.0
 LOG_INTERVAL_S = 2.0
-TARGET_FPS = 15
+# Match the production default (LiveViewConfig.target_fps). The rate
+# ceiling test on FW V90 showed 10 fps sustains and 15 fps stalls.
+TARGET_FPS = 10
 OUT_PATH = Path.home() / "Desktop" / "last_frame.jpg"
 
 
