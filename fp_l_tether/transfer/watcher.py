@@ -1055,7 +1055,7 @@ class TetherDaemon:
                     self._emit_status("downloading", f"Slot 0x{self._next_slot:02X}")
                     try:
                         with self._ptp_lock:
-                            info, data = bridge.sigma_download_current(
+                            entries = bridge.sigma_download_current(
                                 status,
                                 clear_strategy="image_db_head",
                             )
@@ -1068,13 +1068,11 @@ class TetherDaemon:
                         continue
                     except ValueError as e:
                         # PictFileInfo2 parse sanity check tripped — the
-                        # response from the camera didn't match the
-                        # expected single-file layout (e.g. DNG+JPG mode
-                        # returns a different struct). The bridge has
-                        # NOT initiated a GetBigPartialPictFile, so the
-                        # bulk endpoint is intact. Log, advance past
-                        # this slot, re-arm LV, and continue — the user
-                        # can switch back to JPG or DNG-only.
+                        # response from the camera failed the per-entry
+                        # ext / size whitelist. The bridge has NOT
+                        # initiated a GetBigPartialPictFile, so the bulk
+                        # endpoint is intact. Log, advance past this
+                        # slot, re-arm LV, and continue.
                         self.log.error(
                             "download_parse_failed",
                             error=str(e),
@@ -1085,7 +1083,7 @@ class TetherDaemon:
                         )
                         self._emit_status(
                             "error",
-                            f"画像情報の解析失敗 (DNG+JPG layout?): {e}",
+                            f"画像情報の解析失敗: {e}",
                         )
                         self._next_slot = (self._next_slot + 1) & 0xFF
                         self._resume_liveview()
@@ -1111,85 +1109,95 @@ class TetherDaemon:
                     # exposure dials). Once armed, the main loop's
                     # top-of-loop guard suppresses all PTP traffic
                     # until the window expires.
+
+                    # entries is len 1 (JPG-only / DNG-only) or len 2
+                    # (DNG+JPG). All files in one entries list share
+                    # the same shutter — same shot_index, same
+                    # item_idx, same base filename, only the
+                    # extension differs.
                     self._shot_count += 1
-                    # Per-item shot counter for the filename template's
-                    # ``{shot}``. Resets implicitly when the user types a
-                    # new item name in the panel.
                     with self._item_lock:
                         item = self._current_item
                         item_idx = self._shots_by_item.get(item, 0) + 1
                         self._shots_by_item[item] = item_idx
-                    dest = build_destination(
-                        self.cfg,
-                        shot_index=item_idx,
-                        session_name=self.session_name,
-                        item_name=item,
-                        image_id=status.image_id,
-                        camera_name="fpL",
-                        file_ext=(info.fileext or "jpg").lstrip("."),
-                    )
-                    if dest.session_dir is not None:
-                        dest.session_dir.mkdir(parents=True, exist_ok=True)
-                    saved = write_atomic(
-                        dest.path,
-                        data,
-                        on_conflict=self.cfg.output.on_conflict,
-                    )
 
-                    elapsed = (time.monotonic() - t_shot_start) if t_shot_start else 0.0
+                    elapsed = (
+                        (time.monotonic() - t_shot_start)
+                        if t_shot_start else 0.0
+                    )
+                    saved_paths: list[Path] = []
+                    total_size = 0
+                    for entry_idx, (info, data) in enumerate(entries):
+                        dest = build_destination(
+                            self.cfg,
+                            shot_index=item_idx,
+                            session_name=self.session_name,
+                            item_name=item,
+                            image_id=status.image_id,
+                            camera_name="fpL",
+                            file_ext=(info.fileext or "jpg").lstrip("."),
+                        )
+                        if dest.session_dir is not None:
+                            dest.session_dir.mkdir(
+                                parents=True, exist_ok=True
+                            )
+                        saved = write_atomic(
+                            dest.path,
+                            data,
+                            on_conflict=self.cfg.output.on_conflict,
+                        )
+                        saved_paths.append(saved)
+                        total_size += len(data)
+                        # Per-file log so the user sees both halves of
+                        # a DNG+JPG pair in the log stream.
+                        log_shot(
+                            self.log,
+                            filename=saved.name,
+                            size=len(data),
+                            elapsed_s=elapsed,
+                            image_id=status.image_id,
+                            slot=(self._next_slot + entry_idx) & 0xFF,
+                            image_db_head=status.image_db_head,
+                            image_db_tail=status.image_db_tail,
+                            trigger=pending_trigger,
+                        )
+
+                    # Emit a single ShotEvent representing the shutter
+                    # (the primary file — DNG comes first in DNG+JPG
+                    # mode, so saved_paths[0] is the "main" image).
+                    # size is the sum so the UI's running total is
+                    # accurate.
                     event = ShotEvent(
                         shot_index=self._shot_count,
-                        saved_path=saved,
-                        size=len(data),
+                        saved_path=saved_paths[0],
+                        size=total_size,
                         elapsed_s=elapsed,
                         image_id=status.image_id,
                         db_head=status.image_db_head,
                         db_tail=status.image_db_tail,
                         trigger=pending_trigger,
                     )
-                    log_shot(
-                        self.log,
-                        filename=saved.name,
-                        size=event.size,
-                        elapsed_s=event.elapsed_s,
-                        image_id=event.image_id,
-                        slot=self._next_slot,
-                        image_db_head=event.db_head,
-                        image_db_tail=event.db_tail,
-                        trigger=pending_trigger,
-                    )
                     self._emit_shot(event)
-                    self._emit_status("ready", f"Saved #{self._shot_count}: {saved.name}")
+                    if len(saved_paths) == 1:
+                        ready_msg = (
+                            f"Saved #{self._shot_count}: "
+                            f"{saved_paths[0].name}"
+                        )
+                    else:
+                        names = " + ".join(p.name for p in saved_paths)
+                        ready_msg = (
+                            f"Saved #{self._shot_count}: {names}"
+                        )
+                    self._emit_status("ready", ready_msg)
                     # Refresh exposure display — the user may have rolled a
                     # dial between shots.
                     self._emit_exposure(bridge)
 
-                    # Diagnostic: detect dual-file (DNG+JPG) captures.
-                    # After advancing _next_slot below, if db_tail is
-                    # still ahead by 1 it means the camera wrote a
-                    # second file for this snap — the main loop will
-                    # naturally drain it on the next iteration and
-                    # emit a second ShotEvent (the JPG companion to
-                    # the DNG, or vice versa). Phase 3.5e relies on
-                    # this Case-B assumption; if a future test shows
-                    # PictFileInfo2 instead returns a single info
-                    # with two file slots (Case A), the parser in
-                    # ptp_codes.py needs extending. Until proven
-                    # otherwise, Case B is the operating model.
-                    if (status.image_db_tail & 0xFF) != (
-                        (self._next_slot + 1) & 0xFF
-                    ):
-                        self.log.info(
-                            "dual_file_slot_pending",
-                            current_slot=self._next_slot,
-                            db_head=status.image_db_head,
-                            db_tail=status.image_db_tail,
-                            file_ext=info.fileext,
-                            note="extra slot likely DNG+JPG companion",
-                        )
-
-                    # Advance to next slot, reset trigger marker
-                    self._next_slot = (self._next_slot + 1) & 0xFF
+                    # Advance past every slot we just consumed, then
+                    # reset trigger marker.
+                    self._next_slot = (
+                        self._next_slot + len(entries)
+                    ) & 0xFF
                     pending_trigger = "camera_button"
                     t_shot_start = None
 

@@ -160,18 +160,22 @@ def main() -> int:
                         # Drain (download + clear) — same call the
                         # daemon makes. This is what makes the camera
                         # release its commit-window busy state.
-                        info, data = bridge.sigma_download_current(
+                        # Returns a list; this rate-test only ever
+                        # uses JPG, so there's one entry per snap.
+                        results = bridge.sigma_download_current(
                             status, clear_strategy="image_db_head",
                         )
+                        info, data = results[0]
                     snap_dt = time.monotonic() - t_snap
                     snap_ok = True
                     snaps_ok += 1
+                    total_bytes = sum(len(d) for _i, d in results)
                     print(
                         f"  [t={now - t0:5.1f}s] SNAP #{snaps_fired} "
                         f"fired+drained "
                         f"(snap={snap_fired_dt * 1000:.0f} ms, "
                         f"total={snap_dt * 1000:.0f} ms, "
-                        f"size={len(data) / 1024:.0f} KB, "
+                        f"size={total_bytes / 1024:.0f} KB, "
                         f"slot=0x{target_slot:02X})"
                     )
                 except (PTPError, USBBridgeError, TimeoutError) as e:

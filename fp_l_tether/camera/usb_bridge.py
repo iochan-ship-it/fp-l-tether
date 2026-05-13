@@ -969,14 +969,30 @@ class USBBridge:
         resp.raise_for_status()
 
     def sigma_get_pict_file_info_2(self) -> SigmaFpPictFileInfo2Ex:
-        """0x902d ``GetPictFileInfo2`` — file metadata after a successful snap.
+        """0x902d ``GetPictFileInfo2`` — file metadata for the latest snap.
 
-        Returns the parsed struct (fileaddress, filesize, name, ext, dims).
+        Returns the **first** entry. For single-file modes (JPG only,
+        DNG only) that's the only file. For DNG+JPG mode the response
+        actually carries two entries; this method silently drops the
+        second one — use :meth:`sigma_get_pict_file_info_2_list` if
+        you need all of them.
+        """
+        return self.sigma_get_pict_file_info_2_list()[0]
+
+    def sigma_get_pict_file_info_2_list(
+        self,
+    ) -> list[SigmaFpPictFileInfo2Ex]:
+        """0x902d ``GetPictFileInfo2`` returning **all** entries.
+
+        On fp L this returns one entry for single-file modes (JPG /
+        DNG) and two entries for DNG+JPG mode (DNG first, then JPG).
+        See :class:`SigmaFpPictFileInfo2Ex` for the on-the-wire
+        layout details.
         """
         resp = self.send_command_raw(SigmaOperationCode.GET_PICT_FILE_INFO_2)
         resp.raise_for_status()
         _guard_zero_byte(resp.in_data, "pict_file_info_2")
-        return SigmaFpPictFileInfo2Ex.from_wire(resp.in_data)
+        return SigmaFpPictFileInfo2Ex.from_wire_list(resp.in_data)
 
     def sigma_get_big_partial_pict_file(
         self,
@@ -1088,53 +1104,67 @@ class USBBridge:
         self,
         post_status: SgmCaptStatus,
         clear_strategy: str = "image_db_head",
-    ) -> tuple[SigmaFpPictFileInfo2Ex, bytes]:
-        """Download the image currently waiting in the camera, then clear it.
+    ) -> list[tuple[SigmaFpPictFileInfo2Ex, bytes]]:
+        """Download the file(s) for the latest snap, then clear them.
 
         Used after either ``sigma_wait_for_shot`` (camera-triggered) or
-        an explicit ``sigma_snap`` (PC-triggered). Returns
-        ``(file_info, file_bytes)``.
+        an explicit ``sigma_snap`` (PC-triggered).
 
-        ``post_status`` is the success-time SgmCaptStatus (used for
-        clearing the right slot).
+        Returns a list of ``(file_info, file_bytes)`` tuples — length
+        1 for single-file modes (JPG / DNG only) and length 2 for
+        DNG+JPG mode (DNG first, then JPG; same shutter, same base
+        filename, different extensions).
+
+        ``post_status`` is the success-time SgmCaptStatus. For the
+        ``image_db_head`` clear strategy we walk ``len(entries)``
+        consecutive slot ids starting from ``post_status.image_db_head``
+        — DNG+JPG occupies two adjacent slots, single-file modes one.
         """
-        info = self.sigma_get_pict_file_info_2()
-        logger.info(
-            "sigma_download: file %s%s addr=0x%X size=%d (%dx%d)",
-            info.name, info.fileext, info.fileaddress,
-            info.filesize, info.width, info.height,
-        )
-
-        data = self.sigma_get_big_partial_pict_file(
-            info.fileaddress, 0, info.filesize
-        )
-        if len(data) != info.filesize:
-            logger.debug(
-                "sigma_download: size mismatch got=%d expected=%d "
-                "(USB ZLP padding, harmless for JPEG)",
-                len(data), info.filesize,
+        entries = self.sigma_get_pict_file_info_2_list()
+        results: list[tuple[SigmaFpPictFileInfo2Ex, bytes]] = []
+        for idx, info in enumerate(entries):
+            logger.info(
+                "sigma_download: file %s%s addr=0x%X size=%d (%dx%d)"
+                "%s",
+                info.name, info.fileext, info.fileaddress,
+                info.filesize, info.width, info.height,
+                f" [entry {idx + 1}/{len(entries)}]"
+                if len(entries) > 1 else "",
             )
+            data = self.sigma_get_big_partial_pict_file(
+                info.fileaddress, 0, info.filesize
+            )
+            if len(data) != info.filesize:
+                logger.debug(
+                    "sigma_download: size mismatch got=%d expected=%d "
+                    "(USB ZLP padding, harmless for JPEG)",
+                    len(data), info.filesize,
+                )
+            results.append((info, data))
 
-        # Clear from camera DB
+        # Clear from camera DB. For DNG+JPG we have 2 slots to drop;
+        # for single-file modes, 1.
         if clear_strategy == "none":
             logger.debug("sigma_download: skipping clear (clear_strategy=none)")
         elif clear_strategy == "all":
             self.sigma_clear_image_db_all()
             logger.debug("sigma_download: cleared ALL")
         else:
-            clear_id_map = {
+            base_id = {
                 "image_id": post_status.image_id,
                 "image_db_head": post_status.image_db_head,
                 "image_db_tail": post_status.image_db_tail,
-            }
-            clear_id = clear_id_map[clear_strategy]
-            self.sigma_clear_image_db_single(clear_id)
-            logger.debug(
-                "sigma_download: cleared id=0x%02X (strategy=%s)",
-                clear_id, clear_strategy,
-            )
+            }[clear_strategy]
+            for i in range(len(entries)):
+                clear_id = (base_id + i) & 0xFF
+                self.sigma_clear_image_db_single(clear_id)
+                logger.debug(
+                    "sigma_download: cleared id=0x%02X "
+                    "(strategy=%s, entry %d/%d)",
+                    clear_id, clear_strategy, i + 1, len(entries),
+                )
 
-        return info, data
+        return results
 
     def sigma_capture_one(
         self,

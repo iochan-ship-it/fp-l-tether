@@ -445,20 +445,41 @@ class SgmPictureFileInfoData:
 class SigmaFpPictFileInfo2Ex:
     """File metadata returned by GetPictFileInfo2 (0x902D).
 
-    Wire format CONFIRMED from libgphoto2 master ptp.c lines 1200-1261:
+    Two on-the-wire layouts have been observed on fp L (2026-05-13):
 
-        bytes [0..3]   : uint32 LE = 56   (always 56, indicates length follows)
-        bytes [12..15] : fileaddress (uint32 LE) — for GetBigPartialPictFile param
-        bytes [16..19] : filesize (uint32 LE) — total file bytes
-        bytes [20..23] : path offset (uint32 LE) — offset into this data buffer
-        bytes [24..27] : name offset (uint32 LE) — offset into this data buffer
-        bytes [28..31] : fileext (4-byte ASCII, e.g. "JPG\\0" or "DNG\\0")
-        bytes [32..33] : width (uint16 LE)
-        bytes [34..35] : height (uint16 LE)
-        bytes [path_off..path_off+9]: path string (9 bytes, "100SIGMA\\0")
-        bytes [name_off..name_off+9]: name string (9 bytes, "SDIM0001.JPG\\0" et al)
+    **Single-file** (declared_length = 56, total ~60+ bytes) — the
+    layout documented by libgphoto2 master ptp.c lines 1200-1261, used
+    for JPG-only and DNG-only captures:
 
-    Minimum total length: 60 bytes (more if path/name strings are appended).
+        [0..3]   uint32 LE  declared_length = 56
+        [4..11]  (8 bytes, ignored)
+        [12..15] uint32 LE  fileaddress
+        [16..19] uint32 LE  filesize
+        [20..23] uint32 LE  path_off (absolute)
+        [24..27] uint32 LE  name_off (absolute)
+        [28..31] char[4]    fileext  (e.g. "JPG\\0", "DNG\\0")
+        [32..33] uint16 LE  width
+        [34..35] uint16 LE  height
+        [path_off..]        null-terminated path string ("100SIGMA")
+        [name_off..]        null-terminated name string ("SDIM0001.JPG")
+
+    **Multi-file** (declared_length > 56, observed = 108 for DNG+JPG) —
+    fp L DNG+JPG mode emits two file entries in one response:
+
+        [0..3]   uint32 LE  declared_length (108 observed)
+        [4..7]   uint32 LE  entry_count (2 observed)
+        [8..11]  uint32 LE  first_entry_offset (16 observed)
+        [12..15] (4 bytes, ignored — 0x40 observed)
+        [first_entry_offset..]  Entry 1 (24-byte header + strings)
+        [next 4-byte aligned..] Entry 2 (24-byte header + strings)
+
+    Each entry's 24-byte header has the same layout as the single-file
+    case starting at offset 12 in that case (addr / size / path_off /
+    name_off / fileext / width / height). path_off and name_off remain
+    absolute offsets from the start of the response buffer.
+
+    Reverse-engineered from a live DNG+JPG snap on fp L V90 by
+    capturing the raw response with the Step-1 sanity-guard hex dump.
     """
 
     fileaddress: int  # camera-internal pointer for GetBigPartialPictFile
@@ -469,81 +490,39 @@ class SigmaFpPictFileInfo2Ex:
     path: str  # e.g. "100SIGMA"
     name: str  # e.g. "SDIM0001.JPG"
 
-    @classmethod
-    def from_wire(cls, data: bytes) -> "SigmaFpPictFileInfo2Ex":
-        if len(data) < 60:
-            raise ValueError(
-                f"SigmaFpPictFileInfo2Ex needs >=60 bytes, got {len(data)}"
-            )
-        # libgphoto2 checks data[0..3] == 56
-        declared = int.from_bytes(data[0:4], "little")
-        if declared != 56:
-            # warn but don't fail
-            pass
-        fileaddress = int.from_bytes(data[12:16], "little")
-        filesize = int.from_bytes(data[16:20], "little")
-        path_off = int.from_bytes(data[20:24], "little")
-        name_off = int.from_bytes(data[24:28], "little")
-        fileext_raw = data[28:32]
-        # strip trailing nulls
-        fileext = fileext_raw.split(b"\x00", 1)[0].decode("ascii", errors="replace")
-        width = int.from_bytes(data[32:34], "little")
-        height = int.from_bytes(data[34:36], "little")
+    # ---- parsing helpers --------------------------------------------------
 
-        # Bounds check the path/name offsets
+    @classmethod
+    def _parse_entry_at(
+        cls, data: bytes, off: int
+    ) -> "SigmaFpPictFileInfo2Ex":
+        """Parse a single 24-byte entry header (+ its null-terminated
+        path/name strings) starting at ``off``."""
+        if off + 24 > len(data):
+            raise ValueError(
+                f"SigmaFpPictFileInfo2Ex entry header overflows buffer "
+                f"(off={off}, total_len={len(data)})"
+            )
+        fileaddress = int.from_bytes(data[off:off + 4], "little")
+        filesize = int.from_bytes(data[off + 4:off + 8], "little")
+        path_off = int.from_bytes(data[off + 8:off + 12], "little")
+        name_off = int.from_bytes(data[off + 12:off + 16], "little")
+        fileext_raw = data[off + 16:off + 20]
+        fileext = fileext_raw.split(b"\x00", 1)[0].decode(
+            "ascii", errors="replace"
+        )
+        width = int.from_bytes(data[off + 20:off + 22], "little")
+        height = int.from_bytes(data[off + 22:off + 24], "little")
+
         path = ""
         name = ""
         if 0 < path_off < len(data):
-            path_bytes = data[path_off : path_off + 9]
-            path = path_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
+            path = data[path_off:].split(b"\x00", 1)[0].decode(
+                "ascii", errors="replace"
+            )
         if 0 < name_off < len(data):
-            name_bytes = data[name_off : name_off + 9]
-            name = name_bytes.split(b"\x00", 1)[0].decode("ascii", errors="replace")
-
-        # -----------------------------------------------------------------
-        # Defensive sanity guards (added 2026-05-13 after DNG+JPG wedge):
-        #
-        # In DNG+JPG mode the response layout appears to differ from the
-        # documented 60-byte single-file format (possibly a leading
-        # entry-count or two concatenated entries). When the parser
-        # misaligns, filesize comes out near 1.9 GB and the resulting
-        # GetBigPartialPictFile attempt wedges the bulk endpoint.
-        #
-        # These guards raise BEFORE returning so the caller never
-        # initiates a download with bogus parameters, and they dump the
-        # raw response bytes so the layout can be reverse-engineered
-        # without bricking the session.
-        # -----------------------------------------------------------------
-        suspicious = (
-            filesize <= 0
-            or filesize > _MAX_REASONABLE_FILESIZE
-            or fileext.upper() not in _KNOWN_FILE_EXTS
-        )
-        if suspicious:
-            hex_head = data[: min(96, len(data))].hex(" ")
-            _logger.error(
-                "SigmaFpPictFileInfo2Ex: suspicious parse "
-                "(declared_len=%d total_len=%d "
-                "addr=0x%X size=%d ext=%r path=%r name=%r width=%d height=%d) "
-                "raw_head=%s",
-                declared, len(data), fileaddress, filesize, fileext,
-                path, name, width, height, hex_head,
-            )
-            raise ValueError(
-                "SigmaFpPictFileInfo2Ex parse failed sanity check "
-                f"(size={filesize}, ext={fileext!r}); raw bytes logged. "
-                "Likely a DNG+JPG / multi-file layout the parser does "
-                "not yet handle — download aborted to protect the bulk "
-                "endpoint."
-            )
-
-        # Always trace the raw head at DEBUG so successful parses also
-        # leave a record we can compare against the suspicious cases.
-        if _logger.isEnabledFor(logging.DEBUG):
-            _logger.debug(
-                "SigmaFpPictFileInfo2Ex: ok (size=%d ext=%s name=%s) raw_head=%s",
-                filesize, fileext, name,
-                data[: min(64, len(data))].hex(" "),
+            name = data[name_off:].split(b"\x00", 1)[0].decode(
+                "ascii", errors="replace"
             )
 
         return cls(
@@ -555,6 +534,143 @@ class SigmaFpPictFileInfo2Ex:
             path=path,
             name=name,
         )
+
+    # ---- public API --------------------------------------------------
+
+    @classmethod
+    def from_wire(cls, data: bytes) -> "SigmaFpPictFileInfo2Ex":
+        """Return the *first* entry. Kept for callers (e.g. one-shot
+        scripts) that don't need to handle DNG+JPG dual files.
+
+        Equivalent to ``from_wire_list(data)[0]`` but with a more
+        constrained type. Use ``from_wire_list`` if you might receive
+        multiple files (DNG+JPG mode)."""
+        entries = cls.from_wire_list(data)
+        return entries[0]
+
+    @classmethod
+    def from_wire_list(
+        cls, data: bytes
+    ) -> list["SigmaFpPictFileInfo2Ex"]:
+        """Parse one or many file entries from a GetPictFileInfo2 response.
+
+        Auto-detects single-file vs multi-file layout by inspecting
+        the ``declared_length`` field at bytes [0..3]: == 56 means
+        legacy single-file, > 56 means multi-file with an extended
+        header.
+        """
+        if len(data) < 60:
+            raise ValueError(
+                f"SigmaFpPictFileInfo2Ex needs >=60 bytes, got {len(data)}"
+            )
+        declared = int.from_bytes(data[0:4], "little")
+
+        if declared == 56:
+            # Legacy single-entry layout, entry header at offset 12.
+            entries = [cls._parse_entry_at(data, 12)]
+        else:
+            # Multi-entry layout
+            count = int.from_bytes(data[4:8], "little")
+            first_off = int.from_bytes(data[8:12], "little")
+            if count < 1 or count > 4:
+                hex_head = data[: min(96, len(data))].hex(" ")
+                _logger.error(
+                    "SigmaFpPictFileInfo2Ex: implausible entry_count=%d "
+                    "(declared=%d total_len=%d first_off=%d) raw_head=%s",
+                    count, declared, len(data), first_off, hex_head,
+                )
+                raise ValueError(
+                    f"SigmaFpPictFileInfo2Ex: implausible entry_count="
+                    f"{count}; raw bytes logged."
+                )
+            if first_off < 12 or first_off >= len(data):
+                hex_head = data[: min(96, len(data))].hex(" ")
+                _logger.error(
+                    "SigmaFpPictFileInfo2Ex: bad first_entry_offset=%d "
+                    "(declared=%d count=%d total_len=%d) raw_head=%s",
+                    first_off, declared, count, len(data), hex_head,
+                )
+                raise ValueError(
+                    f"SigmaFpPictFileInfo2Ex: bad first_entry_offset="
+                    f"{first_off}; raw bytes logged."
+                )
+            entries = []
+            cursor = first_off
+            for i in range(count):
+                if cursor + 24 > len(data):
+                    hex_head = data[: min(96, len(data))].hex(" ")
+                    _logger.error(
+                        "SigmaFpPictFileInfo2Ex: entry %d overflows at "
+                        "cursor=%d (total_len=%d) raw_head=%s",
+                        i, cursor, len(data), hex_head,
+                    )
+                    raise ValueError(
+                        f"SigmaFpPictFileInfo2Ex: entry {i} overflows "
+                        f"at cursor={cursor}; raw bytes logged."
+                    )
+                entry = cls._parse_entry_at(data, cursor)
+                entries.append(entry)
+                if i + 1 < count:
+                    # Advance past this entry's strings to the next
+                    # 4-byte-aligned offset.
+                    boundary = cursor + 24
+                    # The strings live at the absolute path_off / name_off
+                    # offsets we just parsed. Both end with a null
+                    # terminator; take the max end.
+                    p_off = int.from_bytes(
+                        data[cursor + 8:cursor + 12], "little"
+                    )
+                    n_off = int.from_bytes(
+                        data[cursor + 12:cursor + 16], "little"
+                    )
+                    for s_off in (p_off, n_off):
+                        if 0 < s_off < len(data):
+                            null_pos = data.find(b"\x00", s_off)
+                            if null_pos < 0:
+                                # missing terminator → bail to declared_len
+                                end = declared
+                            else:
+                                end = null_pos + 1
+                            if end > boundary:
+                                boundary = end
+                    cursor = (boundary + 3) & ~0x3
+
+        # Per-entry sanity guards — same logic as the Step 1 single-file
+        # checks, now applied to every entry. Raises on bogus parses
+        # before we hand the entries back to the bridge.
+        for idx, e in enumerate(entries):
+            suspicious = (
+                e.filesize <= 0
+                or e.filesize > _MAX_REASONABLE_FILESIZE
+                or e.fileext.upper() not in _KNOWN_FILE_EXTS
+            )
+            if suspicious:
+                hex_head = data[: min(128, len(data))].hex(" ")
+                _logger.error(
+                    "SigmaFpPictFileInfo2Ex: suspicious entry %d/%d "
+                    "(declared_len=%d total_len=%d "
+                    "addr=0x%X size=%d ext=%r path=%r name=%r "
+                    "width=%d height=%d) raw_head=%s",
+                    idx, len(entries), declared, len(data),
+                    e.fileaddress, e.filesize, e.fileext,
+                    e.path, e.name, e.width, e.height, hex_head,
+                )
+                raise ValueError(
+                    f"SigmaFpPictFileInfo2Ex entry {idx} failed "
+                    f"sanity check (size={e.filesize}, "
+                    f"ext={e.fileext!r}); raw bytes logged."
+                )
+
+        if _logger.isEnabledFor(logging.DEBUG):
+            _logger.debug(
+                "SigmaFpPictFileInfo2Ex: parsed %d entr%s "
+                "(declared=%d total=%d): %s",
+                len(entries), "y" if len(entries) == 1 else "ies",
+                declared, len(data),
+                ", ".join(f"{e.fileext}/{e.filesize}B" for e in entries),
+            )
+
+        return entries
 
     @property
     def full_filename(self) -> str:
