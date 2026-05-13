@@ -158,6 +158,15 @@ class FloatingTetherPanel(NSObject):
         # for an overlay tool.
         self._app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
+        # Controls-busy gate (Fix 4, 2026-05-13): while the daemon
+        # reports state in ("shooting", "downloading"), Shoot / AF /
+        # AF Point buttons + all exposure dropdowns are greyed out
+        # and the LV overlay is force-shown. Pressing controls during
+        # commit window queues requests that fire into a busy camera
+        # — the 2026-05-13 endurance run showed this cascading into
+        # FW wedge. Dimming gives the user visual feedback to wait.
+        self._controls_busy = False
+
         self._build_window()
         self._wire_callbacks()
         self._install_hotkeys()
@@ -589,6 +598,52 @@ class FloatingTetherPanel(NSObject):
             color = NSColor.labelColor()
         self._status_label.setTextColor_(color)
 
+        # ----- Fix 4: dim controls during commit window -----
+        # shooting / downloading = camera is mid-cycle, button presses
+        # just queue. ready / error / stopped / disconnected = safe
+        # to interact again. Other states (connecting / initializing /
+        # focusing / recovering) leave the current dim state alone —
+        # focusing is sub-second so we don't flash on every AF.
+        if state in ("shooting", "downloading"):
+            self._set_controls_busy(True)
+        elif state in ("ready", "error", "stopped", "disconnected"):
+            self._set_controls_busy(False)
+
+    def _set_controls_busy(self, busy: bool) -> None:
+        """Toggle interactive controls based on capture-busy state.
+
+        Disables Shoot / AF / AF Point + all six exposure dropdowns
+        when ``busy=True`` (state in shooting/downloading) and
+        re-enables them on ``busy=False``. Also force-shows the LV
+        overlay during busy so the user sees "Saving…" instantly
+        instead of waiting ~500 ms for the staleness watchdog.
+
+        When un-busying, we DON'T force-hide the overlay — the
+        staleness watchdog still owns the post-snap visual transition
+        (overlay stays until a fresh LV frame lands, which is the
+        right "camera is back online" cue).
+        """
+        if self._controls_busy == busy:
+            return
+        self._controls_busy = busy
+        enabled = not busy
+        for btn in (self._shoot_btn, self._af_btn, self._af_point_btn):
+            btn.setEnabled_(enabled)
+        for dd in (
+            self._iso_dropdown,
+            self._ss_dropdown,
+            self._av_dropdown,
+            self._wb_dropdown,
+            self._fmt_dropdown,
+            self._size_dropdown,
+        ):
+            dd.setEnabled_(enabled)
+        if busy:
+            # Force the overlay up immediately so the user gets
+            # feedback without waiting for the 500 ms staleness
+            # threshold.
+            self._lv_overlay.setHidden_(False)
+
     @objc.signature(b"v@:@")
     def updateShot_(self, tup) -> None:
         idx, name, size, mbps = tup
@@ -730,7 +785,11 @@ class FloatingTetherPanel(NSObject):
         # a frame lands we know LV is alive, so hide the overlay
         # immediately rather than waiting for the next timer tick.
         self._lv_last_frame_at = time.monotonic()
-        if not self._lv_overlay.isHidden():
+        # Fix 4: don't hide while the daemon is mid-snap — busy state
+        # owns the overlay during commit window. The LV pause should
+        # mean no frames arrive anyway, but a stray late frame from
+        # before the pause shouldn't flicker the "Saving…" off.
+        if not self._lv_overlay.isHidden() and not self._controls_busy:
             self._lv_overlay.setHidden_(True)
 
         # Wrap the Python bytes in an NSData. PyObjC can usually pass
@@ -998,7 +1057,11 @@ class FloatingTetherPanel(NSObject):
         if stale and is_hidden:
             self._lv_overlay.setHidden_(False)
         elif not stale and not is_hidden:
-            self._lv_overlay.setHidden_(True)
+            # Fix 4: busy gate wins — if the daemon is in commit
+            # window, hold the overlay up even when frames look
+            # fresh (e.g. tail-end stream queue draining).
+            if not self._controls_busy:
+                self._lv_overlay.setHidden_(True)
 
     # ----- hotkeys (global within app) --------------------------------
 
