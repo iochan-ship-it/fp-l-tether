@@ -1,0 +1,49 @@
+# Virtual env
+venv/
+venv-x86/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+pytest-cache-files-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# User config (never commit secrets/paths)
+config.toml
+
+# Logs and runtime data
+logs/
+*.log
+*.jsonl
+
+# Test outputs
+/tmp_dng/
+*.dng.tmp
+captures/
+
+# DMG and binary blobs (large) — Sigma's copyrighted SDK distribution
+*.dmg
+sdk/
+
+# Vendored research code (libgphoto2 git clone for reference only)
+research/
+
+# Phase 0 trace dumps (may contain serial numbers)
+docs/PTP_TRACE_*.bin
+docs/PHASE0_RAW_*.txt
