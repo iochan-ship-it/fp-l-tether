@@ -152,6 +152,41 @@ Auto Import が動かなくなった場合:
 
 ---
 
+## DNG + JPG 同時記録の取り込み
+
+アプリの Format ドロップダウンで **DNG+JPG** を選ぶと、1 回のシャッターで
+DNG (RAW、~60 MB) と JPG (~5 MB) の 2 ファイルがカメラから連続で転送され、
+それぞれ atomic write で watch フォルダに着地します (`SDIM0001.DNG` と
+`SDIM0001.JPG` のような同名ペア)。
+
+Lightroom Classic 側の取り込みは **環境設定でペア表示の挙動を選択**:
+
+**Lightroom Classic → 環境設定 → 一般 → Import Options**:
+
+| 設定 | 動作 | 推奨 |
+|---|---|---|
+| ☐ Treat JPEG files next to raw files as separate photos (**OFF**) | DNG+JPG が 1 photo として **stack 表示**。Develop は DNG を編集。 | ★★★★★ |
+| ☑ 同 (**ON**) | DNG と JPG が別 photo として両方インポート (Grid に 2 件並ぶ) | △ JPG だけ別系統で書き出したい人向け |
+
+**OFF (stack) を強く推奨** — Lightroom UI が自動で DNG 優先で表示し、JPG は
+サブとしてアタッチされます。Develop で DNG を現像→書き出しのワークフロー
+がそのまま使えて、JPG は別途参照用として残ります。
+
+### 撮影テンポへの影響
+
+- DNG ~60 MB の転送は ~12-13 秒 (fp L の bulk-out 約 5 MB/s)
+- DNG+JPG モードでは + JPG ~1-2 秒 = **1 ショットあたり ~14-15 秒**
+- アプリの burst-aware quiet window が自動で commit tail に応じて伸びるため、
+  連射時の本体 wedge 対策は引き続き有効
+
+### Stack を後から解除したい場合
+
+LR の Library モジュールで `Photo → Stacking → Unstack` (⌘⇧K) で個別に解除可能。
+一括解除は Library Filter で Metadata → File Type を `Digital Negative (DNG)`
+で絞ってから ⌘A → Unstack。
+
+---
+
 ## トラブルシューティング
 
 | 症状 | 原因 | 対処 |

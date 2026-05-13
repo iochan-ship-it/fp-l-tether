@@ -116,6 +116,49 @@ def wb_label(value: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ImageQuality + Resolution enums (DG2.ImageQuality / DG2.Resolution)
+# ---------------------------------------------------------------------------
+#
+# Per sigma_ptpy/enum.py the fp series uses an IntFlag-style encoding for
+# ImageQuality where DNG+JPG is literally ``DNG | JPEGFine`` (0x10 | 0x02 =
+# 0x12). Resolution is a small enum L/M/S that only applies to JPG modes
+# — the fp L returns 0xff for Resolution while in DNG-only, see
+# project_image_quality_resolution_mapping.md memory.
+#
+# Values here are TENTATIVE for fp L V90: they match the well-documented
+# sigma_ptpy schema but have not yet been confirmed by a live diff
+# session that rotates the camera's File Format menu and re-inspects
+# DG2. If a future inspect-diff reveals a different mapping the labels
+# below need adjusting (UI logic does NOT — it uses *_raw codes from
+# CamCanSetInfo5 directly, so the dropdown will still be correct).
+
+# DG2.ImageQuality enum (byte value → label, low-to-high quality order)
+_IMAGE_QUALITY_LABELS: dict[int, str] = {
+    0x02: "JPG Fine",
+    0x04: "JPG Normal",
+    0x08: "JPG Basic",
+    0x10: "DNG",
+    0x12: "DNG+JPG",
+}
+
+# DG2.Resolution enum (byte value → L/M/S label)
+_RESOLUTION_LABELS: dict[int, str] = {
+    0x01: "L",
+    0x02: "M",
+    0x04: "S",
+    0xFF: "—",  # fp L reports this in DNG-only states; Resolution is N/A
+}
+
+
+def image_quality_label(value: int) -> str:
+    return _IMAGE_QUALITY_LABELS.get(value, f"0x{value:02X}")
+
+
+def resolution_label(value: int) -> str:
+    return _RESOLUTION_LABELS.get(value, f"0x{value:02X}")
+
+
+# ---------------------------------------------------------------------------
 # Generic FieldPresent-aware decoder
 # ---------------------------------------------------------------------------
 
@@ -259,6 +302,18 @@ class ExposureSettings:
     # ISO dropdown even though iso_raw still carries whatever value
     # the camera's auto algorithm picked.
     iso_auto_raw: int = 0
+    # Picture file format (DG2.ImageQuality + Resolution). Defaults to
+    # "—" so the panel renders cleanly on the very first frame, before
+    # the daemon's initial DG2 read returns. ``file_format`` is the
+    # human label (e.g. "JPG Fine", "DNG", "DNG+JPG"); ``file_format_raw``
+    # is the DG2 byte the camera reports; ``image_size`` is the L/M/S
+    # selector that applies to JPG modes (DNG is always full-res, so
+    # Resolution is reported as 0xff by the fp L in DNG-only states —
+    # see project_image_quality_resolution_mapping.md memory).
+    file_format: str = "—"
+    file_format_raw: int = 0
+    image_size: str = "—"
+    image_size_raw: int = 0
 
     def short(self) -> str:
         """One-line label, e.g. ``ISO 100 · 1/125 · f/2.8 · WB Auto``."""
@@ -365,6 +420,18 @@ class CanSetInfo:
     iso_manual_codes: list[int] = field(default_factory=list)
     iso_auto_codes: list[int] = field(default_factory=list)
     wb_codes: list[int] = field(default_factory=list)
+    # ImageQuality / Resolution allowed bytes. Default to the full
+    # standard sigma_ptpy enum so the UI dropdown is populated even
+    # if the camera's CamCanSetInfo5 entries for these tags come back
+    # empty (observed on fp L V90 at the time of writing — see
+    # project_image_quality_resolution_mapping.md). Once a live
+    # diff confirms the tag IDs, the parser below will override.
+    image_quality_codes: list[int] = field(
+        default_factory=lambda: [0x02, 0x04, 0x08, 0x10, 0x12]
+    )
+    resolution_codes: list[int] = field(
+        default_factory=lambda: [0x01, 0x02, 0x04]
+    )
     af_x_min: int = 96
     af_x_max: int = 928
     af_y_min: int = 85
@@ -463,6 +530,27 @@ def parse_can_set_info5(buf: bytes) -> CanSetInfo:
         elif isinstance(wb.value, int):
             info.wb_codes = [wb.value]
 
+    # --- ImageQuality / Resolution allowed values.
+    # Tag IDs are TENTATIVE for fp L (sigma_ptpy schema documents them
+    # but the only fp L baseline we have shows empty lists at 0x012F /
+    # tag-15-bytes-of-7-down-to-1 at 0x0015 — clearly fp L specific).
+    # For now we only override the dataclass defaults if the camera
+    # returns a non-empty list whose values look like valid
+    # ImageQuality / Resolution bytes. Otherwise the defaults (full
+    # standard sigma_ptpy enum) survive, so the dropdown stays usable.
+    iq = ifd.by_tag(0x012F)  # candidate ImageQuality allowed-list
+    if (iq is not None
+            and isinstance(iq.value, list)
+            and iq.value
+            and all(v in _IMAGE_QUALITY_LABELS for v in iq.value)):
+        info.image_quality_codes = list(iq.value)
+    res = ifd.by_tag(0x0014)  # candidate Resolution allowed-list
+    if (res is not None
+            and isinstance(res.value, list)
+            and res.value
+            and all(v in _RESOLUTION_LABELS for v in res.value)):
+        info.resolution_codes = list(res.value)
+
     return info
 
 
@@ -515,6 +603,8 @@ def read_exposure(bridge: "USBBridge") -> ExposureSettings:
     ss_raw = dg1.get("ShutterSpeed", 0)
     av_raw = dg1.get("Aperture", 0)
     wb_raw = dg2.get("WhiteBalance", 0)
+    quality_raw = dg2.get("ImageQuality", 0)
+    resolution_raw = dg2.get("Resolution", 0)
 
     return ExposureSettings(
         iso=("Auto" if iso_auto else apex_to_iso(iso_raw)),
@@ -526,4 +616,8 @@ def read_exposure(bridge: "USBBridge") -> ExposureSettings:
         aperture_raw=av_raw,
         wb_raw=wb_raw,
         iso_auto_raw=iso_auto,
+        file_format=image_quality_label(quality_raw),
+        file_format_raw=quality_raw,
+        image_size=resolution_label(resolution_raw),
+        image_size_raw=resolution_raw,
     )

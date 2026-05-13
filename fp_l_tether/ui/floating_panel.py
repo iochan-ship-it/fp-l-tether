@@ -90,6 +90,8 @@ from fp_l_tether.camera.sigma_datagroup import (
     apex_to_aperture,
     apex_to_iso,
     apex_to_shutter,
+    image_quality_label,
+    resolution_label,
     wb_label,
 )
 
@@ -105,7 +107,16 @@ PANEL_WIDTH = 320
 # Existing widget Y offsets are computed against this constant so that
 # growing the panel to add a live-view viewport at the top doesn't
 # require touching every NSMakeRect below.
-CONTROLS_HEIGHT = 280
+#
+# Bumped from 280 → 308 in Phase 3.5d to make room for a third
+# exposure-dropdown row (Format + Size). All widgets anchored to the
+# top of the controls area use ``CONTROLS_HEIGHT - N`` so they shift
+# down with the bump; widgets anchored to the bottom (item field,
+# buttons, hint) use absolute y values and stay put. The shot label
+# at ``CONTROLS_HEIGHT - 166`` lands at the same absolute pixel row
+# as before so its alignment with the bottom-anchored widgets is
+# preserved.
+CONTROLS_HEIGHT = 308
 # Live-view viewport — placed above the controls area. Sized for the
 # fp L's 3:2 capture ratio so frames don't distort when scaled to fit.
 LV_WIDTH = 220
@@ -331,9 +342,40 @@ class FloatingTetherPanel(NSObject):
         self._wb_dropdown.setAction_("wbChanged:")
         content.addSubview_(self._wb_dropdown)
 
+        # Exposure dropdowns row 3: Format (DG2.ImageQuality) + Size
+        # (DG2.Resolution). Same two-column layout + spacing as the
+        # first two rows. Both write through ``request_set_exposure
+        # (group=2, ...)`` so the existing read-back / re-emit cycle
+        # in the daemon validates whatever the camera actually accepts.
+        fmt_caption = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(12, CONTROLS_HEIGHT - 138, 36, 18)
+        )
+        _make_label(fmt_caption, "Fmt", size=10)
+        fmt_caption.setTextColor_(NSColor.secondaryLabelColor())
+        content.addSubview_(fmt_caption)
+        self._fmt_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(42, CONTROLS_HEIGHT - 142, 110, 24), False
+        )
+        self._fmt_dropdown.setTarget_(self)
+        self._fmt_dropdown.setAction_("fmtChanged:")
+        content.addSubview_(self._fmt_dropdown)
+
+        size_caption = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(160, CONTROLS_HEIGHT - 138, 28, 18)
+        )
+        _make_label(size_caption, "Size", size=10)
+        size_caption.setTextColor_(NSColor.secondaryLabelColor())
+        content.addSubview_(size_caption)
+        self._size_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(186, CONTROLS_HEIGHT - 142, 122, 24), False
+        )
+        self._size_dropdown.setTarget_(self)
+        self._size_dropdown.setAction_("sizeChanged:")
+        content.addSubview_(self._size_dropdown)
+
         # Last-shot label
         self._shot_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 138, PANEL_WIDTH - 24, 18)
+            NSMakeRect(12, CONTROLS_HEIGHT - 166, PANEL_WIDTH - 24, 18)
         )
         _make_label(self._shot_label, "No shots yet", size=11)
         self._shot_label.setTextColor_(NSColor.secondaryLabelColor())
@@ -475,6 +517,8 @@ class FloatingTetherPanel(NSObject):
                 s.shutter_raw,
                 s.aperture_raw,
                 s.wb_raw,
+                s.file_format_raw,
+                s.image_size_raw,
             ),
             False,
         )
@@ -556,19 +600,21 @@ class FloatingTetherPanel(NSObject):
 
     @objc.signature(b"v@:@")
     def updateExposure_(self, tup) -> None:
-        """Sync the four dropdowns to the camera's reported exposure.
+        """Sync the dropdowns to the camera's reported exposure.
 
         The action callbacks set ``_suppress_action`` so this method
         doesn't recursively re-queue writes when it programmatically
         selects items.
         """
-        iso_raw, iso_auto, ss_raw, av_raw, wb_raw = tup
+        iso_raw, iso_auto, ss_raw, av_raw, wb_raw, fmt_raw, size_raw = tup
         self._exposure_raw = {
             "ISOSpeed": iso_raw,
             "ISOAuto": iso_auto,
             "ShutterSpeed": ss_raw,
             "Aperture": av_raw,
             "WhiteBalance": wb_raw,
+            "ImageQuality": fmt_raw,
+            "Resolution": size_raw,
         }
         self._suppress_action = True
         try:
@@ -582,6 +628,8 @@ class FloatingTetherPanel(NSObject):
             self._select_dropdown_by_repr(self._ss_dropdown, ss_raw)
             self._select_dropdown_by_repr(self._av_dropdown, av_raw)
             self._select_dropdown_by_repr(self._wb_dropdown, wb_raw)
+            self._select_dropdown_by_repr(self._fmt_dropdown, fmt_raw)
+            self._select_dropdown_by_repr(self._size_dropdown, size_raw)
         finally:
             self._suppress_action = False
 
@@ -621,6 +669,18 @@ class FloatingTetherPanel(NSObject):
                 self._wb_dropdown,
                 [(wb_label(c), c) for c in wb_codes],
             )
+
+            # Format (ImageQuality) + Size (Resolution). Lists default
+            # to the full sigma_ptpy enum when the camera reports
+            # empty CamCanSetInfo5 entries (fp L V90 observed).
+            self._fill_dropdown(
+                self._fmt_dropdown,
+                [(image_quality_label(c), c) for c in info.image_quality_codes],
+            )
+            self._fill_dropdown(
+                self._size_dropdown,
+                [(resolution_label(c), c) for c in info.resolution_codes],
+            )
         finally:
             self._suppress_action = False
 
@@ -633,6 +693,8 @@ class FloatingTetherPanel(NSObject):
                     self._exposure_raw.get("ShutterSpeed", 0),
                     self._exposure_raw.get("Aperture", 0),
                     self._exposure_raw.get("WhiteBalance", 0),
+                    self._exposure_raw.get("ImageQuality", 0),
+                    self._exposure_raw.get("Resolution", 0),
                 )
             )
 
@@ -773,6 +835,35 @@ class FloatingTetherPanel(NSObject):
             # WhiteBalance lives in DG2.
             self._daemon.request_set_exposure(
                 2, {"WhiteBalance": int(repr_obj)}
+            )
+
+    @objc.signature(b"v@:@")
+    def fmtChanged_(self, sender) -> None:
+        """Picture file format (DG2.ImageQuality). DNG variants ignore Size.
+
+        The daemon's read-back / re-emit cycle (200 ms after the write)
+        will refresh the dropdown to the value the camera actually
+        committed — so if the camera rejects a particular code (e.g.
+        the lens is in a state where DNG isn't allowed) the UI snaps
+        back to the previous value rather than silently lying.
+        """
+        if self._suppress_action:
+            return
+        repr_obj = self._selected_repr(sender)
+        if isinstance(repr_obj, int):
+            self._daemon.request_set_exposure(
+                2, {"ImageQuality": int(repr_obj)}
+            )
+
+    @objc.signature(b"v@:@")
+    def sizeChanged_(self, sender) -> None:
+        """Image size (DG2.Resolution: L/M/S, applies to JPG modes)."""
+        if self._suppress_action:
+            return
+        repr_obj = self._selected_repr(sender)
+        if isinstance(repr_obj, int):
+            self._daemon.request_set_exposure(
+                2, {"Resolution": int(repr_obj)}
             )
 
     # --- AF point picker popover ------------------------------------

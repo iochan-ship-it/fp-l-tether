@@ -1094,6 +1094,30 @@ class TetherDaemon:
                     # dial between shots.
                     self._emit_exposure(bridge)
 
+                    # Diagnostic: detect dual-file (DNG+JPG) captures.
+                    # After advancing _next_slot below, if db_tail is
+                    # still ahead by 1 it means the camera wrote a
+                    # second file for this snap — the main loop will
+                    # naturally drain it on the next iteration and
+                    # emit a second ShotEvent (the JPG companion to
+                    # the DNG, or vice versa). Phase 3.5e relies on
+                    # this Case-B assumption; if a future test shows
+                    # PictFileInfo2 instead returns a single info
+                    # with two file slots (Case A), the parser in
+                    # ptp_codes.py needs extending. Until proven
+                    # otherwise, Case B is the operating model.
+                    if (status.image_db_tail & 0xFF) != (
+                        (self._next_slot + 1) & 0xFF
+                    ):
+                        self.log.info(
+                            "dual_file_slot_pending",
+                            current_slot=self._next_slot,
+                            db_head=status.image_db_head,
+                            db_tail=status.image_db_tail,
+                            file_ext=info.fileext,
+                            note="extra slot likely DNG+JPG companion",
+                        )
+
                     # Advance to next slot, reset trigger marker
                     self._next_slot = (self._next_slot + 1) & 0xFF
                     pending_trigger = "camera_button"
