@@ -868,11 +868,19 @@ class TetherDaemon:
                     self._resume_liveview()
 
                 # ----- 1a-pre. Drain exposure/focus queues -----
-                # Exposure/AF-point writes are cheap and not coupled to
-                # capture state, so we always process pending requests
-                # before considering snap/AF triggers.
-                self._drain_set_exposure(bridge)
-                self._drain_set_focus(bridge)
+                # Skip while a shot is in flight — between snap fire
+                # and quiet-window arm, the camera is in commit phase
+                # and set_* writes can wedge the FW (2026-05-13 incident:
+                # rapid set_focus + AF + snap during commit window
+                # produced an unrecoverable bulk endpoint wedge at
+                # shot #27 / ~12 min). AF and snap drains below are
+                # already gated on t_shot_start; this makes set_*
+                # symmetric with that contract. Queue items survive —
+                # they drain on the next iteration after the quiet
+                # window closes.
+                if t_shot_start is None:
+                    self._drain_set_exposure(bridge)
+                    self._drain_set_focus(bridge)
 
                 # ----- 1a. Drain AF queue (only when no shot is in flight) ---
                 # AF-only drive (SnapCommand mode 3) produces no image,
