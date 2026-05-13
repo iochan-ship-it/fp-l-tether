@@ -36,6 +36,7 @@ main thread; daemon runs in a background thread).
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import objc
@@ -67,6 +68,7 @@ from AppKit import (
     NSScreen,
     NSStatusWindowLevel,
     NSSwitchButton,
+    NSTextAlignmentCenter,
     NSTextField,
     NSTextView,
     NSTitledWindowMask,
@@ -82,7 +84,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSData, NSMakePoint, NSObject
+from Foundation import NSData, NSMakePoint, NSObject, NSTimer
 
 from fp_l_tether.camera.sigma_datagroup import (
     apex_to_aperture,
@@ -148,6 +150,7 @@ class FloatingTetherPanel(NSObject):
         self._build_window()
         self._wire_callbacks()
         self._install_hotkeys()
+        self._install_lv_staleness_watch()
 
     # ----- window construction ----------------------------------------
 
@@ -206,6 +209,44 @@ class FloatingTetherPanel(NSObject):
                 NSColor.colorWithCalibratedWhite_alpha_(0.08, 1.0).CGColor()
             )
         content.addSubview_(self._live_view)
+
+        # Pause overlay — a semi-transparent dark veil with a centered
+        # "Saving…" label, sitting exactly on top of the LV image.
+        # Initially hidden; a 250 ms staleness watchdog (installed in
+        # _install_lv_staleness_watch) toggles it based on how long
+        # since the last frame arrived. This is what tells the user
+        # "the camera is mid-snap, the freeze is expected" so they
+        # don't think the app crashed during the ~5 s DNG drain.
+        self._lv_overlay = NSView.alloc().initWithFrame_(
+            NSMakeRect(lv_x, lv_y, LV_WIDTH, LV_HEIGHT)
+        )
+        self._lv_overlay.setWantsLayer_(True)
+        overlay_layer = self._lv_overlay.layer()
+        if overlay_layer is not None:
+            overlay_layer.setBackgroundColor_(
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55).CGColor()
+            )
+        self._lv_overlay.setHidden_(True)
+        content.addSubview_(self._lv_overlay)
+
+        # "Saving…" label — vertically centered inside the overlay.
+        # Coords are relative to the overlay view (its origin is
+        # (lv_x, lv_y), so the label rect is in overlay-local space).
+        self._lv_overlay_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(0, (LV_HEIGHT - 24) // 2, LV_WIDTH, 24)
+        )
+        _make_label(self._lv_overlay_label, "Saving…", bold=True, size=15)
+        self._lv_overlay_label.setAlignment_(NSTextAlignmentCenter)
+        self._lv_overlay_label.setTextColor_(NSColor.whiteColor())
+        self._lv_overlay.addSubview_(self._lv_overlay_label)
+
+        # Staleness watchdog state — overlay shows when no LV frame
+        # arrived for ``_lv_stale_threshold_s``. At 10 fps target the
+        # frame interval is ~100 ms, so 500 ms is roughly "5 missed
+        # frames" — generous enough to not flash on a single hiccup.
+        self._lv_last_frame_at: float = 0.0
+        self._lv_stale_threshold_s: float = 0.5
+        self._lv_stale_timer = None  # set in _install_lv_staleness_watch
 
         # Status indicator label (top of the controls area — LV viewport
         # sits ABOVE this and uses its own y range so all existing
@@ -605,6 +646,12 @@ class FloatingTetherPanel(NSObject):
         # Cheap aliveness counter — useful from the debugger / a future
         # debug overlay.
         self._lv_frame_count = getattr(self, "_lv_frame_count", 0) + 1
+        # Record arrival time for the staleness watchdog. As soon as
+        # a frame lands we know LV is alive, so hide the overlay
+        # immediately rather than waiting for the next timer tick.
+        self._lv_last_frame_at = time.monotonic()
+        if not self._lv_overlay.isHidden():
+            self._lv_overlay.setHidden_(True)
 
         # Wrap the Python bytes in an NSData. PyObjC can usually pass
         # bytes through transparently, but going via NSData avoids a
@@ -806,6 +853,44 @@ class FloatingTetherPanel(NSObject):
     def quitClicked_(self, sender) -> None:
         self.stop()
 
+    # ----- live-view staleness watchdog -------------------------------
+
+    def _install_lv_staleness_watch(self) -> None:
+        """Start an NSTimer that shows the pause overlay when LV freezes.
+
+        Fires every 250 ms on the main run loop. The overlay is shown
+        when no LV frame has arrived for ``_lv_stale_threshold_s``
+        (default 500 ms ≈ 5 missed frames at 10 fps target) and hidden
+        as soon as a fresh frame lands (also handled inline in
+        ``updateLiveFrame_`` for instant resume).
+
+        We keep a reference to the timer so ``stop()`` can invalidate
+        it — otherwise the timer keeps the panel alive past quit.
+        """
+        self._lv_stale_timer = (
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.25, self, "checkLiveFrameStale:", None, True
+            )
+        )
+
+    @objc.signature(b"v@:@")
+    def checkLiveFrameStale_(self, timer) -> None:
+        """Toggle the pause overlay based on how stale the LV feed is."""
+        if self._lv_last_frame_at == 0.0:
+            # No frame yet — keep overlay hidden (stream is still
+            # warming up; we don't want a "Saving…" before the first
+            # frame ever lands).
+            return
+        stale = (
+            time.monotonic() - self._lv_last_frame_at
+            > self._lv_stale_threshold_s
+        )
+        is_hidden = bool(self._lv_overlay.isHidden())
+        if stale and is_hidden:
+            self._lv_overlay.setHidden_(False)
+        elif not stale and not is_hidden:
+            self._lv_overlay.setHidden_(True)
+
     # ----- hotkeys (global within app) --------------------------------
 
     def _install_hotkeys(self) -> None:
@@ -847,6 +932,15 @@ class FloatingTetherPanel(NSObject):
         self._app.run()
 
     def stop(self) -> None:
+        # Tear down the LV staleness watchdog first — otherwise the
+        # repeating timer keeps a strong ref to self and prevents the
+        # panel from being released after quit.
+        if getattr(self, "_lv_stale_timer", None) is not None:
+            try:
+                self._lv_stale_timer.invalidate()
+            except Exception:  # noqa: BLE001
+                pass
+            self._lv_stale_timer = None
         try:
             self._daemon.stop()
         except Exception as e:  # noqa: BLE001
