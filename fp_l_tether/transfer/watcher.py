@@ -191,6 +191,16 @@ class TetherDaemon:
         self._af_queue: Queue[None] = Queue()
         self._set_exposure_queue: Queue[_SetExposureRequest] = Queue()
         self._set_focus_queue: Queue[_SetFocusRequest] = Queue()
+        # Debounce for set_* requests (Fix 5): when a dropdown is
+        # scrolled through and lands on the same value within 200 ms,
+        # collapse the duplicate. Keys are
+        # (group, field, value) for exposure and (x, y) for focus.
+        # Unbounded dict but bounded by total distinct (field, value)
+        # combinations on the camera — finite.
+        self._debounce_window_s: float = 0.2
+        self._debounce_lock = threading.Lock()
+        self._last_set_exp_at: dict[tuple[int, str, int], float] = {}
+        self._last_set_focus_at: dict[tuple[int, int], float] = {}
         self._thread: threading.Thread | None = None
         self._shot_count = 0
         self._next_slot = 0  # camera's db_head — advances after each capture
@@ -288,14 +298,53 @@ class TetherDaemon:
         the field, waits briefly for the camera to settle, re-reads
         DG1+DG2, and emits a fresh ExposureEvent so the UI shows what
         actually took effect (not the requested value).
+
+        Fix 5: drops same-(group, field, value) repeats within
+        ``_debounce_window_s`` (default 200 ms). Mostly catches
+        dropdown scroll-then-release sequences where the menu fires
+        a change event for every transitioned item.
         """
         if group not in (1, 2):
             raise ValueError(f"group must be 1 or 2, got {group}")
-        self._set_exposure_queue.put(_SetExposureRequest(group=group, values=values))
-        self.log.info("set_exposure_requested", group=group, fields=list(values))
+        now = time.monotonic()
+        filtered: dict[str, int] = {}
+        with self._debounce_lock:
+            for field, value in values.items():
+                key = (group, field, value)
+                last = self._last_set_exp_at.get(key, 0.0)
+                if now - last < self._debounce_window_s:
+                    continue
+                self._last_set_exp_at[key] = now
+                filtered[field] = value
+        if not filtered:
+            self.log.debug(
+                "set_exposure_debounced",
+                group=group,
+                fields=list(values),
+            )
+            return
+        self._set_exposure_queue.put(
+            _SetExposureRequest(group=group, values=filtered)
+        )
+        self.log.info(
+            "set_exposure_requested", group=group, fields=list(filtered),
+        )
 
     def request_set_focus_point(self, x: int, y: int) -> None:
-        """Queue a SetCamDataGroupFocus write to move the AF point."""
+        """Queue a SetCamDataGroupFocus write to move the AF point.
+
+        Fix 5: drops same-(x, y) repeats within ``_debounce_window_s``.
+        Catches the case where a click bursts two events at the same
+        coords (e.g. live-view view re-emits after a redraw).
+        """
+        now = time.monotonic()
+        key = (x, y)
+        with self._debounce_lock:
+            last = self._last_set_focus_at.get(key, 0.0)
+            if now - last < self._debounce_window_s:
+                self.log.debug("set_focus_debounced", x=x, y=y)
+                return
+            self._last_set_focus_at[key] = now
         self._set_focus_queue.put(_SetFocusRequest(x=x, y=y))
         self.log.info("set_focus_requested", x=x, y=y)
 
