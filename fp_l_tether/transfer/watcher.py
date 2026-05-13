@@ -1202,14 +1202,15 @@ class TetherDaemon:
                     t_shot_start = None
 
                     # ----- Arm the burst-aware quiet window -----
-                    # Tick the burst counter; if no further snap is
-                    # queued, arm a window scaled to the burst
-                    # length and reset the counter. If a snap IS
-                    # queued, leave the counter ticking so the next
-                    # iteration can incorporate this shot into the
-                    # ongoing burst — the window arms after the
-                    # LAST shot of the burst with the full count.
-                    self._record_shot()
+                    # Tick the burst counter once per file written —
+                    # DNG+JPG counts as 2 ticks because the camera
+                    # commits twice the image_db state per shutter,
+                    # roughly doubling deep-commit work. If no
+                    # further snap is queued, arm a window scaled to
+                    # the (file-aware) burst length and reset the
+                    # counter.
+                    for _ in range(len(entries)):
+                        self._record_shot()
                     if self._snap_queue.empty():
                         self._arm_quiet_window()
                     # Tight loop — image may already be there for next shot

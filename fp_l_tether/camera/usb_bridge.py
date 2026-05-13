@@ -1123,10 +1123,12 @@ class USBBridge:
         entries = self.sigma_get_pict_file_info_2_list()
         results: list[tuple[SigmaFpPictFileInfo2Ex, bytes]] = []
         for idx, info in enumerate(entries):
+            # ``info.name`` is the full filename incl. extension
+            # (e.g. "SDIM0001.JPG") since the multi-entry parser
+            # reads the camera's null-terminated string in full.
             logger.info(
-                "sigma_download: file %s%s addr=0x%X size=%d (%dx%d)"
-                "%s",
-                info.name, info.fileext, info.fileaddress,
+                "sigma_download: file %s addr=0x%X size=%d (%dx%d)%s",
+                info.name, info.fileaddress,
                 info.filesize, info.width, info.height,
                 f" [entry {idx + 1}/{len(entries)}]"
                 if len(entries) > 1 else "",
@@ -1287,8 +1289,8 @@ class USBBridge:
         # File info + download
         info = self.sigma_get_pict_file_info_2()
         logger.info(
-            "sigma_capture: file %s%s addr=0x%X size=%d (%dx%d)",
-            info.name, info.fileext, info.fileaddress,
+            "sigma_capture: file %s addr=0x%X size=%d (%dx%d)",
+            info.name, info.fileaddress,
             info.filesize, info.width, info.height,
         )
 
