@@ -432,37 +432,82 @@ class TetherDaemon:
         Per the user's request: do NOT optimistically update the UI from
         the requested value. Always send → wait → read → emit, so the
         panel reflects what the camera actually accepted.
+
+        **Bulk-endpoint protection (added 2026-05-13 after a live wedge):**
+        Rapidly flipping a dial (e.g. 6 ImageQuality clicks in 19 s)
+        produced a 0-byte data phase → Errno 60 endpoint wedge that
+        only a body power-cycle could recover. Root cause was the LV
+        thread interleaving frame fetches between each
+        SetCamDataGroup2 write — each Set fights with each LV bulk
+        read on the camera's single bulk endpoint, and the camera
+        eventually gives up. Mitigation here mirrors the snap path:
+
+          1. Pause LV up front so frame requests stop.
+          2. Hold ``_ptp_lock`` across the entire drain — write,
+             inter-write delay, settle, read-back, emit — so the
+             heartbeat thread also can't sneak between writes.
+          3. Insert a small inter-write delay so each Set has time
+             to commit before the next is pushed.
+          4. Resume LV in ``finally`` so a mid-drain exception
+             can't leave the stream stuck.
         """
+        if self._set_exposure_queue.empty():
+            return
+
+        # Snapshot whether LV was running so we only re-arm what we
+        # actually paused (don't fight any other pause source).
+        lv_was_running = (
+            self._liveview is not None and not self._liveview.is_paused
+        )
+        if lv_was_running:
+            self._liveview.pause()
+
         applied_any = False
-        while True:
-            try:
-                req = self._set_exposure_queue.get_nowait()
-            except Empty:
-                break
-            try:
-                with self._ptp_lock:
-                    if req.group == 1:
-                        bridge.sigma_set_datagroup_1(req.values)
-                    else:
-                        bridge.sigma_set_datagroup_2(req.values)
-                applied_any = True
-                self.log.info(
-                    "set_exposure_sent", group=req.group, fields=req.values,
-                )
-            except PTPError as e:
-                # Camera rejected. Re-read so the UI snaps back to the
-                # old (still-current) value — that's the "revert" path.
-                self.log.error(
-                    "set_exposure_failed",
-                    group=req.group, fields=req.values, error=str(e),
-                )
-                self._emit_status("error", f"設定変更失敗: {e}")
-                applied_any = True  # still need to re-emit for UI revert
-        if applied_any:
-            # Brief settle so the camera's internal state catches up.
-            # 200ms matches the user's hint and is well below LV polling.
-            time.sleep(0.2)
-            self._emit_exposure(bridge)
+        try:
+            with self._ptp_lock:
+                while True:
+                    try:
+                        req = self._set_exposure_queue.get_nowait()
+                    except Empty:
+                        break
+                    try:
+                        if req.group == 1:
+                            bridge.sigma_set_datagroup_1(req.values)
+                        else:
+                            bridge.sigma_set_datagroup_2(req.values)
+                        applied_any = True
+                        self.log.info(
+                            "set_exposure_sent",
+                            group=req.group, fields=req.values,
+                        )
+                        # Small inter-write breather so the camera
+                        # commits each DataGroup change before the
+                        # next arrives. 80 ms is well below human
+                        # click cadence (single clicks still feel
+                        # instant) but throttles rapid-fire enough
+                        # to prevent the busy → 0-byte → wedge
+                        # cascade observed without it.
+                        time.sleep(0.08)
+                    except PTPError as e:
+                        # Camera rejected. Re-read so the UI snaps
+                        # back to the old (still-current) value —
+                        # that's the "revert" path.
+                        self.log.error(
+                            "set_exposure_failed",
+                            group=req.group, fields=req.values,
+                            error=str(e),
+                        )
+                        self._emit_status("error", f"設定変更失敗: {e}")
+                        applied_any = True  # still re-emit for revert
+                if applied_any:
+                    # 200 ms settle then read-back inside the same
+                    # lock so LV / heartbeat can't grab the bus
+                    # before the read completes.
+                    time.sleep(0.2)
+                    self._emit_exposure(bridge)
+        finally:
+            if lv_was_running:
+                self._liveview.resume()
 
     def _drain_set_focus(self, bridge: USBBridge) -> None:
         """Apply queued AF-point moves, then publish the new position."""
