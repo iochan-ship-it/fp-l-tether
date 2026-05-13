@@ -54,6 +54,7 @@ from fp_l_tether.config import AppConfig
 from fp_l_tether.lightroom import build_destination
 from fp_l_tether.telemetry import get_logger, log_shot
 from fp_l_tether.transfer.atomic import write_atomic
+from fp_l_tether.transfer.liveview import LiveViewFrame, LiveViewStream
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +116,21 @@ class FocusPointEvent:
 
 
 @dataclass
+class LiveViewEvent:
+    """Emitted for each live-view frame.
+
+    ``fps_avg`` and ``frame_kb`` are rolling 1-second metrics from the
+    stream so the UI can show stream health without computing it itself.
+    """
+
+    jpeg: bytes
+    width: int
+    height: int
+    fps_avg: float
+    frame_kb: float
+
+
+@dataclass
 class _SetExposureRequest:
     """Internal queue item: change a single exposure dial."""
 
@@ -138,6 +154,7 @@ StatusCallback = Callable[[StatusEvent], None]
 ExposureCallback = Callable[[ExposureEvent], None]
 CanSetInfoCallback = Callable[[CanSetInfoEvent], None]
 FocusPointCallback = Callable[[FocusPointEvent], None]
+LiveFrameCallback = Callable[[LiveViewEvent], None]
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +197,21 @@ class TetherDaemon:
         self._current_item: str = cfg.output.default_item
         self._shots_by_item: dict[str, int] = {}
         self._item_lock = threading.Lock()
+        # PTP bulk endpoint serialiser. The Sigma camera handles ONE
+        # bulk transfer at a time — concurrent snap + view-frame fetches
+        # interleave on the wire and corrupt both. Every bridge.sigma_*
+        # call (from daemon AND live-view thread) must hold this lock.
+        # RLock so functions that nest (e.g. drain → emit) don't deadlock.
+        self._ptp_lock = threading.RLock()
+        # Live-view stream — created on connect, torn down on stop.
+        self._liveview: LiveViewStream | None = None
 
         self.on_shot: ShotCallback | None = None
         self.on_status: StatusCallback | None = None
         self.on_exposure: ExposureCallback | None = None
         self.on_can_set_info: CanSetInfoCallback | None = None
         self.on_focus_point: FocusPointCallback | None = None
+        self.on_live_frame: LiveFrameCallback | None = None
 
     # ----- lifecycle ---------------------------------------------------
 
@@ -320,10 +346,11 @@ class TetherDaemon:
             except Empty:
                 break
             try:
-                if req.group == 1:
-                    bridge.sigma_set_datagroup_1(req.values)
-                else:
-                    bridge.sigma_set_datagroup_2(req.values)
+                with self._ptp_lock:
+                    if req.group == 1:
+                        bridge.sigma_set_datagroup_1(req.values)
+                    else:
+                        bridge.sigma_set_datagroup_2(req.values)
                 applied_any = True
                 self.log.info(
                     "set_exposure_sent", group=req.group, fields=req.values,
@@ -354,7 +381,8 @@ class TetherDaemon:
         if latest is None:
             return
         try:
-            bridge.sigma_set_cam_datagroup_focus(latest.x, latest.y)
+            with self._ptp_lock:
+                bridge.sigma_set_cam_datagroup_focus(latest.x, latest.y)
             self.log.info("set_focus_sent", x=latest.x, y=latest.y)
         except PTPError as e:
             self.log.error(
@@ -371,7 +399,8 @@ class TetherDaemon:
         if self.on_can_set_info is None:
             return
         try:
-            info = read_can_set_info(bridge)
+            with self._ptp_lock:
+                info = read_can_set_info(bridge)
         except (PTPError, ValueError) as e:
             self.log.warning("can_set_info_read_failed", error=str(e))
             return
@@ -385,7 +414,8 @@ class TetherDaemon:
         if self.on_focus_point is None:
             return
         try:
-            xy = read_focus_point(bridge)
+            with self._ptp_lock:
+                xy = read_focus_point(bridge)
         except PTPError as e:
             self.log.warning("focus_point_read_failed", error=str(e))
             return
@@ -394,6 +424,28 @@ class TetherDaemon:
             self.on_focus_point(FocusPointEvent(x=x, y=y))
         except Exception as e:  # noqa: BLE001
             self.log.warning("focus_point_callback_raised", error=str(e))
+
+    def _emit_live_frame(self, frame: LiveViewFrame) -> None:
+        """Bridge LiveViewStream frames to the panel callback.
+
+        Called from the LiveViewStream's background thread. Drops the
+        callback if none is registered; never raises into the stream
+        thread (would kill the stream).
+        """
+        if self.on_live_frame is None:
+            return
+        try:
+            self.on_live_frame(
+                LiveViewEvent(
+                    jpeg=frame.jpeg,
+                    width=frame.width,
+                    height=frame.height,
+                    fps_avg=frame.fps_avg,
+                    frame_kb=frame.frame_kb,
+                )
+            )
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("live_frame_callback_raised", error=str(e))
 
     def _emit_exposure(self, bridge: USBBridge) -> None:
         """Read DG1+DG2 from the camera and publish an ExposureEvent.
@@ -404,7 +456,8 @@ class TetherDaemon:
         if self.on_exposure is None:
             return
         try:
-            settings = read_exposure(bridge)
+            with self._ptp_lock:
+                settings = read_exposure(bridge)
         except PTPError as e:
             self.log.warning("exposure_read_failed", error=str(e))
             return
@@ -462,18 +515,21 @@ class TetherDaemon:
             self._emit_status("connecting", "Looking for Sigma fp / fp L…")
             bridge = USBBridge.find_sigma_fp_l()
             bridge.open()
-            bridge.open_session()
+            with self._ptp_lock:
+                bridge.open_session()
             self.log.info("session_opened")
 
             self._emit_status("initializing", "Running Sigma init sequence (10 PTP calls)…")
-            bridge.sigma_init()
+            with self._ptp_lock:
+                bridge.sigma_init()
             self.log.info("init_complete")
 
             # Discover starting slot from camera state.
             # Note: we reset _next_slot from the camera's authoritative state
             # on every (re)connect, so resuming after an unplug picks up at
             # the correct slot rather than carrying stale state forward.
-            pre = bridge.sigma_get_capture_status(0)
+            with self._ptp_lock:
+                pre = bridge.sigma_get_capture_status(0)
             self._next_slot = pre.image_db_head
             self.log.info("ready",
                           slot=self._next_slot,
@@ -485,6 +541,18 @@ class TetherDaemon:
             # Initial exposure read so the panel populates before the first shot.
             self._emit_exposure(bridge)
             self._emit_focus_point(bridge)
+
+            # Start background live view if enabled. The stream shares
+            # the PTP lock so its view-frame fetches serialise against
+            # snaps/downloads on the single USB bulk endpoint.
+            if self.cfg.liveview.enabled:
+                self._liveview = LiveViewStream(
+                    bridge,
+                    self._ptp_lock,
+                    target_fps=self.cfg.liveview.target_fps,
+                    on_frame=self._emit_live_frame,
+                )
+                self._liveview.start()
 
             poll_idle_s = self.cfg.camera.poll_idle_ms / 1000.0
             poll_active_s = self.cfg.camera.poll_active_ms / 1000.0
@@ -523,8 +591,9 @@ class TetherDaemon:
                     else:
                         self._emit_status("focusing", "AF駆動中")
                         try:
-                            bridge.sigma_set_datagroup_3_pc_capture()
-                            bridge.sigma_snap(mode=3, amount=1)  # AF_DRIVE_ONLY
+                            with self._ptp_lock:
+                                bridge.sigma_set_datagroup_3_pc_capture()
+                                bridge.sigma_snap(mode=3, amount=1)  # AF_DRIVE_ONLY
                             self.log.info("af_completed")
                             self._emit_status(
                                 "ready",
@@ -551,40 +620,45 @@ class TetherDaemon:
                 if pc_snap_requested:
                     self._emit_status("shooting", "Snap (PC trigger)")
                     try:
-                        # Re-arm PC capture mode (per fp trace) then fire
-                        bridge.sigma_set_datagroup_3_pc_capture()
+                        # Re-arm + sync + snap as one PTP transaction so
+                        # the live-view thread can't slot a view-frame
+                        # fetch between sub-steps and confuse the
+                        # capture state machine.
+                        with self._ptp_lock:
+                            # Re-arm PC capture mode (per fp trace) then fire
+                            bridge.sigma_set_datagroup_3_pc_capture()
 
-                        # Re-sync next_slot from camera state before snap.
-                        #
-                        # Per the 2026-05-13 hardware traces, the camera
-                        # writes the next snap to ``image_db_tail`` (the
-                        # next-write slot), NOT ``image_db_head``. Head is
-                        # the oldest-unread pointer; it sits at 0 when
-                        # nothing is pending and only catches up after
-                        # the capture commits ~hundreds of ms later. So
-                        # polling head pre-snap finds an empty slot and
-                        # the loop spins until the watchdog fires.
-                        try:
-                            sync_state = bridge.sigma_get_capture_status(0)
-                            target = sync_state.image_db_tail
-                            if target != self._next_slot:
-                                self.log.info(
-                                    "slot_resync",
-                                    cached=self._next_slot,
-                                    actual=target,
-                                    db_head=sync_state.image_db_head,
-                                    db_tail=sync_state.image_db_tail,
+                            # Re-sync next_slot from camera state before snap.
+                            #
+                            # Per the 2026-05-13 hardware traces, the camera
+                            # writes the next snap to ``image_db_tail`` (the
+                            # next-write slot), NOT ``image_db_head``. Head is
+                            # the oldest-unread pointer; it sits at 0 when
+                            # nothing is pending and only catches up after
+                            # the capture commits ~hundreds of ms later. So
+                            # polling head pre-snap finds an empty slot and
+                            # the loop spins until the watchdog fires.
+                            try:
+                                sync_state = bridge.sigma_get_capture_status(0)
+                                target = sync_state.image_db_tail
+                                if target != self._next_slot:
+                                    self.log.info(
+                                        "slot_resync",
+                                        cached=self._next_slot,
+                                        actual=target,
+                                        db_head=sync_state.image_db_head,
+                                        db_tail=sync_state.image_db_tail,
+                                    )
+                                    self._next_slot = target
+                            except (PTPError, USBBridgeError) as e:
+                                self.log.warning(
+                                    "slot_resync_failed", error=str(e)
                                 )
-                                self._next_slot = target
-                        except (PTPError, USBBridgeError) as e:
-                            self.log.warning(
-                                "slot_resync_failed", error=str(e)
-                            )
 
-                        bridge.sigma_snap(
-                            mode=self.cfg.camera.snap_mode,
-                            amount=1,
-                        )
+                            bridge.sigma_snap(
+                                mode=self.cfg.camera.snap_mode,
+                                amount=1,
+                            )
                         pending_trigger = "pc_snap"
                         t_shot_start = time.monotonic()
                         # Force the first polling log to fire ASAP
@@ -601,7 +675,8 @@ class TetherDaemon:
 
                 # ----- 2. Single status poll for the active slot -----
                 try:
-                    status = bridge.sigma_get_capture_status(self._next_slot)
+                    with self._ptp_lock:
+                        status = bridge.sigma_get_capture_status(self._next_slot)
                 except PTPError as e:
                     self.log.error("status_poll_failed", error=str(e))
                     self._emit_status("error", f"poll error: {e}")
@@ -620,7 +695,8 @@ class TetherDaemon:
                         slot=self._next_slot,
                     )
                     try:
-                        bridge.sigma_clear_image_db_single(self._next_slot)
+                        with self._ptp_lock:
+                            bridge.sigma_clear_image_db_single(self._next_slot)
                         self.log.info(
                             "cleared_failed_slot",
                             slot=self._next_slot,
@@ -643,10 +719,11 @@ class TetherDaemon:
                 if status.capt_status in (0x0002, 0x0005):
                     self._emit_status("downloading", f"Slot 0x{self._next_slot:02X}")
                     try:
-                        info, data = bridge.sigma_download_current(
-                            status,
-                            clear_strategy="image_db_head",
-                        )
+                        with self._ptp_lock:
+                            info, data = bridge.sigma_download_current(
+                                status,
+                                clear_strategy="image_db_head",
+                            )
                     except PTPError as e:
                         self.log.error("download_failed", error=str(e))
                         self._emit_status("error", f"download error: {e}")
@@ -761,9 +838,19 @@ class TetherDaemon:
             # Always release the bridge so the next reconnect attempt
             # starts from a clean USB state. Errors here are swallowed
             # because the device may already be gone.
+            # Stop the live-view thread BEFORE closing the bridge so
+            # its in-flight fetch can complete (or fail cleanly) while
+            # the USB endpoint is still alive.
+            if self._liveview is not None:
+                try:
+                    self._liveview.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self._liveview = None
             if bridge is not None:
                 try:
-                    bridge.close_session()
+                    with self._ptp_lock:
+                        bridge.close_session()
                 except Exception:  # noqa: BLE001
                     pass
                 try:

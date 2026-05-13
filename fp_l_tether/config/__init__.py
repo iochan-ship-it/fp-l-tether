@@ -99,6 +99,19 @@ class UIConfig(BaseModel):
     quit_key: str = "cmd+q"
 
 
+class LiveViewConfig(BaseModel):
+    """Live view streaming preferences.
+
+    ``pause_during_snap`` is implemented via a shared PTP lock — the
+    live view loop blocks while a snap/download is in flight so the
+    USB bulk endpoint isn't contended.
+    """
+
+    enabled: bool = True
+    target_fps: int = 15
+    pause_during_snap: bool = True
+
+
 class TelemetryConfig(BaseModel):
     """Logging behavior."""
 
@@ -130,6 +143,7 @@ class AppConfig(BaseModel):
     output: OutputConfig = Field(default_factory=OutputConfig)
     lightroom: LightroomConfig = Field(default_factory=LightroomConfig)
     ui: UIConfig = Field(default_factory=UIConfig)
+    liveview: LiveViewConfig = Field(default_factory=LiveViewConfig)
     telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
 
 

@@ -571,6 +571,22 @@ class USBBridge:
         resp.raise_for_status()
         return resp.in_data
 
+    def sigma_get_view_frame(self) -> bytes:
+        """0x902B ``GetCamViewFrame`` — fetch one live-view JPEG frame.
+
+        Returns the raw JPEG bytes (SOI..EOI). The camera wraps the JPEG
+        in a small prefix (per libgphoto2 ptp.c sigma_fp_liveview_image,
+        the payload begins with the JPEG SOI marker after some leading
+        bytes), so we slice from the first SOI to the last EOI to be
+        robust against varying header sizes across firmware versions.
+
+        Returns ``b""`` if no SOI/EOI pair was found (e.g. camera not in
+        live-view mode yet, or PC mode not engaged for view frames).
+        """
+        resp = self.send_command_raw(SigmaOperationCode.GET_CAM_VIEW_FRAME)
+        resp.raise_for_status()
+        return _extract_jpeg(resp.in_data)
+
     def sigma_get_cam_status_2(
         self, canset: int = 0, datagroup: int = 0, other: int = 0
     ) -> bytes:
@@ -1380,3 +1396,24 @@ def unwrap_sigma_fixed_struct(data: bytes, struct_size: int) -> bytes:
 def utc_now_iso() -> str:
     """Helper for log timestamps."""
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+
+def _extract_jpeg(buf: bytes) -> bytes:
+    """Slice a JPEG out of a Sigma live-view payload.
+
+    The fp / fp L wraps each view frame in a small prefix before the
+    actual JPEG (per libgphoto2 ptp.c sigma_fp_liveview_image — the
+    payload begins with some leading bytes followed by the JPEG SOI
+    marker). To stay robust across firmware variations, we don't rely
+    on a fixed prefix length — we find the first SOI (``FF D8 FF``)
+    and the last EOI (``FF D9``).
+
+    Returns ``b""`` if no SOI/EOI pair was found.
+    """
+    soi = buf.find(b"\xFF\xD8\xFF")
+    if soi < 0:
+        return b""
+    eoi = buf.rfind(b"\xFF\xD9")
+    if eoi < 0 or eoi <= soi:
+        return b""
+    return buf[soi : eoi + 2]
