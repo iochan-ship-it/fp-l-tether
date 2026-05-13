@@ -332,6 +332,28 @@ class TetherDaemon:
             except Exception as e:  # noqa: BLE001
                 self.log.warning("shot_callback_raised", error=str(e))
 
+    def _pause_liveview(self) -> None:
+        """Suspend live-view for the duration of a snap+download.
+
+        No-op if LV is disabled, not running, or pause_during_snap is
+        off. Idempotent — safe to call from multiple code paths (PC
+        snap fire, image-found, etc.) within one capture cycle.
+        """
+        if (self._liveview is not None
+                and self.cfg.liveview.pause_during_snap):
+            self._liveview.pause()
+
+    def _resume_liveview(self) -> None:
+        """Re-arm the LV stream once the capture cycle is done.
+
+        Called from every code path that ends a capture: download
+        completed, slot failure cleared, watchdog reset, PC snap
+        rejection. Idempotent.
+        """
+        if (self._liveview is not None
+                and self.cfg.liveview.pause_during_snap):
+            self._liveview.resume()
+
     def _drain_set_exposure(self, bridge: USBBridge) -> None:
         """Apply queued exposure dial writes, then re-read for ground truth.
 
@@ -551,6 +573,17 @@ class TetherDaemon:
                     self._ptp_lock,
                     target_fps=self.cfg.liveview.target_fps,
                     on_frame=self._emit_live_frame,
+                    backoff_s=self.cfg.liveview.busy_backoff_ms / 1000.0,
+                    max_consecutive_busy=self.cfg.liveview.max_consecutive_busy,
+                    promote_after_consecutive_ok=(
+                        self.cfg.liveview.promote_after_consecutive_ok
+                    ),
+                    post_snap_busy_grace_s=(
+                        self.cfg.liveview.post_snap_busy_grace_s
+                    ),
+                    first_storm_grace_s=(
+                        self.cfg.liveview.first_storm_grace_s
+                    ),
                 )
                 self._liveview.start()
 
@@ -619,6 +652,14 @@ class TetherDaemon:
 
                 if pc_snap_requested:
                     self._emit_status("shooting", "Snap (PC trigger)")
+                    # Suspend LV for the entire snap+download cycle.
+                    # The Phase 3.2 stream test showed that running LV
+                    # through a PC snap triggers a ~5 s busy storm on
+                    # the first capture (and shorter blips on later
+                    # ones). Pausing here lets the camera dedicate the
+                    # bulk endpoint to capture and download. Resumed
+                    # below after download / failure / watchdog.
+                    self._pause_liveview()
                     try:
                         # Re-arm + sync + snap as one PTP transaction so
                         # the live-view thread can't slot a view-frame
@@ -669,6 +710,9 @@ class TetherDaemon:
                         # Camera is still alive, just rejected this snap.
                         self.log.error("pc_snap_failed", error=str(e))
                         self._emit_status("error", str(e))
+                        # Snap never fired → no download cycle to wait
+                        # for, so resume LV immediately.
+                        self._resume_liveview()
                         time.sleep(poll_idle_s)
                         continue
                     # USBBridgeError / usb.core.USBError propagates → reconnect
@@ -713,6 +757,9 @@ class TetherDaemon:
                     self._next_slot = (self._next_slot + 1) & 0xFF
                     pending_trigger = "camera_button"
                     t_shot_start = None
+                    # Capture cycle ended (in failure) → resume LV so it
+                    # doesn't stay paused after a stuck-slot recovery.
+                    self._resume_liveview()
                     continue
 
                 # Image ready → download + write
@@ -727,9 +774,18 @@ class TetherDaemon:
                     except PTPError as e:
                         self.log.error("download_failed", error=str(e))
                         self._emit_status("error", f"download error: {e}")
+                        # Download failed → cycle is over, re-arm LV.
+                        self._resume_liveview()
                         time.sleep(poll_idle_s)
                         continue
                     # USBBridgeError propagates → reconnect
+
+                    # Download + clear complete — the camera's bulk
+                    # endpoint is free again, so resume LV before doing
+                    # the (slower, lock-free) atomic write and callbacks.
+                    # Per coworker spec: resume タイミングは clear 完了
+                    # 直後 (sigma_download_current() 戻り直後).
+                    self._resume_liveview()
 
                     self._shot_count += 1
                     # Per-item shot counter for the filename template's
@@ -828,6 +884,9 @@ class TetherDaemon:
                         t_shot_start = None
                         pending_trigger = "camera_button"
                         t_last_polling_log = 0.0
+                        # Snap is being abandoned → resume LV so the
+                        # user still sees the viewfinder.
+                        self._resume_liveview()
 
                 # Use active interval when we're waiting on a pending shot,
                 # idle interval when just watching for a manual button press.

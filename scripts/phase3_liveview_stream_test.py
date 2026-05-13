@@ -117,21 +117,74 @@ def main() -> int:
             if snaps_fired < SNAP_COUNT and now >= next_snap_at:
                 snaps_fired += 1
                 t_snap = time.monotonic()
+                # Mirror the daemon's full snap→poll→download→clear
+                # transaction inside one pause window. The previous
+                # iteration of this test paused only around
+                # ``sigma_snap()`` itself (~7 ms) and resumed before
+                # the camera had finished committing the capture —
+                # which is why SNAP #1 still saw a 5 s busy storm
+                # even with pause/resume wired. The commit window is
+                # what triggers 0x2019; covering it with the pause is
+                # the whole point of pause_during_snap.
+                stream.pause()
+                snap_ok = False
                 try:
                     with ptp_lock:
                         bridge.sigma_set_datagroup_3_pc_capture()
+                        # Re-sync the target slot from camera state
+                        # (image_db_tail = next-write slot, per the
+                        # 2026-05-13 hardware traces — head is the
+                        # oldest-unread pointer and lags commit).
+                        pre = bridge.sigma_get_capture_status(0)
+                        target_slot = pre.image_db_tail
                         bridge.sigma_snap(mode=1, amount=1)
+                        snap_fired_dt = time.monotonic() - t_snap
+
+                        # Poll until image is ready or timeout (~30 s
+                        # to allow a worst-case long exposure).
+                        status = None
+                        for _ in range(150):
+                            status = bridge.sigma_get_capture_status(
+                                target_slot,
+                            )
+                            if status.capt_status in (0x0002, 0x0005):
+                                break
+                            time.sleep(0.2)
+                        else:
+                            raise TimeoutError(
+                                f"snap timed out, last status="
+                                f"0x{status.capt_status:04X}"
+                                if status else "snap timed out"
+                            )
+
+                        # Drain (download + clear) — same call the
+                        # daemon makes. This is what makes the camera
+                        # release its commit-window busy state.
+                        info, data = bridge.sigma_download_current(
+                            status, clear_strategy="image_db_head",
+                        )
                     snap_dt = time.monotonic() - t_snap
+                    snap_ok = True
                     snaps_ok += 1
                     print(
-                        f"  [t={now - t0:5.1f}s] SNAP #{snaps_fired} fired "
-                        f"({snap_dt * 1000:.0f} ms)"
+                        f"  [t={now - t0:5.1f}s] SNAP #{snaps_fired} "
+                        f"fired+drained "
+                        f"(snap={snap_fired_dt * 1000:.0f} ms, "
+                        f"total={snap_dt * 1000:.0f} ms, "
+                        f"size={len(data) / 1024:.0f} KB, "
+                        f"slot=0x{target_slot:02X})"
                     )
-                except (PTPError, USBBridgeError) as e:
+                except (PTPError, USBBridgeError, TimeoutError) as e:
                     snaps_failed += 1
                     print(
                         f"  [t={now - t0:5.1f}s] SNAP #{snaps_fired} FAILED: {e}"
                     )
+                finally:
+                    # Resume after drain (or failure) — matches the
+                    # production watcher.py code path where
+                    # _resume_liveview() fires right after
+                    # sigma_download_current() returns.
+                    stream.resume()
                 next_snap_at = now + SNAP_INTERVAL_S
 
             time.sleep(0.05)

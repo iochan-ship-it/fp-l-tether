@@ -102,9 +102,15 @@ class UIConfig(BaseModel):
 class LiveViewConfig(BaseModel):
     """Live view streaming preferences.
 
-    ``pause_during_snap`` is implemented via a shared PTP lock — the
-    live view loop blocks while a snap/download is in flight so the
-    USB bulk endpoint isn't contended.
+    ``pause_during_snap``: when True, the daemon explicitly suspends
+    the LiveViewStream thread for the duration of each snap+download
+    transaction. This eliminates the first-snap busy storm (~5 s of
+    PTP_RC_DeviceBusy observed when LV runs through a full capture).
+
+    ``busy_backoff_ms`` / ``max_consecutive_busy``: defense in depth.
+    If a busy still slips through, sleep for that many ms; if N busies
+    happen in a row, halve the effective target_fps (recovers slowly
+    after sustained success).
     """
 
     enabled: bool = True
@@ -112,7 +118,39 @@ class LiveViewConfig(BaseModel):
     # 15 fps reliably triggers PTP_RC_DeviceBusy (0x2019) and stalls
     # the bulk endpoint; 12 fps untested. Stay conservative.
     target_fps: int = 10
+    # When True, suspend LV across the full snap → poll → download →
+    # clear window. This eliminates the 0x2019 busy storm the camera
+    # otherwise produces while committing the capture, at the cost of
+    # a ~5 s LV freeze per shot (matches DNG download time at the
+    # fp L's ~5 MB/s bulk-out rate). Acceptable for studio tether
+    # where the user is focused on Lightroom between shots.
     pause_during_snap: bool = True
+    # TODO(Phase 3.x): if a finer-grained trade-off is wanted, add
+    # `pause_mode: Literal["full", "snap_only", "off"]` here and wire
+    # it through to LiveViewStream + watcher. "full" covers the whole
+    # commit+drain (current default; zero busies, 5s LV gap). The
+    # plumbing — pause()/resume() on the stream and helper methods
+    # on the daemon — is already in place; only the resume-point
+    # selection in watcher.py would need to switch on the mode.
+    busy_backoff_ms: int = 500
+    max_consecutive_busy: int = 5
+    # Number of consecutive successful frames before we promote
+    # effective_fps by +1 back toward target. Lower = faster recovery
+    # from a transient demotion. At 5 fps, 10 frames ≈ 2 s.
+    promote_after_consecutive_ok: int = 10
+    # When the daemon resumes LV after a snap+download, the camera
+    # often returns one or two 0x2019 busies as its commit state
+    # settles. These are NOT a rate problem — counting them toward
+    # demotion drags effective_fps down inappropriately. Within this
+    # window after each resume(), busies are still logged + back-off
+    # is applied, but they don't tick max_consecutive_busy.
+    post_snap_busy_grace_s: float = 1.5
+    # The very first snap of a session frequently triggers a longer
+    # busy burst even with pause/resume around the full commit
+    # window. Don't let that one-off drag the session-long
+    # effective_fps down — within this window from stream start,
+    # busies are tolerated without demotion.
+    first_storm_grace_s: float = 30.0
 
 
 class TelemetryConfig(BaseModel):

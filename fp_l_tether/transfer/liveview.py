@@ -130,17 +130,38 @@ class LiveViewStream:
         target_fps: int = 15,
         on_frame: Callable[[LiveViewFrame], None] | None = None,
         backoff_s: float = DEFAULT_BACKOFF_S,
+        max_consecutive_busy: int = 5,
+        promote_after_consecutive_ok: int = 10,
+        post_snap_busy_grace_s: float = 1.5,
+        first_storm_grace_s: float = 30.0,
     ) -> None:
         if target_fps <= 0:
             raise ValueError(f"target_fps must be positive, got {target_fps}")
         self._bridge = bridge
         self._ptp_lock = ptp_lock
-        self._target_fps = target_fps
+        self._target_fps = target_fps         # configured ceiling
+        self._effective_fps = target_fps      # adaptive — may be lower
         self._on_frame = on_frame
         self._backoff_s = backoff_s
+        self._max_consecutive_busy = max_consecutive_busy
+        self._promote_after_consecutive_ok = promote_after_consecutive_ok
+        self._post_snap_busy_grace_s = post_snap_busy_grace_s
+        self._first_storm_grace_s = first_storm_grace_s
 
         self._stop_event = threading.Event()
+        # _resume_event reflects "stream is running" — set = run, clear = paused.
+        # Initially set so start() begins streaming immediately.
+        self._resume_event = threading.Event()
+        self._resume_event.set()
         self._thread: threading.Thread | None = None
+        # Snap-grace window — busies inside this window are treated as
+        # commit-cycle settling, not a rate problem (so they don't
+        # tick the demote counter). resume() extends this window.
+        self._post_snap_window_until: float = 0.0
+        # When the stream started — used by first_storm_grace logic
+        # to give the very first capture cycle of a session a longer
+        # tolerance for 0x2019 without demoting.
+        self._stream_started_at: float = 0.0
         self.log = get_logger("liveview")
 
         # Rolling fps / frame-size window — last ~1 s of arrivals.
@@ -153,6 +174,7 @@ class LiveViewStream:
         if self._thread is not None:
             return
         self._stop_event.clear()
+        self._stream_started_at = time.monotonic()
         self._thread = threading.Thread(
             target=self._run, name="LiveViewStream", daemon=True
         )
@@ -161,6 +183,9 @@ class LiveViewStream:
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop_event.set()
+        # If we're paused, the loop is sitting on resume_event.wait().
+        # Set it so the loop checks stop_event and returns.
+        self._resume_event.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
@@ -169,6 +194,45 @@ class LiveViewStream:
     @property
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def is_paused(self) -> bool:
+        return not self._resume_event.is_set()
+
+    @property
+    def effective_fps(self) -> int:
+        """Current adaptive target fps (may be below configured target)."""
+        return self._effective_fps
+
+    def pause(self) -> None:
+        """Suspend the streaming loop without killing the thread.
+
+        Idempotent. Used by the daemon to free the PTP bulk endpoint
+        for the duration of a snap+download transaction so the camera
+        doesn't busy out (see Phase 3.2 rate-test traces).
+        """
+        if self._resume_event.is_set():
+            self._resume_event.clear()
+            self.log.debug("liveview_paused")
+
+    def resume(self) -> None:
+        """Resume the streaming loop. Idempotent.
+
+        Extends the post-snap grace window: for ``post_snap_busy_grace_s``
+        after this call, any 0x2019 busies from the camera are treated
+        as expected commit-cycle settling rather than a rate problem,
+        so they don't count toward effective_fps demotion. (Back-off
+        and warning logs still happen — just no demote tick.)
+        """
+        # Always (re)arm the grace window even if we weren't paused —
+        # the daemon may call resume() defensively at exit points
+        # where pause() was never reached, and that's harmless.
+        self._post_snap_window_until = (
+            time.monotonic() + self._post_snap_busy_grace_s
+        )
+        if not self._resume_event.is_set():
+            self._resume_event.set()
+            self.log.debug("liveview_resumed")
 
     # ----- metrics -----------------------------------------------------
 
@@ -194,15 +258,26 @@ class LiveViewStream:
     # ----- main loop ---------------------------------------------------
 
     def _run(self) -> None:
-        period_s = 1.0 / self._target_fps
         consecutive_failures = 0
+        # Adaptive-rate state.
+        consecutive_busy = 0
+        consecutive_success = 0
 
         # Warm-up: skip the well-known first-call busy by waiting once.
         if self._stop_event.wait(WARMUP_S):
             return
 
         while not self._stop_event.is_set():
+            # ---- Honor pause -------------------------------------
+            # When the daemon pauses us (e.g. for the snap+download
+            # transaction), block until resumed. Polled in 50 ms
+            # increments so stop() still takes effect promptly.
+            while not self._resume_event.is_set():
+                if self._stop_event.wait(0.05):
+                    return
+
             loop_start = time.monotonic()
+            period_s = 1.0 / max(1, self._effective_fps)
 
             # Acquire the lock for just the PTP fetch — release before
             # the callback so heavy panel work doesn't block snaps.
@@ -214,13 +289,49 @@ class LiveViewStream:
                 msg = str(e)
                 is_busy = f"0x{PTP_RC_DEVICE_BUSY:04X}" in msg
                 consecutive_failures += 1
-                # Busy is the camera's "I can't keep up" signal — not
-                # a real failure. Log it under a separate event so it
-                # doesn't get conflated with USB / PTP errors.
+                if is_busy:
+                    # Decide whether this busy counts toward demotion.
+                    # Two grace windows exempt commit-cycle artifacts
+                    # from being treated as a sustained rate problem:
+                    #   1. post-snap window (set by resume()): a few
+                    #      busies are normal as the camera settles
+                    #      after a capture commit.
+                    #   2. first-storm window: the very first capture
+                    #      cycle of a session is the worst — give it
+                    #      a wider tolerance so one bad event doesn't
+                    #      drag effective_fps for the whole session.
+                    now_t = time.monotonic()
+                    in_post_snap_grace = now_t < self._post_snap_window_until
+                    in_first_storm_grace = (
+                        self._stream_started_at > 0
+                        and (now_t - self._stream_started_at)
+                            < self._first_storm_grace_s
+                    )
+                    in_grace = in_post_snap_grace or in_first_storm_grace
+                    consecutive_success = 0
+                    if not in_grace:
+                        consecutive_busy += 1
+                        # Adaptive: after sustained busy, halve effective
+                        # fps so we stop hammering. Floors at 1 fps so
+                        # the stream never goes fully silent.
+                        if (consecutive_busy >= self._max_consecutive_busy
+                                and self._effective_fps > 1):
+                            new_fps = max(1, self._effective_fps // 2)
+                            self.log.warning(
+                                "liveview_rate_demoted",
+                                from_fps=self._effective_fps,
+                                to_fps=new_fps,
+                                consecutive_busy=consecutive_busy,
+                            )
+                            self._effective_fps = new_fps
+                            consecutive_busy = 0  # reset for next demotion
                 self.log.warning(
                     "liveview_busy" if is_busy else "liveview_failed",
                     error=msg,
                     consecutive=consecutive_failures,
+                    grace=("post_snap" if in_post_snap_grace
+                           else "first_storm" if in_first_storm_grace
+                           else None) if is_busy else None,
                 )
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     self.log.error(
@@ -229,7 +340,6 @@ class LiveViewStream:
                     )
                     return
                 # Brief back-off, then retry — but honour stop_event.
-                # 500 ms recovers from DeviceBusy in our rate tests.
                 if self._stop_event.wait(self._backoff_s):
                     return
                 continue
@@ -249,6 +359,24 @@ class LiveViewStream:
                 continue
 
             consecutive_failures = 0
+            consecutive_busy = 0
+            consecutive_success += 1
+            # Adaptive: after sustained success, claw back 1 fps at a
+            # time toward the configured target. The threshold is
+            # configurable via promote_after_consecutive_ok — default
+            # 10 frames, which at 5 fps is ~2 s clean, fast enough to
+            # recover from a transient hiccup within a few snaps.
+            if (consecutive_success >= self._promote_after_consecutive_ok
+                    and self._effective_fps < self._target_fps):
+                old = self._effective_fps
+                self._effective_fps = min(
+                    self._target_fps, self._effective_fps + 1
+                )
+                self.log.info(
+                    "liveview_rate_promoted",
+                    from_fps=old, to_fps=self._effective_fps,
+                )
+                consecutive_success = 0
 
             # Update rolling metrics.
             now = time.monotonic()
