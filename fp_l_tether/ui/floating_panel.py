@@ -194,9 +194,17 @@ class FloatingTetherPanel(NSObject):
         # connected end-to-end.
         lv_x = (PANEL_WIDTH - LV_WIDTH) // 2
         lv_y = CONTROLS_HEIGHT + LV_PAD_BOTTOM
-        self._live_view = NSImageView.alloc().initWithFrame_(
+        # LiveViewImageView is a click-aware NSImageView subclass. Click
+        # anywhere on the rendered LV → maps view-local (x, y) to camera
+        # AF coordinates via panel.af_bounds() and pushes through
+        # panel.commit_focus_point(). This replaces the AF popover as
+        # the primary way to set the AF point (the popover stays for
+        # users who want the numeric coord readout / 3×3 snap mode).
+        self._live_view = LiveViewImageView.alloc().initWithFrame_(
             NSMakeRect(lv_x, lv_y, LV_WIDTH, LV_HEIGHT)
         )
+        self._live_view.setOwner_(self)
+        self._live_view.setEditable_(False)
         # Proportional scaling so non-3:2 frames (e.g. cropped sensor
         # modes) don't distort.
         self._live_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
@@ -971,6 +979,65 @@ def _make_label(field: NSTextField, text: str, *, bold: bool = False, size: floa
         field.setFont_(NSFont.boldSystemFontOfSize_(size))
     else:
         field.setFont_(NSFont.systemFontOfSize_(size))
+
+
+# ---------------------------------------------------------------------------
+# Live-view image view — click to set AF point
+# ---------------------------------------------------------------------------
+#
+# Tiny NSImageView subclass whose only job is to turn mouseDown_ events
+# into camera AF coords and forward them to the FloatingTetherPanel via
+# its existing commit_focus_point() entry point.
+#
+# Coordinate mapping is the same as AFPointView:
+#  - The whole LV view rect maps to the camera's AF coord range
+#    (af_bounds() = X∈[x_min..x_max], Y∈[y_min..y_max], default 96..928
+#    / 85..597 on fp L V90).
+#  - AppKit Y goes up from bottom-left, camera Y goes down from
+#    top-left → we flip Y when going view → cam.
+#  - The image is scaled proportionally inside the view, so non-3:2
+#    frames will pillarbox/letterbox slightly. We intentionally don't
+#    correct for that here — the camera's AF coord system already
+#    covers the cropped active area (the fp L's AF range stays inside
+#    the full sensor frame regardless of LV aspect), and matching the
+#    picker popover's "click anywhere = pick that fraction of AF
+#    range" feel keeps the two paths consistent.
+
+
+class LiveViewImageView(NSImageView):
+    """NSImageView subclass that maps clicks → camera AF coordinates.
+
+    Holds a back-ref to the FloatingTetherPanel (set via setOwner_)
+    so it can read the current AF bounds and push new points without
+    needing the rest of the AF popover plumbing.
+    """
+
+    def initWithFrame_(self, frame):  # type: ignore[no-untyped-def]
+        self = objc.super(LiveViewImageView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._owner = None
+        return self
+
+    def setOwner_(self, owner) -> None:  # type: ignore[no-untyped-def]
+        self._owner = owner
+
+    def mouseDown_(self, event) -> None:  # type: ignore[no-untyped-def]
+        if self._owner is None:
+            return
+        local = self.convertPoint_fromView_(event.locationInWindow(), None)
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+        x_min, x_max, y_min, y_max = self._owner.af_bounds()
+        # Clamp normalised view coords to [0..1] so a click exactly on
+        # the border (or a stray off-by-one) still produces a valid
+        # in-range AF point.
+        nx = max(0.0, min(1.0, local.x / max(1.0, w)))
+        ny = max(0.0, min(1.0, 1.0 - local.y / max(1.0, h)))  # flip Y
+        cam_x = int(round(nx * (x_max - x_min) + x_min))
+        cam_y = int(round(ny * (y_max - y_min) + y_min))
+        self._owner.commit_focus_point(cam_x, cam_y)
 
 
 # ---------------------------------------------------------------------------
