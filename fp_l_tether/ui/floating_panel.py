@@ -54,6 +54,7 @@ from AppKit import (
     NSEventMaskKeyDown,
     NSFloatingWindowLevel,
     NSFont,
+    NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSMakeRect,
@@ -81,7 +82,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSMakePoint, NSObject
+from Foundation import NSData, NSMakePoint, NSObject
 
 from fp_l_tether.camera.sigma_datagroup import (
     apex_to_aperture,
@@ -589,18 +590,34 @@ class FloatingTetherPanel(NSObject):
 
     @objc.signature(b"v@:@")
     def updateLiveFrame_(self, tup) -> None:
-        """Main-thread stub for live-view frame updates.
+        """Decode a JPEG live-view frame and push it into the viewport.
 
-        3.3a only proves the callback fires on the main thread. 3.3b
-        will decode ``jpeg`` into an NSImage and call
-        ``self._live_view.setImage_(image)``. Until then we just
-        record that a frame arrived so an aliveness check in tests
-        / logs can confirm wiring.
+        Runs on the main thread (marshalled via
+        ``performSelectorOnMainThread_``). NSImage construction and
+        setImage_ are both main-thread-only on AppKit.
+
+        Decoding is cheap (~1–2 ms for 760 KB JPEG on Apple Silicon)
+        so we do it inline rather than offloading. If profiling later
+        shows it's too heavy, switch to a CIImage / CGImageSource
+        pipeline or pre-decode on the LV thread.
         """
         jpeg, width, height = tup
         # Cheap aliveness counter — useful from the debugger / a future
-        # debug overlay. Not used yet.
+        # debug overlay.
         self._lv_frame_count = getattr(self, "_lv_frame_count", 0) + 1
+
+        # Wrap the Python bytes in an NSData. PyObjC can usually pass
+        # bytes through transparently, but going via NSData avoids a
+        # bytes-copy ambiguity in some PyObjC versions and is what
+        # Apple's sample code uses.
+        ns_data = NSData.dataWithBytes_length_(jpeg, len(jpeg))
+        image = NSImage.alloc().initWithData_(ns_data)
+        if image is None:
+            # Malformed JPEG (rare — the camera occasionally emits a
+            # truncated frame during mode transitions). Keep the
+            # previous image up so the viewport doesn't flicker.
+            return
+        self._live_view.setImage_(image)
 
     # ----- dropdown helpers -------------------------------------------
 
