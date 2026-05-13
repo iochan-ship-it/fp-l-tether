@@ -1056,6 +1056,53 @@ class TetherDaemon:
                     # Capture cycle ended (in failure) → resume LV so it
                     # doesn't stay paused after a stuck-slot recovery.
                     self._resume_liveview()
+
+                    # ----- Drain queued requests (Fix 2) -----
+                    # The user likely queued more snaps / AF / set_*
+                    # before this failure surfaced (button mashing
+                    # during commit window). Letting those fire now
+                    # cascades into multiple snap_watchdog_timeouts
+                    # — 2026-05-13 endurance run observed 4 stuck
+                    # slots / 2+ min after a single 0x6001. Drop
+                    # all queued items; the user re-triggers if
+                    # they still want the shot.
+                    drained = {"snap": 0, "af": 0, "set_exp": 0, "set_focus": 0}
+                    for key, q in (
+                        ("snap", self._snap_queue),
+                        ("af", self._af_queue),
+                        ("set_exp", self._set_exposure_queue),
+                        ("set_focus", self._set_focus_queue),
+                    ):
+                        while True:
+                            try:
+                                q.get_nowait()
+                            except Empty:
+                                break
+                            drained[key] += 1
+                    if any(drained.values()):
+                        self.log.info(
+                            "capture_failure_queues_drained", **drained,
+                        )
+
+                    # Emit user-facing failure message. 0x6001 is the
+                    # most common on fp L (focus/exposure-lock fail);
+                    # other subcodes possible, so keep the wording
+                    # generic but include the raw code for diagnosis.
+                    self._emit_status(
+                        "error",
+                        f"撮影失敗 (0x{status.capt_status:04X}) — "
+                        "フォーカス確認後、再操作してください",
+                    )
+
+                    # Hold the warning ~3 s, then return to ready so
+                    # the UI doesn't sit on an error state forever.
+                    # Interruptible via stop_event for clean Ctrl-C.
+                    if self._stop_event.wait(3.0):
+                        continue
+                    self._emit_status(
+                        "ready",
+                        f"Watching slot 0x{self._next_slot:02X}",
+                    )
                     continue
 
                 # Image ready → download + write
