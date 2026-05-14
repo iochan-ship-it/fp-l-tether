@@ -3,7 +3,7 @@
 NSView subclass that owns a ``HistogramData`` snapshot and renders it
 in ``drawRect:`` using NSBezierPath. Three overlapping line paths
 (R / G / B) drawn with additive compositing so the overlap area
-brightens toward white — matches the Capture One / Lightroom look.
+brightens toward white — the standard additive-blend RGB histogram look.
 
 Numeric clipping markers (▲ X.X% / ▽ X.X%) are drawn at the corners.
 

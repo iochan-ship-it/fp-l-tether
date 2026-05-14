@@ -16,6 +16,12 @@
 for the Sigma fp L on macOS. The headline features:
 
 - **Live View** at up to 10 fps, with click-to-AF
+- **Detachable LV window** (⌘D) — pop Live View out of the panel into a
+  resizable 3:2 window for art-repro / studio work
+- **RGB histogram overlay** (H / ⌘H) on Live View with highlight / shadow
+  clipping markers
+- **Composition grid overlay** (G / ⌘G) — cycle thirds / golden ratio /
+  10×6 alignment grid
 - **Floating control panel** that follows you across macOS Spaces and
   Lightroom fullscreen
 - **Lightroom Classic Auto Import** integration — every shot lands in your
@@ -24,13 +30,14 @@ for the Sigma fp L on macOS. The headline features:
   firmware quirk), this daemon detects the wedge and force-re-enumerates
   the device via IOKit in ~4 seconds. No physical power cycle needed.
 - **Persistent settings cache** — your ISO / SS / Aperture / WB / Format
-  stay remembered across disconnects and recoveries; no need to re-dial
-  the camera every time you reconnect.
+  and LV window state stay remembered across disconnects and recoveries.
 - **JPG / DNG / DNG+JPG** capture with dual-file extraction
 - **Exposure controls** — ISO, SS, Aperture, WB, Format, Resolution
   via floating panel dropdowns
+- **質実剛健 UI** — anodized-black + amber accent + SF Mono hero values,
+  inspired by the Sigma fp's industrial design
 
-Phase 3.9 status: feature-complete and used daily by the author for studio
+Status: feature-complete and used daily by the author for studio
 product photography. Bug reports and pull requests very welcome.
 
 ---
