@@ -43,12 +43,17 @@ class CameraConfig(BaseModel):
     chunk_size: int = 1_048_576
     clear_image_db_after_download: bool = True
 
-    # SnapCommand CaptureMode (per Sigma SDK header)
-    #   1 = GENERAL_CAPTURE       — AF + shutter (default, normal shooting)
-    #   2 = NON_AF_CAPTURE        — skip AF, use current focus (MF scenarios)
+    # SnapCommand CaptureMode (verified by experiment)
+    #   1 = GENERAL_CAPTURE       — AF + shutter
+    #   2 = NON_AF_CAPTURE        — skip AF, use current focus (default 2026-05-13)
     #   3 = AF_DRIVE_ONLY         — focus only, no shutter
     #   6 = START_CAPTURE         — begin sequence shooting
-    snap_mode: int = 1
+    #
+    # Phase 3.9 (2026-05-13): defaulted to 2. The floating panel has a
+    # separate AF button + LV-click-to-AF for focus control, so making
+    # Shoot include AF was an unnecessary duplication that also caused
+    # unwanted refocusing when the photographer had already locked focus.
+    snap_mode: int = 2
 
     # USB keep-alive heartbeat. The fp L slips into an internal
     # power-saving state after ~5 min of bus idle (even in PC capture
@@ -58,7 +63,73 @@ class CameraConfig(BaseModel):
     # the watcher's recovery path will catch any drift on the next
     # status poll.
     keep_alive_enabled: bool = True
-    keep_alive_interval_s: float = 60.0
+    # Phase 3.6 (2026-05-13): bumped 60.0 → 30.0. Empirically the
+    # camera entered idle ~1:47 after the last shot during the
+    # endurance retest even with LV streaming at 10 fps, so a 60 s
+    # heartbeat is too sparse — by the time the next ping fires the
+    # camera may already be half-asleep, and the ping itself can
+    # tip a half-stalled endpoint into Errno 60.
+    keep_alive_interval_s: float = 30.0
+
+    # Phase 3.6 Plan T (2026-05-13): aggressive keep-alive. When
+    # enabled, the heartbeat sends SnapCommand(mode=AF_DRIVE_ONLY,
+    # amount=0) instead of the passive camera_info query. Empirically
+    # the shot operation is the only opcode family that resets the
+    # fp L's internal doze timer (4 min of inter-shot quiet stayed
+    # awake during the 0x903a probe). Side effects:
+    #  - Slight AF motor sound every interval_s seconds
+    #  - May briefly re-focus during static subjects
+    # Disable in studio scenarios with critical focus stability.
+    # Kept for backward compat — newer code should set
+    # ``keepalive_strategy = "af_drive_only"`` instead.
+    aggressive_keepalive: bool = False
+    # When aggressive_keepalive is on, this overrides keep_alive_interval_s.
+    # 50 s is below the observed doze threshold (75-107 s) with safety
+    # margin, but spread out enough to minimise AF wear.
+    aggressive_keepalive_interval_s: float = 50.0
+
+    # Phase 3.7 Plan U (2026-05-13): heartbeat strategy selector.
+    #
+    #   "info"            — passive ``sigma_get_camera_info`` (default;
+    #                       cheap, zero side effects, but doesn't prevent
+    #                       doze — Phase 3.6 baseline 75-107 s).
+    #   "af_drive_only"   — ``SnapCommand(mode=3, amount=1)`` AF-only
+    #                       shutter (Plan T, 153 s until doze). Best
+    #                       known result. Side effect: brief AF motor
+    #                       whirr every interval_s.
+    #   "af_point_jiggle" — ``SetCamDataGroupFocus`` (0x9032) writes the
+    #                       current AF point shifted by ±1 px and then
+    #                       restored. Hypothesis: a Sigma DataGroup
+    #                       write counts as a "user touch" for the
+    #                       doze timer the same way Snap does, without
+    #                       the AF motor cost. UNTESTED 2026-05-13;
+    #                       observed side effect is a single-pixel
+    #                       flicker of the AF reticle.
+    #
+    # When ``aggressive_keepalive=True`` is set in older configs, it
+    # is interpreted as ``"af_drive_only"`` for backward compatibility.
+    keepalive_strategy: Literal["info", "af_drive_only", "af_point_jiggle"] = "info"
+    # Pixel delta for the jiggle strategy. 1 px is invisible in normal
+    # framing; >1 may be more reliable at touching the doze timer but
+    # makes the AF reticle flicker more visible on LV.
+    af_jiggle_delta_px: int = 1
+
+    # Phase 3.8 (2026-05-13): preserve user-dialed camera settings
+    # across the PC tether handshake. The fp / fp L's well-known
+    # behaviour is that switching to PC capture mode overwrites
+    # several user fields (DriveMode, SpecialMode, FlashMode, possibly
+    # others) with hard-coded defaults — Capture One also has this
+    # issue. We work around it by reading DG1+DG2 right after
+    # open_session, running the normal sigma_init, then replaying
+    # the saved fields via the per-field SetCamDataGroup setters.
+    #
+    # Failure is non-fatal: any individual field that the camera
+    # rejects (e.g. ShutterSpeed write in Auto-exposure mode) is
+    # logged and skipped — the user can re-dial that field by hand.
+    #
+    # Disable this if you actually want PC tether to reset settings
+    # to defaults (rare, e.g. studio reproducibility scenarios).
+    preserve_user_settings: bool = True
 
     # Burst-aware post-capture quiet window (see TetherDaemon._arm_quiet_window).
     # After a burst settles (snap queue drains), the daemon enforces
@@ -74,6 +145,51 @@ class CameraConfig(BaseModel):
     # commit tail observed → per-shot=1.0 picks 14 s of safety).
     commit_window_base_s: float = 5.0
     commit_window_per_shot_s: float = 1.0
+
+    # Phase 3.7 (2026-05-13): automatic USB recovery between reconnect
+    # attempts. When the bridge dies (Errno 60, 0-byte read, etc.) and
+    # the daemon retries connecting, it first forces a USB-level
+    # re-enumeration via IOKit's USBDeviceReEnumerate — equivalent to
+    # unplugging and replugging the cable, but driven from software.
+    # This eliminates the need to physically power-cycle the camera
+    # for the vast majority of wedge cases. Verified on macOS Apple
+    # Silicon with Sigma fp L (PID 0xC442); falls back gracefully on
+    # any unexpected IOKit error.
+    #
+    # Turn off if you want the old "manual power cycle" behavior
+    # (e.g. for diagnosing why a wedge occurred without auto-clearing
+    # the evidence).
+    auto_recover_on_wedge: bool = True
+    # Max wait for the device to come back on the USB bus after
+    # IOKit ReEnumerate. Empirically the fp L re-enumerates in <1 s,
+    # so 12 s is very generous.
+    usb_recovery_timeout_s: float = 12.0
+    # Sleep after device reappears, before libusb tries to claim it.
+    # Lets ptpcamerad re-attach (so we can detach it cleanly again)
+    # and the kernel driver state machine settle.
+    usb_recovery_settle_s: float = 1.5
+    # How many consecutive CameraIdleError / Errno 60 hits we tolerate
+    # before tearing down the session and triggering USB recovery.
+    # Each attempt costs ~5 s of sleep + the USB read timeout (~5 s),
+    # so this directly controls the worst-case idle → recovered time:
+    #
+    #   total_recovery_s ≈ idle_recovery_max * 10  +  2 (reconnect delay)
+    #                                              +  2 (reenum + settle)
+    #
+    # Evolution of this knob:
+    #   Phase 3.6 (no recovery):   12  (~125 s) — long wait for the user
+    #                                            to wake the camera by
+    #                                            pressing Shoot.
+    #   Phase 3.7a (initial reenum): 2  (~25 s) — passive waits absorb
+    #                                            occasional transient busies.
+    #   Phase 3.7b (this default):   0  (~ 5 s) — empirically once we
+    #                                            see Errno 60 the camera
+    #                                            does NOT come back without
+    #                                            a USB-level cycle, so
+    #                                            the passive_wait window
+    #                                            is pure wasted time.
+    #                                            Skip straight to reenum.
+    idle_recovery_max: int = 0
 
 
 class OutputConfig(BaseModel):

@@ -63,6 +63,29 @@ class LiveViewFrame:
 DEFAULT_BACKOFF_S = 0.5
 MAX_CONSECUTIVE_FAILURES = 20  # ~10 seconds at the default back-off
 
+# Phase 3.6 (2026-05-13): when the camera enters power-save the first
+# symptom on the LV path is "PTP read too short: 0 bytes" (the header
+# read itself returns 0 bytes — distinct from a 0-byte data phase
+# which is the symptom on the status-poll path).
+#
+# Hammering the endpoint after one of these is bad: empirically the
+# next bulk transaction tips it from "half-stalled" into Errno 60
+# territory, which on the fp L is only recoverable by a physical
+# power cycle. So when we detect this pattern we self-pause the
+# stream with an exponential back-off — the daemon's recovery path
+# owns the wake / reconnect decision, we just stop contributing
+# 0-byte reads to the wedge.
+#
+# Patterns we treat as "endpoint is dozing, stop hammering":
+LV_IDLE_PATTERNS: tuple[str, ...] = (
+    "PTP read too short",  # raised by USBBridge._read_container
+    "Operation timed out",  # Errno 60 wedge symptom
+    "Errno 60",
+)
+# Exponential back-off ladder (seconds). Each consecutive idle hit
+# advances one rung; a successful frame resets to rung 0.
+LV_IDLE_BACKOFF_LADDER_S: tuple[float, ...] = (5.0, 15.0, 30.0, 60.0)
+
 # fp L rate-test (2026-05-13) findings:
 #   - Sustained ceiling is 10 fps; 15 fps reliably degrades to 0x2019
 #     DeviceBusy and stalls the bulk endpoint.
@@ -154,6 +177,15 @@ class LiveViewStream:
         self._resume_event = threading.Event()
         self._resume_event.set()
         self._thread: threading.Thread | None = None
+        # Phase 3.6 (2026-05-13): self-pause state. Set in the future
+        # when we detect an idle pattern (see LV_IDLE_PATTERNS); the
+        # main loop will not attempt a fetch while now < this value.
+        # An external resume() clears this — the daemon's recovery
+        # path owns the wake signal, not us.
+        self._self_paused_until: float = 0.0
+        # How far up the LV_IDLE_BACKOFF_LADDER_S we currently sit.
+        # Reset to 0 on a successful frame.
+        self._idle_rung: int = 0
         # Snap-grace window — busies inside this window are treated as
         # commit-cycle settling, not a rate problem (so they don't
         # tick the demote counter). resume() extends this window.
@@ -230,6 +262,14 @@ class LiveViewStream:
         self._post_snap_window_until = (
             time.monotonic() + self._post_snap_busy_grace_s
         )
+        # Clear any in-progress self-pause: an explicit resume() means
+        # the daemon believes the endpoint is healthy again, so we
+        # should retry on the next loop iteration (the daemon's
+        # status poll has just succeeded by the time it reaches us).
+        if self._self_paused_until > 0.0:
+            self._self_paused_until = 0.0
+            self._idle_rung = 0
+            self.log.debug("liveview_self_pause_cleared")
         if not self._resume_event.is_set():
             self._resume_event.set()
             self.log.debug("liveview_resumed")
@@ -276,6 +316,27 @@ class LiveViewStream:
                 if self._stop_event.wait(0.05):
                     return
 
+            # ---- Honor self-pause (Phase 3.6) --------------------
+            # If we previously detected an idle pattern, sit on the
+            # back-off until the deadline (or resume() clears it).
+            # 50 ms polling keeps stop_event / resume() responsive.
+            while True:
+                if self._stop_event.is_set():
+                    return
+                if self._self_paused_until <= 0.0:
+                    break
+                remaining = self._self_paused_until - time.monotonic()
+                if remaining <= 0:
+                    # Back-off expired; clear and try a fetch.
+                    self._self_paused_until = 0.0
+                    self.log.info(
+                        "liveview_self_pause_expired",
+                        rung=self._idle_rung,
+                    )
+                    break
+                if self._stop_event.wait(min(remaining, 0.05)):
+                    return
+
             loop_start = time.monotonic()
             period_s = 1.0 / max(1, self._effective_fps)
 
@@ -289,6 +350,42 @@ class LiveViewStream:
                 msg = str(e)
                 is_busy = f"0x{PTP_RC_DEVICE_BUSY:04X}" in msg
                 consecutive_failures += 1
+                # Phase 3.6: idle-pattern self-pause. A short read or
+                # Errno 60 means the camera is going / has gone into
+                # power-save and the bulk endpoint is half-stalled.
+                # We don't try to recover ourselves — we just step
+                # back so we stop contributing to the wedge, and let
+                # the daemon's passive_wait + reconnect logic decide
+                # how to proceed. resume() called by the daemon
+                # clears this state when the camera is healthy again.
+                is_idle_pattern = any(p in msg for p in LV_IDLE_PATTERNS)
+                if is_idle_pattern:
+                    rung = min(
+                        self._idle_rung, len(LV_IDLE_BACKOFF_LADDER_S) - 1,
+                    )
+                    backoff_s = LV_IDLE_BACKOFF_LADDER_S[rung]
+                    self._self_paused_until = (
+                        time.monotonic() + backoff_s
+                    )
+                    self.log.warning(
+                        "liveview_self_paused",
+                        rung=self._idle_rung,
+                        backoff_s=backoff_s,
+                        error=msg,
+                    )
+                    self._idle_rung = min(
+                        self._idle_rung + 1,
+                        len(LV_IDLE_BACKOFF_LADDER_S) - 1,
+                    )
+                    # Don't tick into "giving up" on idle patterns —
+                    # self-pause handles back-off and we want the
+                    # stream to survive a long doze so it resumes
+                    # cleanly once the daemon recovers the camera.
+                    consecutive_failures = 0
+                    # Skip the post-except backoff/giving-up logic
+                    # below — go straight back to the loop top so
+                    # the self-pause gate engages.
+                    continue
                 if is_busy:
                     # Decide whether this busy counts toward demotion.
                     # Two grace windows exempt commit-cycle artifacts
@@ -361,6 +458,10 @@ class LiveViewStream:
             consecutive_failures = 0
             consecutive_busy = 0
             consecutive_success += 1
+            # A clean frame means the endpoint is healthy — reset the
+            # self-pause back-off ladder so the next idle dip starts
+            # fresh at rung 0 instead of escalating to a long sleep.
+            self._idle_rung = 0
             # Adaptive: after sustained success, claw back 1 fps at a
             # time toward the configured target. The threshold is
             # configurable via promote_after_consecutive_ok — default

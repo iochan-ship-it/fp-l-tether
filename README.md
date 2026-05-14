@@ -1,95 +1,61 @@
 # fp-l-tether
 
-> **A working Python tether implementation for the Sigma fp L on macOS — no Capture One required.**
-> Sigma fp L のテザー撮影を macOS で動かす Python 実装（Capture One 不要、月額不要）。
+> **An open-source Python tether implementation for the Sigma fp L on macOS, with Lightroom Classic auto-import.**
+> Sigma fp L のテザー撮影を macOS で動かすオープンソース Python 実装 — Lightroom Classic 連携、Capture One 不要、月額不要。
 
-[![Status: Phase 0-C clear](https://img.shields.io/badge/status-Phase%200--C%20clear-success)]()
-[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue)]()
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)]()
 [![macOS](https://img.shields.io/badge/macOS-12+-lightgrey)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
+[![Status: Beta](https://img.shields.io/badge/status-beta-orange)]()
 
 ---
 
-## What this is
+## What it does
 
-A native Python + libusb implementation of Sigma's vendor-specific PTP
-protocol for the **Sigma fp L**, targeting macOS. The end-goal is a small
-menubar app that drops each shot into a Lightroom Classic Auto Import
-folder, but the core breakthrough is the reverse-engineered capture
-sequence itself.
+`fp-l-tether` is a self-contained tethering daemon + floating control panel
+for the Sigma fp L on macOS. The headline features:
 
-**Verified working as of 2026-05-12**: 5 consecutive shots, all unique
-26 MB JPEG files, ~5 MB/s sustained transfer, no clone-return bug
-(libgphoto2 Issue #882).
+- **Live View** at up to 10 fps, with click-to-AF
+- **Floating control panel** that follows you across macOS Spaces and
+  Lightroom fullscreen
+- **Lightroom Classic Auto Import** integration — every shot lands in your
+  catalog automatically
+- **Auto USB recovery** — when the fp L's bulk endpoint wedges (a known
+  firmware quirk that requires unplug/replug with every other tether tool),
+  this daemon detects the wedge and force-re-enumerates the device via
+  IOKit in ~4 seconds. No physical power cycle needed.
+- **Persistent settings cache** — the fp L resets ISO/SS/Aperture/WB/Format
+  to defaults on every USB connect (also a firmware quirk that Capture One
+  has not solved). This daemon remembers your last-dialed values and
+  replays them on every (re)connect.
+- **JPG / DNG / DNG+JPG** capture with dual-file extraction
+- **Exposure controls** — ISO, SS, Aperture, WB, Format, Resolution
+  via floating panel dropdowns
+
+Phase 3.9 status: feature-complete and used daily by the author for studio
+product photography. Bug reports and pull requests very welcome.
 
 ---
 
 ## Why this project exists
 
-Tethered shooting with the Sigma fp L on macOS has been a known pain
-point since the camera shipped in 2021:
+Tethered shooting with the Sigma fp L on macOS has been a known pain point
+since the camera shipped in 2021:
 
-| Alternative | Why it doesn't work |
+| Alternative | Why it doesn't fully work |
 |---|---|
-| Capture One Pro | Paid subscription, fp L "settings reset" bug |
-| Lightroom Classic native tether | No Sigma support |
+| Capture One Pro | Paid subscription; "settings reset on connect" bug; no Lightroom flow |
+| Lightroom Classic native tether | No Sigma support at all |
 | libgphoto2 / gphoto2 CLI | `camera_init` double-free aborts immediately on fp L |
 | Darktable | Wraps libgphoto2; same crash |
-| Sigma Camera Control SDK (2020) | Built before fp L launched; sample app returns `0xA081 NOTINITIALIZED` on fp L |
-| sigma-ptpy | fp only, fp L untested, libusb permissions issues on macOS |
-| Smart Shooter / Cascable / Sofortbild | No Sigma support at all |
-| SD-card workflow | Arca-Swiss plate blocks the SD door |
-| Mass Storage mode | Camera locks while mounted, can't shoot |
+| sigma-ptpy | fp only, fp L untested, no Live View, no recovery |
+| Smart Shooter / Cascable / Sofortbild | No Sigma support |
+| SD-card workflow | Many L-bracket plates block the SD door |
+| Mass Storage mode | Camera locks; can't shoot while mounted |
 
-This project documents and implements the *actually-working* path.
-
----
-
-## The five reverse-engineered insights that made it work
-
-These are the load-bearing facts; everything else falls out from them.
-Documented in [docs/PHASE0_LOG.md](docs/PHASE0_LOG.md) and
-[fp_l_tether/camera/usb_bridge.py](fp_l_tether/camera/usb_bridge.py).
-
-1. **`GetCaptureStatus(p1=N)` returns the status of *slot N*, not a global
-   state.** Polling slot 0 forever (as libgphoto2 does) only works for
-   the first shot because that's where `image_db_head` starts. Subsequent
-   shots land in slots 1, 2, 3… — you must poll the slot pointed to by
-   `pre_status.image_db_head`.
-
-2. **`SetDataGroup3 (0x9018)` enables PC capture mode.** Sending the
-   22-byte payload
-   `03 00 80 02 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 85`
-   (FieldPresent1=0x03, DestinationToSave=0x80) during init is essential.
-   Extracted from libgphoto2's reverse-engineered fp trace at
-   `cameras/sigma-fp.txt`.
-
-3. **`Snap` mode = 2 (NON_AF_CAPTURE).** libgphoto2 hard-codes mode=1
-   which only fires the first shot. The Sigma SDK headers and the fp
-   trace agree on mode=2. Wire bytes: `02 02 01 05`.
-
-4. **`GetCaptureStatus` wire response is 8 bytes, not 7.**
-   Layout: `[0x06 length, imageid, db_head, db_tail, status_lo, status_hi, dest, chk]`.
-   libgphoto2's parser has an off-by-one between `status_hi` and `dest`.
-
-5. **`brew install gphoto2` aborts immediately on fp L.** The
-   `ptp_sigma_fp_9035` helper frees its data buffer internally, then
-   `camera_init` frees it again → `___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED`.
-   This is a libgphoto2 bug, not an fp L incompatibility.
-
----
-
-## Requirements
-
-- macOS 12 (Monterey) or later (tested on macOS 26.3.1 Apple Silicon)
-- Python 3.11+
-- [Homebrew](https://brew.sh) + `libusb`: `brew install libusb`
-- Sigma fp L in **Camera Control** USB mode (Menu → System → USB mode)
-- USB-C cable, directly to Mac (avoid hubs for tether reliability)
-- `sudo` for libusb kernel driver detach
-
-Optional:
-- Adobe Lightroom Classic (for the Auto Import folder workflow)
+This project documents and implements the actually-working path, with a
+particular focus on the operational issues (wedge recovery, settings
+preservation) that make other tools frustrating in daily studio use.
 
 ---
 
@@ -98,7 +64,7 @@ Optional:
 ### Install
 
 ```bash
-git clone https://github.com/<your-username>/fp-l-tether.git
+git clone https://github.com/iochan-ship-it/fp-l-tether.git
 cd fp-l-tether
 python3 -m venv venv
 source venv/bin/activate
@@ -111,74 +77,155 @@ pip install -e .
 2. CINE/STILL switch → **STILL**
 3. Power **ON**
 4. MENU → System → **USB mode → Camera Control**
-5. Power **OFF**
-6. Plug USB-C into Mac
-7. Power **ON**
+5. Power **OFF**, plug USB-C into Mac, power **ON**
 
-### Test the full capture cycle (Phase 0-C)
+### Run
 
 ```bash
-# Take 5 shots into ./captures/
-sudo venv/bin/python scripts/phase0_capture_v2.py --shots 5 --gap 2
-
-# Expected: SUCCESS — all 5 shot(s) captured & saved
-```
-
-If macOS's `ptpcamerad` is holding the camera, kill it before running:
-
-```bash
+# Kill macOS's built-in PTP daemon first (claims the camera exclusively).
 sudo killall ptpcamerad
+
+# Launch the daemon + floating panel.
+sudo venv/bin/fp-l-tether start
 ```
+
+`sudo` is required because libusb has to detach the kernel driver from
+the camera's PTP interface. See `docs/SETUP.md` for an explanation of
+the permission model.
+
+### Lightroom integration
+
+The daemon writes each shot atomically into a watch folder. Point
+Lightroom Classic's **File → Auto Import → Auto Import Settings…** at
+that folder and your shots will appear in your catalog on save. See
+`docs/LIGHTROOM.md` for full setup.
+
+---
+
+## What's working / not working
+
+| Feature | Status |
+|---|---|
+| Capture (single shot, PC-triggered) | ✅ Works |
+| Capture (camera-button-triggered) | ✅ Works |
+| Live View (10 fps) | ✅ Works |
+| Click-to-AF on Live View | ✅ Works |
+| ISO / SS / Av / WB / Format / Resolution control | ✅ Works |
+| Lightroom Auto Import | ✅ Works |
+| Auto USB recovery from wedge | ✅ Works (~4 s) |
+| Settings preservation across reconnects | ✅ Works |
+| Burst / continuous capture | ⚠️ Single shot only (mode=2). Continuous on roadmap. |
+| Video / movie tether | ❌ Not supported, no plans |
+| Linux / Windows | ❌ macOS only (IOKit-dependent recovery path) |
 
 ---
 
 ## Project structure
 
 ```
-fp_l_tether/                         # Python package
+fp_l_tether/                 # Python package
   camera/
-    ptp_codes.py                     # Sigma opcodes + dataclasses + wire parsers
-    usb_bridge.py                    # libusb PTP transport + sigma_capture_one()
-    ic_bridge.py                     # ImageCaptureCore enumeration (limited)
-  transfer/, lightroom/, ui/, …      # Phase 1 (in progress)
+    ptp_codes.py             # PTP opcodes + dataclasses + wire parsers
+    usb_bridge.py            # libusb PTP transport + capture/download
+    sigma_datagroup.py       # DataGroup IFD parser + exposure decode
+    usb_recovery.py          # IOKit USBDeviceReEnumerate driver
+    settings_preservation.py # Snapshot/restore user-dialed settings
+    ic_bridge.py             # ImageCaptureCore enumeration (limited)
+  transfer/
+    watcher.py               # TetherDaemon main loop
+    liveview.py              # Live View stream
+    heartbeat.py             # USB keep-alive
+    atomic.py                # Atomic write helper
+  lightroom/
+    destinations.py          # Watch folder / session folder router
+  ui/
+    cli.py                   # Typer CLI (start / shoot / status / inspect)
+    floating_panel.py        # PyObjC NSPanel with LV + AF overlay
+  storage/
+    settings_cache.py        # Persistent settings cache
+  telemetry/
+    logger.py                # structlog wrappers
+  config/
+    __init__.py              # Pydantic-validated TOML config
 
-scripts/
-  phase0_smoke_test.py               # USB enumeration sanity check
-  phase0_session_test.py             # PTP session open + ConfigApi probe
-  phase0_capture_v2.py               # Full capture + download cycle (WORKING)
-  phase0_diag_post_capture.py        # Diagnostic for camera state introspection
+scripts/                     # Diagnostic & verification scripts
+  phase3_usb_reenum_test.py  # Standalone USB recovery verifier
+  phase3_liveview_*.py       # Live View diagnostics
 
-tests/unit/                          # Pure-Python tests (no camera needed)
-docs/                                # SETUP, LIGHTROOM, PHASE0_LOG, TROUBLESHOOTING
-DESIGN_PLAN.md                       # Architecture & rationale
-CLAUDE.md                            # Context for AI-assisted continuation
+docs/
+  SETUP.md                   # macOS setup, libusb, ptpcamerad notes
+  LIGHTROOM.md               # Lightroom Classic Auto Import setup
+  TROUBLESHOOTING.md         # Common issues
+
+tests/unit/                  # pytest tests (no camera needed)
+config.example.toml          # Example config; copy to config.toml to override defaults
 ```
 
 ---
 
-## Status
+## Requirements
 
-| Phase | Status |
-|---|---|
-| **0-A** Camera enumeration | ✅ Clear |
-| **0-B** PTP session + ConfigApi | ✅ Clear |
-| **0-C** Snap → poll → download → clear | ✅ Clear (5/5 shots @ 5 MB/s) |
-| **1.0** CLI + Lightroom Auto Import | 🚧 In progress |
-| **1.1** Menubar UI (rumps) | ⏳ Planned |
-| **1.2** Hot-plug / reconnect handling | ⏳ Planned |
-| **2.0** Live view (0x902b) + DNG support | ⏳ Future |
+- macOS 12 (Monterey) or later (tested on macOS 26 Apple Silicon)
+- Python 3.10+
+- [Homebrew](https://brew.sh) + `libusb`: `brew install libusb`
+  (or rely on the bundled `libusb-package` wheel)
+- Sigma fp L in **Camera Control** USB mode
+- USB-C cable, directly to Mac (avoid hubs)
+- `sudo` for libusb kernel driver detach
+- Adobe Lightroom Classic (optional, for the Auto Import workflow)
+
+---
+
+## How it works (high level)
+
+The daemon runs three coordinated threads sharing a single libusb bulk
+endpoint:
+
+1. **Main loop** — polls `GetCaptureStatus(slot=N)` where `N` is the
+   camera's `image_db_head`, drains the snap/AF/exposure request queues,
+   and downloads completed shots via `GetBigPartialPictFile`.
+2. **Live View thread** — at 10 fps grabs JPEG view frames via
+   `GetCamViewFrame` (0x902b), pauses across snaps/AF, has its own
+   exponential backoff for `0x2019 DeviceBusy` storms.
+3. **Heartbeat thread** — every 30 s sends a benign keep-alive opcode
+   (default: `sigma_get_camera_info`).
+
+When any of those threads sees the fp L's bulk endpoint wedge
+(`Errno 60` / 0-byte read — a known firmware doze quirk), the main loop
+tears down the session and calls
+`IOUSBDeviceInterface::USBDeviceReEnumerate()` via IOKit, which forces
+the macOS USB host controller to drop and re-enumerate the device.
+Equivalent to physically unplugging and replugging the cable, but
+software-driven. A new bridge is opened, the persistent settings cache
+is replayed to the camera, and Live View resumes within ~4 s.
+
+Settings preservation works the same way: on every (re)connect, the
+daemon reads the user's last-known good values from
+`~/.fp-l-tether/user_settings.json` and writes them to DG1 + DG2 via
+the per-field `SetCamDataGroup1/2` opcodes. Updates to the cache happen
+whenever the user changes a setting from the floating panel.
+
+See `fp_l_tether/transfer/watcher.py` for the full state machine.
 
 ---
 
 ## Contributing
 
-This is a personal project, but PRs and issues are welcome — especially
-from other fp / fp L owners. If you've successfully tethered the fp L on
-Linux or Windows, your protocol notes would be invaluable.
+This is a personal project but PRs and issues are welcome — especially
+from other fp / fp L owners. Some things that would be particularly
+helpful:
 
-If you have a working USB packet capture of Capture One Pro talking to
-an fp L, please open an issue. That would let us confirm or refute the
-"slot N polling" finding and potentially reveal Live View and AF control.
+- Working USB packet captures of **Capture One Pro** talking to an fp L
+  (this would let us confirm or refute the Live View / AF protocol
+  details, and potentially reveal whether Capture One has a real
+  keep-alive that the public PTP opcodes don't expose).
+- fp / fp L L-mount lens correction tables (currently no lens correction
+  is applied in either JPG or DNG; the camera handles JPG correction
+  internally).
+- Linux port. The recovery path uses macOS IOKit, but the PTP layer is
+  portable. A `libusb_reset_device()` substitute on Linux should
+  produce similar wedge recovery.
+- Burst / continuous shooting (mode=6 START_CAPTURE).
 
 ---
 
@@ -186,25 +233,27 @@ an fp L, please open an issue. That would let us confirm or refute the
 
 This work would not have been possible without:
 
-- **libgphoto2** — both as a reference implementation
-  (`camlibs/ptp2/ptp.c` `ptp_sigma_fp_*`) and as a counter-example
-  showing what *doesn't* work for the fp L specifically. Special thanks
-  to the contributor who reverse-engineered and committed
-  `cameras/sigma-fp.txt` — that single file unlocked the entire
-  protocol.
-- **The `sigma-ptpy` project** (makanikai) for the early fp groundwork.
-- **The Sigma Camera Control SDK** (2020-07) for documenting opcode
-  numbers and struct shapes, even where its sample app no longer runs.
+- **libgphoto2** (LGPL-2.1+) — as a reference for the PTP wire protocol
+  details that are common across cameras. The `cameras/sigma-fp.txt`
+  capture trace contributed by Sigma fp owners to libgphoto2 was an
+  invaluable reference for understanding which Sigma vendor opcodes
+  shape DataGroup writes during init. See `NOTICE` for full attribution.
+- **sigma-ptpy** by makanikai — an independent Python implementation of
+  the Sigma PTP protocol that we cross-referenced our observations
+  against.
+- All the fp / fp L owners who posted USB captures and protocol notes
+  on GitHub issues, Reddit r/SigmaFP, and DPReview over the years.
 
 ---
 
 ## License
 
-[MIT](LICENSE).
+This project is released under the [MIT License](LICENSE).
+See `NOTICE` for third-party attribution.
 
-"SIGMA", "fp", and "fp L" are trademarks of SIGMA Corporation. This
-project is not affiliated with or endorsed by SIGMA Corporation. The PTP
-wire format details documented here were obtained through clean-room
-reverse engineering of public USB traffic, in line with the
-interoperability provisions of 17 U.S.C. § 1201(f) and EU Directive
-2009/24/EC Article 6.
+"SIGMA", "Sigma fp", and "Sigma fp L" are trademarks of SIGMA Corporation.
+This project is **not affiliated with, endorsed by, or sponsored by SIGMA
+Corporation**. The PTP wire-format details documented here were obtained
+through clean-room observation of public USB traffic against a Sigma
+fp L, in line with the interoperability provisions of 17 U.S.C. § 1201(f)
+and EU Directive 2009/24/EC Article 6.

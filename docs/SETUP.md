@@ -20,7 +20,7 @@ python3.11 --version   # 3.11.x が出ればOK
 ## 2. 仮想環境を作って依存をインストール
 
 ```bash
-cd "/Users/PI/Documents/Claude/Projects/FP L Tether APP"
+cd /path/to/fp-l-tether
 
 # 仮想環境を作成
 python3.11 -m venv venv

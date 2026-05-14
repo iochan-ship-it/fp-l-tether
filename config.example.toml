@@ -26,7 +26,15 @@ clear_image_db_after_download = true
 # (sigma_get_camera_info) を打つことで予防。
 # true 推奨。本体メニュー System → Auto Power Off → OFF も併せて。
 keep_alive_enabled = true
-keep_alive_interval_s = 60.0
+keep_alive_interval_s = 30.0
+
+# Aggressive keep-alive (Plan T): SnapCommand(AF_DRIVE_ONLY) を
+# 50s 毎に発火して doze を防ぐ。fp L で shot 系 opcode のみ
+# 内部 doze timer を reset することが分かったための実験モード。
+# 副作用: 静物撮影中もレンズが定期的に AF を駆動する。
+# true で keep_alive_interval_s より aggressive_keepalive_interval_s が優先。
+aggressive_keepalive = false
+aggressive_keepalive_interval_s = 50.0
 
 # Burst-aware post-capture quiet window. After a burst settles
 # (snap queue drains) the daemon enforces a no-PTP-traffic window of:

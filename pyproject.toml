@@ -4,20 +4,31 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fp-l-tether"
-version = "0.0.1"
-description = "Sigma fp L tethered shooting bridge for macOS + Lightroom Classic"
+version = "0.1.0"
+description = "Unofficial Sigma fp L tethered-shooting bridge for macOS + Lightroom Classic"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{ name = "IO", email = "i.okazaki@piartcenter.com" }]
-license = { text = "Proprietary" }
+authors = [{ name = "iochan-kaihatsu" }]
+license = { text = "MIT" }
+keywords = ["sigma", "fp-l", "tether", "lightroom", "ptp", "camera", "macos"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: Capture",
+]
 
 dependencies = [
-    # macOS native camera bridge (kept for device enumeration only — see PHASE0_LOG)
+    # macOS native camera bridge (kept for device enumeration only)
     "pyobjc-core>=10.0",
     "pyobjc-framework-Cocoa>=10.0",
     "pyobjc-framework-ImageCaptureCore>=10.0",
 
-    # USB-level PTP bridge (primary path — see DESIGN_PLAN.md pivot 2026-05-11)
+    # USB-level PTP bridge (primary path)
     "pyusb>=1.2",
     "libusb-package>=1.0.26",  # bundles libusb binaries, no Homebrew needed
 

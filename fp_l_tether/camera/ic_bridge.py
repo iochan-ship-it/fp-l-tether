@@ -439,8 +439,9 @@ class Camera:
         # ICCameraDevice.requestSendPTPCommand expects the raw command container
         # **without** the length / type / transaction-ID prefix on some macOS
         # versions; on others it expects the full container. We follow the
-        # SigmaSDK pattern which sends the OpCode + parameters as a single
-        # NSData and lets ImageCaptureCore prepend the rest.
+        # community pattern (also used by sigma-ptpy) of sending the OpCode +
+        # parameters as a single NSData and letting ImageCaptureCore prepend
+        # the rest.
         for p in parameters:
             cmd_buf += int(p & 0xFFFFFFFF).to_bytes(4, "little")
         cmd_nsdata = NSData.dataWithBytes_length_(bytes(cmd_buf), len(cmd_buf))

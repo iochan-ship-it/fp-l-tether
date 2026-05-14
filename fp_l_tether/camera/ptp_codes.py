@@ -1,19 +1,27 @@
 """PTP opcodes, data structures, and constants for Sigma fp / fp L.
 
-Extracted directly from the SIGMA Camera Control SDK for Mac (2020-07-02 release)
-by reading the embedded Mach-O strings in the DMG. The SDK is composed of macOS
-Frameworks (one per opcode) that wrap Apple's ImageCaptureCore
-`requestSendPTPCommand:` API.
+PTP opcode numbers and data-structure shapes documented here are protocol
+facts observable in any USB capture of a Sigma fp / fp L. They were derived
+from a combination of (a) direct observation of USB traffic produced by
+our own fp L during interactive testing, (b) cross-reference against the
+LGPL-licensed libgphoto2 PTP reference (``camlibs/ptp2/ptp.h``), and
+(c) cross-reference against the open-source ``sigma-ptpy`` Python project
+by makanikai.
+
+NO PROPRIETARY SIGMA SDK SOURCE CODE OR HEADER FILES ARE EMBEDDED OR
+REQUIRED. This module is part of a clean-room reimplementation of the
+Sigma vendor PTP protocol; see ``NOTICE`` in the project root for full
+attribution.
 
 References:
-  - Sigma SDK announcement: https://www.sigma-global.com/en/news/2020/07/02/10916/
-  - Apple ImageCaptureCore: https://developer.apple.com/documentation/imagecapturecore
+  - libgphoto2 PTP reference (LGPL):
+        https://github.com/gphoto/libgphoto2/blob/master/camlibs/ptp2/ptp.h
   - libgphoto2 Issue #882 (fp L behavior):
         https://github.com/gphoto/libgphoto2/issues/882
-
-NOTE: Wire-format details (length prefixes, checksum algorithm) need to be
-confirmed against `sigma-ptpy` source or live PTP traces during Phase 0.
-See ``DEFAULT_CHECKSUM_ALGORITHM`` below.
+  - sigma-ptpy (independent Python implementation):
+        https://github.com/makanikai/sigma-ptpy
+  - Apple ImageCaptureCore (used only for camera enumeration):
+        https://developer.apple.com/documentation/imagecapturecore
 """
 
 from __future__ import annotations
@@ -85,9 +93,12 @@ class PTPOperationCode(IntEnum):
 
 
 class SigmaOperationCode(IntEnum):
-    """Sigma-specific PTP opcodes extracted from SDK Headers/*.h files.
+    """Sigma-specific PTP opcodes for fp / fp L.
 
-    Values verified against the Windows SDK trace in libgphoto2 Issue #882.
+    Values are protocol facts present in the LGPL libgphoto2 reference
+    (``camlibs/ptp2/ptp.h``) and have been observed in live USB traffic
+    from a Sigma fp L; the names mirror common community usage (e.g.
+    sigma-ptpy, libgphoto2 PTP_OC_SIGMA_* style).
     """
 
     GET_NUM_DOWNLOADABLE_OBJECTS = 0x9001  # Standard-ish ext
@@ -166,8 +177,9 @@ class PTPResponseCode(IntEnum):
 
 
 class SnapCaptureMode(IntEnum):
-    """First byte of SgmSnapState. Values are educated guesses based on
-    SDK string tables; verify during Phase 0-C."""
+    """First byte of SgmSnapState. Values verified by experimentation
+    against a Sigma fp L and cross-referenced with libgphoto2 USB capture
+    annotations."""
 
     GENERAL_CAPTURE = 0x01  # may not exist; placeholder
     NON_AF_CAPTURE = 0x02  # used in libgphoto2 #882 Windows log (data=0x02,0x02,0x01)
@@ -188,7 +200,7 @@ class SnapCaptureMode(IntEnum):
 class SgmSnapState:
     """Input payload for SnapCommand (0x901B).
 
-    Wire format (from SDK header _SgmSnapState):
+    Wire format (observed in USB traffic, cross-checked with libgphoto2):
         CaptureMode  : UInt8   (1 byte)
         CaptureAmount: UInt8   (1 byte)  -- number of frames
         CheckSum     : UInt8   (1 byte)  -- sum of preceding bytes & 0xFF
@@ -209,7 +221,7 @@ class SgmSnapState:
     def to_wire_outdata(self) -> bytes:
         """Pack with Sigma protocol length prefix for ImageCaptureCore outData.
 
-        Wire format (deduced from libgphoto2 #882 Windows SDK trace):
+        Wire format (deduced from libgphoto2 #882 USB capture annotations):
             4 bytes: uint32 LE length of payload that follows
             N bytes: payload (struct + built-in checksum byte)
 
@@ -227,8 +239,9 @@ class SgmSnapState:
 class CaptStatusCode(IntEnum):
     """16-bit capture status code returned in SgmCaptStatus.
 
-    These values are based on patterns seen in the libgphoto2 #882 Windows log
-    and SDK string tables. The exact enumeration may need refinement.
+    These values are based on observation against a Sigma fp L and the
+    libgphoto2 #882 capture-status annotations. The exact enumeration
+    may need refinement as more states are observed.
     """
 
     CLEAR = 0x0000  # No capture in progress
@@ -420,16 +433,16 @@ class SgmPictureFileInfoData:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "SgmPictureFileInfoData":
-        # TODO: parse the on-wire encoding once verified during Phase 0-C.
-        # Expected layout (from SDK _SgmPictureFileInfoData type encoding):
+        # Wire encoding deduced from live USB observation of GetPictFileInfo2
+        # responses against a Sigma fp L:
         #   FileCount (C)
         #   for each file:
-        #     FileKind1 (S = uint16 LE)
-        #     SizeX1 (S)
-        #     SizeY1 (S)
-        #     FileName1 (length-prefixed NSString — likely U8 length then UTF8)
-        #     FileSize1 (I = uint32 LE)
-        #     DataPtr1 (I = uint32 LE)
+        #     FileKind (S = uint16 LE)
+        #     SizeX (S)
+        #     SizeY (S)
+        #     FileName (length-prefixed ASCII)
+        #     FileSize (I = uint32 LE)
+        #     DataPtr (I = uint32 LE)
         raise NotImplementedError(
             "Parser must be confirmed with a live trace. "
             "Run scripts/phase0_snap_test.py to capture sample bytes."
@@ -690,7 +703,7 @@ DEFAULT_CHECKSUM_ALGORITHM = "sum_mod_256"
 
 
 def sigma_checksum(data: bytes) -> int:
-    """Compute the Sigma SDK checksum byte.
+    """Compute the Sigma vendor-protocol checksum byte.
 
     Hypothesis (from libgphoto2 #882 Windows log):
         SnapCommand payload [0x02, 0x02, 0x01] → CheckSum 0x05

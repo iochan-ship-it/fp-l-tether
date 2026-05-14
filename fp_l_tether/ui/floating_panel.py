@@ -48,7 +48,6 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
-    NSBezierPath,
     NSButton,
     NSColor,
     NSEvent,
@@ -60,21 +59,16 @@ from AppKit import (
     NSImageView,
     NSMakeRect,
     NSMakeSize,
-    NSMinYEdge,
     NSPanel,
     NSPopUpButton,
-    NSPopover,
-    NSPopoverBehaviorTransient,
     NSScreen,
     NSStatusWindowLevel,
-    NSSwitchButton,
     NSTextAlignmentCenter,
     NSTextField,
     NSTextView,
     NSTitledWindowMask,
     NSUtilityWindowMask,
     NSView,
-    NSViewController,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorStationary,
@@ -84,7 +78,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSData, NSMakePoint, NSObject, NSTimer
+from Foundation import NSData, NSObject, NSTimer
 
 from fp_l_tether.camera.sigma_datagroup import (
     apex_to_aperture,
@@ -125,11 +119,10 @@ LV_PAD_TOP = 12
 LV_PAD_BOTTOM = 10
 PANEL_HEIGHT = CONTROLS_HEIGHT + LV_PAD_BOTTOM + LV_HEIGHT + LV_PAD_TOP
 
-# AF popover dimensions (px) and the camera's AF coordinate bounds. The
-# camera bounds are dynamic — populated from CamCanSetInfo5 on connect —
-# but we initialise to the fp L V90 defaults so the UI works pre-connect.
-AF_POPOVER_W = 200
-AF_POPOVER_H = 125
+# AF marker dimensions (px) — the on-LV reticle shown at the current
+# AF point. The camera's AF coord bounds are dynamic (populated from
+# CamCanSetInfo5 on connect, fp L V90 defaults via FloatingTetherPanel.af_bounds).
+AF_MARKER_SIZE = 28
 
 
 class FloatingTetherPanel(NSObject):
@@ -268,6 +261,38 @@ class FloatingTetherPanel(NSObject):
         self._lv_overlay_label.setTextColor_(NSColor.whiteColor())
         self._lv_overlay.addSubview_(self._lv_overlay_label)
 
+        # AF marker — a small yellow-amber reticle drawn on top of the
+        # LV showing the camera's current AF point. Added AFTER the
+        # _lv_overlay so it sits higher in z-order; we hide it
+        # explicitly whenever the overlay shows (the pause-state
+        # semantic is "stale info, don't trust this view"). Initial
+        # frame is placed at the LV centre as a sensible default
+        # until the first focus-point event arrives.
+        self._af_marker_view = NSView.alloc().initWithFrame_(
+            NSMakeRect(
+                lv_x + (LV_WIDTH - AF_MARKER_SIZE) // 2,
+                lv_y + (LV_HEIGHT - AF_MARKER_SIZE) // 2,
+                AF_MARKER_SIZE,
+                AF_MARKER_SIZE,
+            )
+        )
+        self._af_marker_view.setWantsLayer_(True)
+        marker_layer = self._af_marker_view.layer()
+        if marker_layer is not None:
+            marker_layer.setBorderColor_(
+                NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                    1.0, 0.78, 0.0, 1.0
+                ).CGColor()
+            )
+            marker_layer.setBorderWidth_(2.0)
+            marker_layer.setBackgroundColor_(NSColor.clearColor().CGColor())
+            marker_layer.setCornerRadius_(2.0)
+        # Hidden until the first focus-point event lands — avoids a
+        # stray reticle at the LV centre before we know where the
+        # camera actually has its AF point.
+        self._af_marker_view.setHidden_(True)
+        content.addSubview_(self._af_marker_view)
+
         # Staleness watchdog state — overlay shows when no LV frame
         # arrived for ``_lv_stale_threshold_s``. At 10 fps target the
         # frame interval is ~100 ms, so 500 ms is roughly "5 missed
@@ -396,15 +421,11 @@ class FloatingTetherPanel(NSObject):
         # Track latest exposure bytes so we can re-select the matching
         # dropdown item without firing the action accidentally.
         self._exposure_raw: dict[str, int] = {}
-        # Current AF point (for popover dot). None ⇒ unknown.
+        # Current AF point (for the on-LV marker). None ⇒ unknown.
         self._focus_xy: tuple[int, int] | None = None
         # Whether the user is currently changing a dropdown — guards
         # against re-syncing-back during the action callback.
         self._suppress_action = False
-        # AF popover is built lazily on first click; track here so
-        # afPointClicked_/updateFocusPoint_ can probe its state safely.
-        self._af_popover = None
-        self._af_popover_ctrl = None
 
         # Item row: "Item:" label + editable text field.
         # Typing here changes ``{item}`` in the filename template and resets
@@ -439,25 +460,19 @@ class FloatingTetherPanel(NSObject):
         self._shoot_btn.setAction_("shootClicked:")
         content.addSubview_(self._shoot_btn)
 
-        # AF button (drive AF only, no capture — SnapCommand mode 3)
+        # AF button (drive AF only, no capture — SnapCommand mode 3).
+        # Phase 3.9 (2026-05-13): widened to fill the slot vacated by
+        # the removed "AF Point ⊞" popover button — AF point is now
+        # set by clicking on the LV, with the current point shown as
+        # a yellow reticle (see _af_marker_view).
         self._af_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(98, 58, 40, 28)
+            NSMakeRect(98, 58, 132, 28)
         )
         self._af_btn.setTitle_("AF")
         self._af_btn.setBezelStyle_(NSBezelStyleRounded)
         self._af_btn.setTarget_(self)
         self._af_btn.setAction_("afClicked:")
         content.addSubview_(self._af_btn)
-
-        # AF Point button — opens the AF-point picker popover.
-        self._af_point_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(144, 58, 86, 28)
-        )
-        self._af_point_btn.setTitle_("AF Point ⊞")
-        self._af_point_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._af_point_btn.setTarget_(self)
-        self._af_point_btn.setAction_("afPointClicked:")
-        content.addSubview_(self._af_point_btn)
 
         # Bottom row: New Session + Stop
         self._new_session_btn = NSButton.alloc().initWithFrame_(
@@ -599,12 +614,19 @@ class FloatingTetherPanel(NSObject):
         self._status_label.setTextColor_(color)
 
         # ----- Fix 4: dim controls during commit window -----
-        # shooting / downloading = camera is mid-cycle, button presses
-        # just queue. ready / error / stopped / disconnected = safe
-        # to interact again. Other states (connecting / initializing /
-        # focusing / recovering) leave the current dim state alone —
-        # focusing is sub-second so we don't flash on every AF.
-        if state in ("shooting", "downloading"):
+        # shooting / downloading / recovering = camera is mid-cycle
+        # or quiet, button presses just queue. ready / error /
+        # stopped / disconnected = safe to interact again. Other
+        # states (connecting / initializing / focusing) leave the
+        # current dim state alone — focusing is sub-second so we
+        # don't flash on every AF.
+        #
+        # Phase 3.6 (2026-05-13): "recovering" added to the busy set
+        # so the LV overlay forces up and dropdowns gray out while
+        # _passive_idle_wait is running. Without this the user sees
+        # a stale LV frame and can keep mashing buttons into a
+        # half-stalled endpoint.
+        if state in ("shooting", "downloading", "recovering"):
             self._set_controls_busy(True)
         elif state in ("ready", "error", "stopped", "disconnected"):
             self._set_controls_busy(False)
@@ -612,11 +634,12 @@ class FloatingTetherPanel(NSObject):
     def _set_controls_busy(self, busy: bool) -> None:
         """Toggle interactive controls based on capture-busy state.
 
-        Disables Shoot / AF / AF Point + all six exposure dropdowns
-        when ``busy=True`` (state in shooting/downloading) and
-        re-enables them on ``busy=False``. Also force-shows the LV
-        overlay during busy so the user sees "Saving…" instantly
-        instead of waiting ~500 ms for the staleness watchdog.
+        Disables Shoot / AF + all six exposure dropdowns when
+        ``busy=True`` (state in shooting/downloading) and re-enables
+        them on ``busy=False``. Also force-shows the LV overlay
+        during busy so the user sees "Saving…" instantly instead of
+        waiting ~500 ms for the staleness watchdog, and hides the
+        AF reticle (its position info is stale until LV resumes).
 
         When un-busying, we DON'T force-hide the overlay — the
         staleness watchdog still owns the post-snap visual transition
@@ -627,7 +650,7 @@ class FloatingTetherPanel(NSObject):
             return
         self._controls_busy = busy
         enabled = not busy
-        for btn in (self._shoot_btn, self._af_btn, self._af_point_btn):
+        for btn in (self._shoot_btn, self._af_btn):
             btn.setEnabled_(enabled)
         for dd in (
             self._iso_dropdown,
@@ -641,8 +664,10 @@ class FloatingTetherPanel(NSObject):
         if busy:
             # Force the overlay up immediately so the user gets
             # feedback without waiting for the 500 ms staleness
-            # threshold.
+            # threshold. Reticle hides with the overlay — re-shown
+            # on the next focus-point event or when LV resumes.
             self._lv_overlay.setHidden_(False)
+            self._af_marker_view.setHidden_(True)
 
     @objc.signature(b"v@:@")
     def updateShot_(self, tup) -> None:
@@ -758,11 +783,56 @@ class FloatingTetherPanel(NSObject):
         x, y = tup
         if x is None or y is None:
             self._focus_xy = None
-        else:
-            self._focus_xy = (int(x), int(y))
-        # If the popover is open, repaint it.
-        if getattr(self, "_af_popover", None) is not None and self._af_popover.isShown():
-            self._af_popover_ctrl.refresh()
+            self._af_marker_view.setHidden_(True)
+            return
+        self._focus_xy = (int(x), int(y))
+        self._reposition_af_marker()
+
+    def _reposition_af_marker(self) -> None:
+        """Move the AF reticle to the current ``_focus_xy`` on the LV.
+
+        Hides the marker if the LV overlay is up (camera mid-snap),
+        otherwise sets the frame to centre on the mapped view coord
+        and shows it. Called from ``updateFocusPoint_`` and from the
+        LV resume path.
+        """
+        if self._focus_xy is None:
+            self._af_marker_view.setHidden_(True)
+            return
+        if self._controls_busy:
+            # Stale-info gate — reticle reappears once LV resumes.
+            self._af_marker_view.setHidden_(True)
+            return
+        cam_x, cam_y = self._focus_xy
+        vx, vy = self.cam_to_view(cam_x, cam_y)
+        frame = NSMakeRect(
+            vx - AF_MARKER_SIZE / 2.0,
+            vy - AF_MARKER_SIZE / 2.0,
+            AF_MARKER_SIZE,
+            AF_MARKER_SIZE,
+        )
+        self._af_marker_view.setFrame_(frame)
+        self._af_marker_view.setHidden_(False)
+
+    def cam_to_view(self, cam_x: int, cam_y: int) -> tuple[float, float]:
+        """Map a camera AF coord to LV-superview coordinates.
+
+        Returns (x, y) in the panel's content-view coordinate space
+        (so the marker view's frame can be set directly to a rect
+        centred there). AppKit Y goes up from bottom-left; camera Y
+        goes down from top-left → we flip Y.
+        """
+        x_min, x_max, y_min, y_max = self.af_bounds()
+        nx = (cam_x - x_min) / max(1, (x_max - x_min))
+        ny = (cam_y - y_min) / max(1, (y_max - y_min))
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
+        # LV frame origin in superview coords:
+        lv_x = (PANEL_WIDTH - LV_WIDTH) // 2
+        lv_y = CONTROLS_HEIGHT + LV_PAD_BOTTOM
+        vx = lv_x + nx * LV_WIDTH
+        vy = lv_y + (1.0 - ny) * LV_HEIGHT  # flip Y
+        return vx, vy
 
     @objc.signature(b"v@:@")
     def updateLiveFrame_(self, tup) -> None:
@@ -791,6 +861,9 @@ class FloatingTetherPanel(NSObject):
         # before the pause shouldn't flicker the "Saving…" off.
         if not self._lv_overlay.isHidden() and not self._controls_busy:
             self._lv_overlay.setHidden_(True)
+            # Overlay just hid → restore the AF reticle if we have
+            # a known focus point.
+            self._reposition_af_marker()
 
         # Wrap the Python bytes in an NSData. PyObjC can usually pass
         # bytes through transparently, but going via NSData avoids a
@@ -925,37 +998,10 @@ class FloatingTetherPanel(NSObject):
                 2, {"Resolution": int(repr_obj)}
             )
 
-    # --- AF point picker popover ------------------------------------
-
-    @objc.signature(b"v@:@")
-    def afPointClicked_(self, sender) -> None:
-        """Show / hide the AF point picker popover anchored to the button."""
-        if getattr(self, "_af_popover", None) is None:
-            self._build_af_popover()
-        if self._af_popover.isShown():
-            self._af_popover.close()
-            return
-        # Push current state into the controller before showing.
-        self._af_popover_ctrl.set_owner(self)
-        self._af_popover_ctrl.refresh()
-        btn = self._af_point_btn
-        self._af_popover.showRelativeToRect_ofView_preferredEdge_(
-            btn.bounds(), btn, NSMinYEdge
-        )
-
-    def _build_af_popover(self) -> None:
-        """Lazily create the popover + controller (one per session)."""
-        ctrl = AFPointPopoverController.alloc().init()
-        ctrl.set_owner(self)
-        popover = NSPopover.alloc().init()
-        popover.setBehavior_(NSPopoverBehaviorTransient)
-        popover.setContentSize_(NSMakeSize(AF_POPOVER_W + 24, AF_POPOVER_H + 100))
-        popover.setContentViewController_(ctrl)
-        self._af_popover = popover
-        self._af_popover_ctrl = ctrl
+    # --- AF point (LV click → camera) -------------------------------
 
     def commit_focus_point(self, cam_x: int, cam_y: int) -> None:
-        """Called by the popover view to push a new AF point to the camera."""
+        """Push a new AF point to the camera (called from LV mouse handler)."""
         # Clamp to the camera-reported bounds so we never send out-of-range.
         info = self._can_set_info
         if info is not None:
@@ -963,8 +1009,9 @@ class FloatingTetherPanel(NSObject):
             cam_y = max(info.af_y_min, min(info.af_y_max, cam_y))
         self._focus_xy = (cam_x, cam_y)
         self._daemon.request_set_focus_point(cam_x, cam_y)
-        if self._af_popover is not None and self._af_popover.isShown():
-            self._af_popover_ctrl.refresh()
+        # Move the reticle immediately to give feedback before the
+        # focus-point event round-trips back from the camera.
+        self._reposition_af_marker()
 
     def af_bounds(self) -> tuple[int, int, int, int]:
         """Return ``(x_min, x_max, y_min, y_max)`` for the AF coordinate system."""
@@ -1062,6 +1109,7 @@ class FloatingTetherPanel(NSObject):
             # fresh (e.g. tail-end stream queue draining).
             if not self._controls_busy:
                 self._lv_overlay.setHidden_(True)
+                self._reposition_af_marker()
 
     # ----- hotkeys (global within app) --------------------------------
 
@@ -1075,12 +1123,38 @@ class FloatingTetherPanel(NSObject):
         """
 
         def _handle(event) -> object | None:  # noqa: ANN001
-            # If the user is typing in a text field (item input), let the
-            # event through — don't hijack space / "a" as triggers.
             responder = self._panel.firstResponder()
-            if responder is not None and responder.isKindOfClass_(NSTextView):
-                return event
+            in_text_field = (
+                responder is not None and responder.isKindOfClass_(NSTextView)
+            )
+
             key = event.charactersIgnoringModifiers()
+            key_code = event.keyCode()
+
+            # Phase 3.9 Fix 2: Escape (keyCode 53) always drops focus when
+            # the user is editing a field — gives them an "oops" out
+            # without committing.
+            if key_code == 53 and in_text_field:
+                self._panel.makeFirstResponder_(None)
+                return None  # consume
+
+            if in_text_field:
+                # Space inside the Item field: commit + drop focus + shoot.
+                # One-keystroke fast path so the user isn't trapped after
+                # editing the item name.
+                if key == " ":
+                    field = self._item_field
+                    name = str(field.stringValue())
+                    self._daemon.set_current_item(name)
+                    field.setStringValue_(self._daemon.current_item)
+                    self._panel.makeFirstResponder_(None)
+                    self._daemon.request_snap()
+                    return None  # consume
+                # All other keys (letters, digits, Return, Tab, arrows)
+                # pass through to the field normally.
+                return event
+
+            # Outside text field: original hotkey behavior.
             if key == " ":
                 self._daemon.request_snap()
                 return None  # consume
@@ -1151,9 +1225,9 @@ def _make_label(field: NSTextField, text: str, *, bold: bool = False, size: floa
 #
 # Tiny NSImageView subclass whose only job is to turn mouseDown_ events
 # into camera AF coords and forward them to the FloatingTetherPanel via
-# its existing commit_focus_point() entry point.
+# its commit_focus_point() entry point.
 #
-# Coordinate mapping is the same as AFPointView:
+# Coordinate mapping:
 #  - The whole LV view rect maps to the camera's AF coord range
 #    (af_bounds() = X∈[x_min..x_max], Y∈[y_min..y_max], default 96..928
 #    / 85..597 on fp L V90).
@@ -1163,17 +1237,18 @@ def _make_label(field: NSTextField, text: str, *, bold: bool = False, size: floa
 #    frames will pillarbox/letterbox slightly. We intentionally don't
 #    correct for that here — the camera's AF coord system already
 #    covers the cropped active area (the fp L's AF range stays inside
-#    the full sensor frame regardless of LV aspect), and matching the
-#    picker popover's "click anywhere = pick that fraction of AF
-#    range" feel keeps the two paths consistent.
+#    the full sensor frame regardless of LV aspect), and the reverse
+#    mapping in panel.cam_to_view() uses the same scale factors so
+#    click-in and reticle-out are symmetric.
 
 
 class LiveViewImageView(NSImageView):
     """NSImageView subclass that maps clicks → camera AF coordinates.
 
     Holds a back-ref to the FloatingTetherPanel (set via setOwner_)
-    so it can read the current AF bounds and push new points without
-    needing the rest of the AF popover plumbing.
+    so it can read the current AF bounds and push new points via
+    ``commit_focus_point``. The on-LV reticle is positioned by the
+    panel itself from ``updateFocusPoint_``.
     """
 
     def initWithFrame_(self, frame):  # type: ignore[no-untyped-def]
@@ -1204,246 +1279,3 @@ class LiveViewImageView(NSImageView):
         self._owner.commit_focus_point(cam_x, cam_y)
 
 
-# ---------------------------------------------------------------------------
-# AF Point picker — popover view + controller
-# ---------------------------------------------------------------------------
-#
-# The picker draws a 200x125 rectangle whose interior maps to the camera's
-# AF coordinate range (from CamCanSetInfo5 tag 0x0265, default
-# X∈[96..928], Y∈[85..597]). Click anywhere in the rectangle to drive the
-# camera AF point there. The current point is shown as a filled blue dot.
-#
-# Coordinate notes:
-#  - AppKit Y goes *up* from bottom-left, but the camera's AF Y axis
-#    goes *down* from top-left, so we flip Y when mapping in either
-#    direction.
-#  - 3x3 grid mode snaps clicks to rule-of-thirds, splitting the cam
-#    range into thirds and clicking the centre of each cell.
-
-
-class AFPointView(NSView):
-    """Custom NSView for the AF picker rectangle + dot + grid lines.
-
-    Holds a weak ref back to the FloatingTetherPanel (via the controller)
-    so it can read current focus + camera bounds and push new points.
-    """
-
-    def initWithFrame_(self, frame):  # type: ignore[no-untyped-def]
-        self = objc.super(AFPointView, self).initWithFrame_(frame)
-        if self is None:
-            return None
-        self._controller = None
-        return self
-
-    def setController_(self, controller) -> None:  # type: ignore[no-untyped-def]
-        self._controller = controller
-
-    def isFlipped(self) -> bool:  # noqa: N802
-        # AppKit default is bottom-left origin; we keep that so blue-dot
-        # Y math reads naturally. Drawing handles the flip explicitly.
-        return False
-
-    def drawRect_(self, rect) -> None:  # type: ignore[no-untyped-def]
-        bounds = self.bounds()
-        w = bounds.size.width
-        h = bounds.size.height
-
-        # Background — subtle dark fill
-        NSColor.colorWithCalibratedWhite_alpha_(0.12, 1.0).setFill()
-        NSBezierPath.fillRect_(bounds)
-
-        # Border
-        NSColor.tertiaryLabelColor().setStroke()
-        path = NSBezierPath.bezierPathWithRect_(bounds)
-        path.setLineWidth_(1.0)
-        path.stroke()
-
-        # Optional 3x3 grid lines
-        if self._controller is not None and self._controller.show_grid():
-            NSColor.colorWithCalibratedWhite_alpha_(0.5, 0.4).setStroke()
-            for i in (1, 2):
-                vx = w * i / 3.0
-                p = NSBezierPath.bezierPath()
-                p.moveToPoint_(NSMakePoint(vx, 0))
-                p.lineToPoint_(NSMakePoint(vx, h))
-                p.setLineWidth_(0.5)
-                p.stroke()
-                hy = h * i / 3.0
-                p = NSBezierPath.bezierPath()
-                p.moveToPoint_(NSMakePoint(0, hy))
-                p.lineToPoint_(NSMakePoint(w, hy))
-                p.setLineWidth_(0.5)
-                p.stroke()
-
-        # Blue dot at current focus point
-        if self._controller is not None:
-            xy = self._controller.current_focus_xy()
-            if xy is not None:
-                cam_x, cam_y = xy
-                vx, vy = self._cam_to_view(cam_x, cam_y, w, h)
-                NSColor.systemBlueColor().setFill()
-                radius = 5.0
-                dot = NSBezierPath.bezierPathWithOvalInRect_(
-                    NSMakeRect(vx - radius, vy - radius, radius * 2, radius * 2)
-                )
-                dot.fill()
-                NSColor.whiteColor().setStroke()
-                dot.setLineWidth_(1.0)
-                dot.stroke()
-
-    def mouseDown_(self, event) -> None:  # type: ignore[no-untyped-def]
-        if self._controller is None:
-            return
-        local = self.convertPoint_fromView_(event.locationInWindow(), None)
-        bounds = self.bounds()
-        cam_x, cam_y = self._view_to_cam(
-            local.x, local.y, bounds.size.width, bounds.size.height
-        )
-        if self._controller.show_grid():
-            cam_x, cam_y = self._snap_thirds(cam_x, cam_y)
-        self._controller.handle_click(cam_x, cam_y)
-        self.setNeedsDisplay_(True)
-
-    # ----- coord helpers ---------------------------------------------
-
-    def _af_bounds(self) -> tuple[int, int, int, int]:
-        if self._controller is None:
-            return 96, 928, 85, 597
-        return self._controller.af_bounds()
-
-    def _cam_to_view(self, cam_x: int, cam_y: int, w: float, h: float) -> tuple[float, float]:
-        x_min, x_max, y_min, y_max = self._af_bounds()
-        nx = (cam_x - x_min) / max(1, (x_max - x_min))
-        ny = (cam_y - y_min) / max(1, (y_max - y_min))
-        # Flip Y (camera Y-down → AppKit Y-up)
-        vx = nx * w
-        vy = (1.0 - ny) * h
-        return vx, vy
-
-    def _view_to_cam(self, vx: float, vy: float, w: float, h: float) -> tuple[int, int]:
-        x_min, x_max, y_min, y_max = self._af_bounds()
-        nx = max(0.0, min(1.0, vx / max(1.0, w)))
-        ny = max(0.0, min(1.0, 1.0 - vy / max(1.0, h)))  # flip Y
-        cam_x = round(nx * (x_max - x_min) + x_min)
-        cam_y = round(ny * (y_max - y_min) + y_min)
-        return int(cam_x), int(cam_y)
-
-    def _snap_thirds(self, cam_x: int, cam_y: int) -> tuple[int, int]:
-        x_min, x_max, y_min, y_max = self._af_bounds()
-        # Snap to the centres of a 3x3 grid: 1/6, 1/2, 5/6 along each axis.
-        def _snap(v: int, lo: int, hi: int) -> int:
-            t = (v - lo) / max(1, (hi - lo))  # 0..1
-            idx = min(2, max(0, round(t * 3 - 0.5)))
-            centre_t = (idx + 0.5) / 3.0
-            return int(round(centre_t * (hi - lo) + lo))
-        return _snap(cam_x, x_min, x_max), _snap(cam_y, y_min, y_max)
-
-
-class AFPointPopoverController(NSViewController):
-    """NSViewController owning the AF picker view + coord label + buttons."""
-
-    def init(self):  # type: ignore[no-untyped-def]
-        self = objc.super(AFPointPopoverController, self).init()
-        if self is None:
-            return None
-        self._owner = None
-        self._show_grid = False
-        return self
-
-    def set_owner(self, owner) -> None:  # type: ignore[no-untyped-def]
-        self._owner = owner
-
-    def show_grid(self) -> bool:
-        return self._show_grid
-
-    def af_bounds(self) -> tuple[int, int, int, int]:
-        if self._owner is None:
-            return 96, 928, 85, 597
-        return self._owner.af_bounds()
-
-    def current_focus_xy(self) -> tuple[int, int] | None:
-        if self._owner is None:
-            return None
-        return self._owner.current_focus_xy()
-
-    def handle_click(self, cam_x: int, cam_y: int) -> None:
-        if self._owner is None:
-            return
-        self._owner.commit_focus_point(cam_x, cam_y)
-        self._update_label(cam_x, cam_y)
-
-    def refresh(self) -> None:
-        if getattr(self, "_picker", None) is not None:
-            self._picker.setNeedsDisplay_(True)
-            xy = self.current_focus_xy()
-            if xy is not None:
-                self._update_label(*xy)
-
-    def _update_label(self, x: int, y: int) -> None:
-        if getattr(self, "_coord_label", None) is not None:
-            self._coord_label.setStringValue_(f"X: {x}   Y: {y}")
-
-    def loadView(self) -> None:  # noqa: N802
-        # Container view holds the picker rectangle + coord label + buttons
-        container_w = AF_POPOVER_W + 24
-        container_h = AF_POPOVER_H + 100
-        container = NSView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, container_w, container_h)
-        )
-
-        # Picker rectangle, top-aligned with 12px padding
-        picker_y = container_h - AF_POPOVER_H - 12
-        picker = AFPointView.alloc().initWithFrame_(
-            NSMakeRect(12, picker_y, AF_POPOVER_W, AF_POPOVER_H)
-        )
-        picker.setController_(self)
-        container.addSubview_(picker)
-        self._picker = picker
-
-        # Coordinate label below the rectangle
-        label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, picker_y - 22, AF_POPOVER_W, 18)
-        )
-        _make_label(label, "X: —   Y: —", size=11)
-        label.setTextColor_(NSColor.secondaryLabelColor())
-        container.addSubview_(label)
-        self._coord_label = label
-
-        # Center button
-        center_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(12, 12, 80, 26)
-        )
-        center_btn.setTitle_("Center")
-        center_btn.setBezelStyle_(NSBezelStyleRounded)
-        center_btn.setTarget_(self)
-        center_btn.setAction_("centerClicked:")
-        container.addSubview_(center_btn)
-
-        # 3×3 Grid toggle
-        grid_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(100, 12, 110, 26)
-        )
-        grid_btn.setTitle_("3×3 Grid")
-        grid_btn.setButtonType_(NSSwitchButton)
-        grid_btn.setTarget_(self)
-        grid_btn.setAction_("gridToggled:")
-        container.addSubview_(grid_btn)
-
-        self.setView_(container)
-        # Sync label with the latest known focus point, if any
-        xy = self.current_focus_xy()
-        if xy is not None:
-            self._update_label(*xy)
-
-    @objc.signature(b"v@:@")
-    def centerClicked_(self, sender) -> None:
-        x_min, x_max, y_min, y_max = self.af_bounds()
-        cx = (x_min + x_max) // 2
-        cy = (y_min + y_max) // 2
-        self.handle_click(cx, cy)
-        self._picker.setNeedsDisplay_(True)
-
-    @objc.signature(b"v@:@")
-    def gridToggled_(self, sender) -> None:
-        self._show_grid = bool(sender.state())
-        self._picker.setNeedsDisplay_(True)

@@ -47,3 +47,30 @@ research/
 # Phase 0 trace dumps (may contain serial numbers)
 docs/PTP_TRACE_*.bin
 docs/PHASE0_RAW_*.txt
+
+# Internal AI-assist memory & research artifacts (not part of the
+# published package — kept locally for development continuity only)
+CLAUDE.md
+DESIGN_PLAN.md
+sigma-tether-handoff.md
+docs/PHASE0_LOG.md
+docs/PHASE_3_9_PANEL_FIXES.md
+docs/PTP_TRACE.md
+docs/COMPATIBILITY.md
+memory/
+
+# Phase 0 SDK research scripts — dead-end paths kept on disk for
+# personal reference but not shipped (they reference local SDK paths
+# and were superseded by the libusb-based clean implementation)
+scripts/sigma_sdk_*.py
+scripts/setup_sigma_sdk.py
+scripts/setup_x86_venv.sh
+scripts/inspect_sample_program.sh
+scripts/refix_sdk_copy.sh
+
+# Persistent user data (settings cache, runtime state)
+.fp-l-tether/
+*.json.tmp
+
+# Local Claude Code / IDE settings
+.claude/

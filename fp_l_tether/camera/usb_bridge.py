@@ -471,9 +471,10 @@ class USBBridge:
         For write ops with outgoing data: ``data_phase_out=True``, pass out_data.
         For ops with no data phase: ``data_phase_in=False``.
 
-        The Sigma SDK ALWAYS wraps DATA payload with a 4-byte length prefix
-        and a 1-byte checksum at the end. This method does NOT add that
-        wrapping automatically — use ``send_sigma_command()`` for that.
+        The Sigma vendor protocol ALWAYS wraps DATA payload with a 4-byte
+        length prefix and a 1-byte checksum at the end. This method does
+        NOT add that wrapping automatically — use ``send_sigma_command()``
+        for that.
         """
         with self._lock:
             txid = self._next_txid()
@@ -564,11 +565,56 @@ class USBBridge:
         _guard_zero_byte(resp.in_data, "cam_can_set_info_5")
         return resp.in_data
 
+    def sigma_get_cam_op_permission(self) -> bytes:
+        """0x9039 ``GetCamOpPermission`` — PC control mode keep-alive.
+
+        Per Phase 0 testing, fp L returns a 25-byte variable-length
+        response (length=20, payload=20B, checksum=1B) with
+        ``mode_word=0x00010001`` indicating PC capture mode is engaged.
+
+        Tried as a heartbeat candidate (Phase 3.6 Plan O): the opcode
+        name "Operation Permission" suggests it's a "may I keep
+        controlling the camera?" probe, which could plausibly reset
+        the camera's internal doze timer in a way that passive get-*
+        opcodes (``camera_info``, ``capture_status``) empirically
+        do not.
+        """
+        resp = self.send_command_raw(SigmaOperationCode.GET_CAM_OP_PERMISSION)
+        resp.raise_for_status()
+        _guard_zero_byte(resp.in_data, "cam_op_permission")
+        return resp.in_data
+
     def sigma_get_cam_config(self) -> bytes:
         """0x9010 ``GetCamConfig`` — global camera configuration blob."""
         resp = self.send_command_raw(SigmaOperationCode.GET_CAM_CONFIG)
         resp.raise_for_status()
         _guard_zero_byte(resp.in_data, "cam_config")
+        return resp.in_data
+
+    def sigma_unknown_9038(self) -> bytes:
+        """0x9038 — undocumented opcode (Phase 3.6 Plan R probe).
+
+        Public Sigma PTP documentation (and community references like
+        libgphoto2) lists 0x9036=GetMovieFileInfo, 0x9037=GetPartialMovieFile,
+        0x9039=GetCamOpPermission, but 0x9038 is a gap. Tried here as a
+        heartbeat candidate in case it's an undocumented keep-alive op.
+
+        No ``_guard_zero_byte`` — a 0-byte response is informative
+        (and may indicate the opcode is write-only or simply
+        unsupported). The caller logs the response length.
+        """
+        resp = self.send_command_raw(0x9038)
+        resp.raise_for_status()
+        return resp.in_data
+
+    def sigma_unknown_903a(self) -> bytes:
+        """0x903a — undocumented opcode (Phase 3.6 Plan R probe).
+
+        Same rationale as 0x9038: no public reference documents 0x903a,
+        so it may be an undocumented keep-alive op.
+        """
+        resp = self.send_command_raw(0x903A)
+        resp.raise_for_status()
         return resp.in_data
 
     def sigma_get_datagroup(self, group: int) -> bytes:
@@ -650,10 +696,11 @@ class USBBridge:
     def sigma_set_cam_datagroup_focus(self, x: int, y: int) -> None:
         """0x9032 ``SetCamDataGroupFocus`` — write AF point coordinates.
 
-        Wire format is TIFF-IFD (matching the Get response). Confirmed from
-        sigma-ptpy ``schema.py`` (CamDataGroupFocus / DMFPos / _encode) plus
-        SDK Framework Mach-O type encoding
-        ``i32@0:8^{_IFDArray=II^{_SgmDirectoryEntry}}16@24``.
+        Wire format is TIFF-IFD (matching the Get response). The layout
+        was verified by capturing the bytes our own fp L returns to
+        ``GetCamDataGroupFocus`` and cross-checked against the
+        ``sigma-ptpy`` ``schema.py`` (CamDataGroupFocus / DMFPos / _encode)
+        for naming consistency.
 
         We send three tags together so the camera transitions into the
         free-form AF point mode and accepts arbitrary coordinates:
@@ -1189,9 +1236,10 @@ class USBBridge:
           0. *(NEW)* SetDataGroup3 with PC-capture-mode bytes (the magic
              that re-arms the camera for the next shot).
           1. GetCaptureStatus (pre-snap, for logging).
-          2. Snap(mode, amount).  Default mode=2 (NON_AF_CAPTURE per Sigma
-             SDK headers and matching the fp trace). libgphoto2 uses mode=1
-             which works for the very first shot but breaks subsequent ones.
+          2. Snap(mode, amount).  Default mode=2 (NON_AF_CAPTURE — verified
+             by experiment and matching the libgphoto2 fp trace annotations).
+             libgphoto2's default mode=1 works for the very first shot but
+             breaks subsequent ones on the fp L.
           3. Poll GetCaptureStatus up to ``max_poll_iterations × poll_interval``:
              - ``status & 0xf000 == 0x6000`` → failure (``0x6001`` = no focus)
              - ``status == 0x0002`` → success
@@ -1357,9 +1405,10 @@ class USBBridge:
         where ``external_checksum = sum(sigma_payload) & 0xFF``.
 
         IMPORTANT: We do NOT prepend a 4-byte length prefix to the OUT data.
-        The earlier hypothesis based on libgphoto2 #882 Windows SDK trace was
-        wrong — the leading ``00 00 00 00 04 00 00 00`` bytes in that trace
-        are ICAPTPPassThroughPB internal metadata, not actual on-wire bytes.
+        The earlier hypothesis based on libgphoto2 #882 USB capture
+        annotations was wrong — the leading ``00 00 00 00 04 00 00 00``
+        bytes in that trace are ICAPTPPassThroughPB internal metadata,
+        not actual on-wire bytes.
 
         For the rare op that DOES need a length-prefixed OUT data, pass
         ``wrap_with_length_prefix=True``.

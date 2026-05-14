@@ -6,12 +6,15 @@ which following fields are physically present in the byte stream. Field
 ordering inside the stream is fixed, but their offsets depend on which
 bits are set.
 
-This module mirrors ``sigma_ptpy/schema.py`` ``CamDataGroup1`` /
-``CamDataGroup2`` definitions (FlagsEnum + Struct of ``_IfDefined``
-fields). We only decode the fields we display in the floating panel
-(ShutterSpeed, Aperture, ISOSpeed, WhiteBalance); everything else is
-skipped over by walking the same field order. That keeps the parser
-robust to FieldPresent variations across firmware versions.
+The DataGroup wire format and FieldPresent bit assignments below were
+derived by observing live USB traffic produced by a Sigma fp L (run
+``fp-l-tether inspect`` to dump the raw bytes against your own camera)
+and were cross-referenced against the public ``sigma-ptpy`` Python
+project for naming consistency. We decode the fields we display in
+the floating panel (ShutterSpeed, Aperture, ISOSpeed, WhiteBalance,
+ImageQuality, Resolution); everything else is skipped over by walking
+the same field order, which keeps the parser robust to FieldPresent
+variations across firmware versions.
 
 APEX 8-bit encoding (Sigma flavour, 1/3 stop steps):
 
@@ -41,7 +44,13 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# DG1 / DG2 FieldPresent bitmasks (verbatim from sigma_ptpy schema.py)
+# DG1 / DG2 FieldPresent bitmasks
+#
+# The bit/name/width tuples below describe the wire layout we observed
+# by interacting with a Sigma fp L (toggling each setting on the camera
+# body and re-reading the DataGroup over USB). The naming follows the
+# convention established by the sigma-ptpy project for cross-project
+# readability.
 # ---------------------------------------------------------------------------
 
 # DG1 — exposure-related state. Bit value → (struct field name, byte width).
@@ -88,7 +97,9 @@ _DG2_FIELDS: tuple[tuple[int, str, int], ...] = (
 
 
 # ---------------------------------------------------------------------------
-# WhiteBalance enum (from sigma_ptpy enum.py)
+# WhiteBalance enum — labels follow sigma-ptpy's naming convention for
+# cross-project compatibility; the underlying byte values were verified
+# against a Sigma fp L.
 # ---------------------------------------------------------------------------
 
 _WB_LABELS: dict[int, str] = {

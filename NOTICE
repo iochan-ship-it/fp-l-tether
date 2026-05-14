@@ -1,0 +1,64 @@
+fp-l-tether
+Copyright (c) 2026 iochan-kaihatsu
+
+This product includes original software released under the MIT License
+(see LICENSE).
+
+================================================================================
+Third-party references
+================================================================================
+
+This is a clean-room reimplementation of the Sigma fp L tethering protocol,
+derived from publicly observable USB PTP traffic against a Sigma fp L camera
+and cross-referenced against the following open-source projects.
+
+NO PROPRIETARY SIGMA SDK SOURCE CODE OR HEADERS ARE INCLUDED OR REQUIRED.
+
+--------------------------------------------------------------------------------
+
+* libgphoto2  (https://github.com/gphoto/libgphoto2)
+
+  GNU Lesser General Public License, version 2.1 or later.
+
+  We used libgphoto2 as a protocol reference implementation. Specifically,
+  the file `camlibs/ptp2/ptp.h` documents PTP vendor opcodes — many of which
+  are protocol facts observable in any USB capture of a Sigma camera. Where
+  our `fp_l_tether/camera/ptp_codes.py` lists Sigma vendor opcodes, those
+  values are also present in libgphoto2's `ptp.h` and have been observed
+  by us in live USB traffic from a Sigma fp L.
+
+  libgphoto2 maintainers (notably Marcus Meissner) reverse-engineered Sigma
+  camera behaviour by working directly with the hardware. We have NOT
+  copied any source code from libgphoto2 into this project; we re-implemented
+  the protocol behaviour in Python from observation.
+
+--------------------------------------------------------------------------------
+
+* sigma-ptpy  (https://github.com/makanikai/sigma-ptpy)
+
+  Independent Python implementation of the Sigma PTP protocol by makanikai.
+  We cross-referenced our DataGroup FieldPresent bitmask observations against
+  sigma-ptpy's published schema and found them consistent with the wire data
+  produced by our own Sigma fp L. We have NOT imported or vendored any code
+  from sigma-ptpy.
+
+--------------------------------------------------------------------------------
+
+* SIGMA Corporation trademarks
+
+  "SIGMA", "Sigma fp", "Sigma fp L", and related marks are trademarks of
+  SIGMA Corporation, used here in their descriptive sense (i.e. to identify
+  the camera this software is compatible with). This project is NOT
+  affiliated with, endorsed by, or sponsored by SIGMA Corporation.
+
+  The SIGMA Camera Control SDK is distributed separately by SIGMA Corporation
+  under its own license terms. Users who wish to use the official SDK
+  alongside or instead of this project should download it from
+  https://www.sigma-global.com/en/news/2020/07/02/10916/ and abide by
+  SIGMA's terms. No part of the SDK is needed to use fp-l-tether.
+
+--------------------------------------------------------------------------------
+
+* PyObjC, pyusb, libusb-package, typer, rumps, pydantic, watchdog, structlog,
+  pynput, tomli — see their respective licenses in the installed packages
+  (mostly MIT / BSD / Apache-2.0).

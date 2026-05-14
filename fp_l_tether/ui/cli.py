@@ -72,8 +72,9 @@ def start(
     panel: bool = typer.Option(True, "--panel/--no-panel",
                                 help="Show the floating tether panel"),
     af: bool = typer.Option(
-        True, "--af/--no-af",
-        help="Auto-focus before each shot (default). --no-af to use current focus.",
+        False, "--af/--no-af",
+        help="Auto-focus before each shot. Default: no AF (use current focus). "
+             "Use --af to include AF in the shutter press.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:

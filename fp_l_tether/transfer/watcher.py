@@ -45,11 +45,27 @@ from fp_l_tether.camera.sigma_datagroup import (
     read_exposure,
     read_focus_point,
 )
+from fp_l_tether.camera.ptp_codes import (
+    SIGMA_FP_L_PRODUCT_ID,
+    SIGMA_FP_PRODUCT_ID,
+    SIGMA_VENDOR_ID,
+)
+from fp_l_tether.camera.settings_preservation import (
+    UserSettings,
+    restore_user_settings,
+    snapshot_user_settings,
+)
 from fp_l_tether.camera.usb_bridge import (
     CameraIdleError,
     PTPError,
     USBBridge,
     USBBridgeError,
+)
+from fp_l_tether.camera.usb_recovery import recover_camera
+from fp_l_tether.storage import (
+    SettingsCache,
+    load_settings_cache,
+    save_settings_cache,
 )
 from fp_l_tether.config import AppConfig
 from fp_l_tether.lightroom import build_destination
@@ -219,6 +235,21 @@ class TetherDaemon:
         self._liveview: LiveViewStream | None = None
         # USB keep-alive heartbeat — same lifecycle as the LV stream.
         self._heartbeat: HeartbeatThread | None = None
+
+        # ----- Phase 3.8 v2: persistent settings cache -----
+        # The fp / fp L resets DG1/DG2 to a hard-coded PC-mode template
+        # the moment USB enumerates — before we can read pre-reset
+        # values. We work around that by maintaining our own state in
+        # a disk-backed cache that replays on every (re)connect. See
+        # ``fp_l_tether.storage.settings_cache``.
+        #
+        # ``_settings_cache`` is the in-memory copy; it's loaded from
+        # disk once at daemon startup, updated whenever the user
+        # changes a setting via the floating panel, and persisted
+        # after each successful camera write.
+        self._settings_cache: SettingsCache | None = (
+            load_settings_cache() if cfg.camera.preserve_user_settings else None
+        )
 
         # ----- Burst-aware quiet-window state -----
         # After a burst settles (snap queue drains), the camera's
@@ -408,6 +439,54 @@ class TetherDaemon:
             except Exception as e:  # noqa: BLE001
                 self.log.warning("shot_callback_raised", error=str(e))
 
+    # ----- USB-level recovery (Phase 3.7) ------------------------------
+
+    def _attempt_usb_recovery(self) -> None:
+        """Force-reenumerate the fp/fp L over USB via IOKit. Best-effort.
+
+        Called between reconnect attempts in ``run()`` so the next
+        ``USBBridge.find_sigma_fp_l() → open()`` sees a fresh device
+        rather than a wedged endpoint. Equivalent to physically
+        unplugging and replugging the cable — but driven by macOS's
+        USB host controller, so it works even when the camera firmware
+        has dozed and the bulk endpoint is stalled (Errno 60).
+
+        Failures are logged but never raised: the worst case is "same
+        as before recovery existed" (a normal reconnect attempt with
+        whatever bus state we have).
+        """
+        # Try fp L first (most common), then base fp as a fallback so
+        # users with the original fp body don't miss out on recovery.
+        candidates = [
+            (SIGMA_VENDOR_ID, SIGMA_FP_L_PRODUCT_ID, "fp L"),
+            (SIGMA_VENDOR_ID, SIGMA_FP_PRODUCT_ID,  "fp"),
+        ]
+        timeout_s = self.cfg.camera.usb_recovery_timeout_s
+        settle_s  = self.cfg.camera.usb_recovery_settle_s
+
+        for vid, pid, name in candidates:
+            try:
+                self._emit_status(
+                    "recovering",
+                    f"USB 再列挙で {name} を復旧中… (電源 OFF/ON 不要)",
+                )
+                ok = recover_camera(
+                    vid, pid,
+                    log=self.log,
+                    reappear_timeout_s=timeout_s,
+                    settle_s=settle_s,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Should not happen — recover_camera swallows its own
+                # exceptions — but guard anyway so an IOKit oddity can't
+                # crash the daemon's reconnect loop.
+                self.log.warning("usb_recovery_raised", vid=vid, pid=pid, error=str(e))
+                ok = False
+            if ok:
+                self.log.info("usb_recovery_ok", model=name)
+                return
+        self.log.warning("usb_recovery_unavailable")
+
     # ----- Burst-aware quiet-window helpers ----------------------------
 
     def bus_quiet_remaining(self) -> float:
@@ -529,6 +608,27 @@ class TetherDaemon:
                             "set_exposure_sent",
                             group=req.group, fields=req.values,
                         )
+                        # Phase 3.8 v2: persist the change so the next
+                        # (re)connect can replay it. We update the
+                        # in-memory cache first and only write to disk
+                        # if anything actually changed, to avoid
+                        # spamming the filesystem on every panel click.
+                        if (
+                            self.cfg.camera.preserve_user_settings
+                            and self._settings_cache is not None
+                        ):
+                            changed = self._settings_cache.update_from(
+                                dg1=req.values if req.group == 1 else None,
+                                dg2=req.values if req.group == 2 else None,
+                            )
+                            if changed:
+                                ok = save_settings_cache(self._settings_cache)
+                                self.log.info(
+                                    "settings_cache_updated",
+                                    group=req.group,
+                                    fields=list(req.values),
+                                    persisted=ok,
+                                )
                         # Small inter-write breather so the camera
                         # commits each DataGroup change before the
                         # next arrives. 80 ms is well below human
@@ -643,6 +743,7 @@ class TetherDaemon:
         reason: str,
         attempt: int,
         sleep_s: float,
+        sleep_hint_after: int = 6,
     ) -> None:
         """Passively wait out a 0-byte read, no active PTP calls.
 
@@ -659,12 +760,19 @@ class TetherDaemon:
         loop retry the status poll. If the camera was just
         commit-settling, the next poll succeeds. If it was genuinely
         idle, the heartbeat (or the next poll itself) wakes it.
-        Three consecutive failures still escalate to a reconnect.
+
+        Phase 3.6 (2026-05-13): once ``attempt`` crosses
+        ``sleep_hint_after`` we switch the user-facing message to a
+        power-save hint ("press Shoot to wake") — by 30 s of quiet
+        the camera has clearly dozed, not just been busy.
         """
-        self._emit_status(
-            "recovering",
-            f"Camera quiet — waiting… (attempt {attempt})",
-        )
+        if attempt > sleep_hint_after:
+            message = (
+                f"Sleeping — press Shoot to wake (attempt {attempt})"
+            )
+        else:
+            message = f"Camera quiet — waiting… (attempt {attempt})"
+        self._emit_status("recovering", message)
         self.log.warning(
             "camera_idle_passive_wait",
             attempt=attempt,
@@ -676,7 +784,10 @@ class TetherDaemon:
         # We don't resume here — the LV resume gate at the top of
         # the main loop handles resume timing centrally so we
         # don't accidentally double-fire it during a sequence of
-        # alternating wait/poll cycles.
+        # alternating wait/poll cycles. The gate also withholds
+        # resume until idle_recovery_attempts returns to 0, so the
+        # LV worker stays paused across the entire recovery
+        # window — not just inside this one sleep.
         self._pause_liveview()
         self._stop_event.wait(sleep_s)
 
@@ -724,9 +835,26 @@ class TetherDaemon:
             if first_attempt:
                 first_attempt = False
             else:
-                # Wait between reconnect attempts; bail early if stopped
+                # Wait between reconnect attempts; bail early if stopped.
                 if self._stop_event.wait(reconnect_delay_s):
                     break
+
+                # Phase 3.7 (2026-05-13): before re-opening the bridge,
+                # force a USB-level re-enumeration via IOKit. This is
+                # functionally equivalent to physically unplugging and
+                # replugging the cable — required because the fp L's
+                # doze wedge leaves the bulk endpoint in a state that
+                # libusb_reset_device cannot recover from (libusb #455
+                # is broken on macOS). After re-enumeration, the
+                # subsequent ``find_sigma_fp_l() → open()`` sees a
+                # fresh device and PTP session can be re-established.
+                #
+                # Best-effort: failures here are logged but never
+                # raise — the worst case is "same as before" (reconnect
+                # attempt with the stale bridge state, which will
+                # fail again and feed the cap).
+                if self.cfg.camera.auto_recover_on_wedge:
+                    self._attempt_usb_recovery()
 
             session_start_at = time.monotonic()
             try:
@@ -753,11 +881,15 @@ class TetherDaemon:
                         "reconnect_cap_reached",
                         cap=reconnect_failure_cap,
                     )
+                    # With auto-recovery on, hitting the cap means that
+                    # even forced re-enumeration didn't resurrect the
+                    # camera — at that point physical intervention is
+                    # the only remaining option.
                     self._emit_status(
                         "error",
                         f"カメラ wedge ({reconnect_failures} 回連続失敗) — "
-                        f"fp L 本体の電源を OFF→ON してから再起動してください "
-                        f"(USB 抜き差しだけでは復旧しません)",
+                        f"自動 USB 再列挙でも復旧できませんでした。"
+                        f"fp L 本体の電源を OFF→ON してから再起動してください。",
                     )
                     break
                 self._emit_status(
@@ -765,7 +897,7 @@ class TetherDaemon:
                     f"接続切れ ({e}). 再接続を試行中… "
                     f"({reconnect_failures}/{reconnect_failure_cap})",
                 )
-                # loop continues → reconnect attempt after delay
+                # loop continues → recovery + reconnect attempt after delay
             except Exception as e:  # noqa: BLE001
                 # Unexpected; log and exit cleanly so we don't spin
                 self.log.exception("unexpected_fatal", error=str(e))
@@ -781,6 +913,14 @@ class TetherDaemon:
         Raises on USB-level failures so the outer loop can reconnect.
         """
         bridge: USBBridge | None = None
+        # Phase 3.7c (2026-05-13): track whether the session ended because
+        # the bulk endpoint is wedged. If so, the finally block skips
+        # ``bridge.close_session()`` — sending PTP CLOSE_SESSION (0x1003)
+        # to a wedged camera just blocks for 5 s on the read timeout, with
+        # no benefit since USB recovery is about to re-enumerate the device
+        # entirely. Empirically this is the source of the 5 s gap between
+        # heartbeat_stopped and session_lost.
+        bridge_likely_wedged = False
         try:
             self._emit_status("connecting", "Looking for Sigma fp / fp L…")
             bridge = USBBridge.find_sigma_fp_l()
@@ -789,10 +929,72 @@ class TetherDaemon:
                 bridge.open_session()
             self.log.info("session_opened")
 
+            # Phase 3.8 v2 (2026-05-13): persistent settings cache.
+            #
+            # We learned in v1 that the fp / fp L resets DG1/DG2 to a
+            # hard-coded PC-mode template at USB enumeration — before
+            # any PTP traffic can read pre-reset values. So a "snapshot
+            # now, restore after init" approach captures defaults, not
+            # the user's dialled state.
+            #
+            # The fix: maintain a disk-backed cache of the user's
+            # settings, populated from their actions on the floating
+            # panel. On each (re)connect we replay that cache to the
+            # camera right after init. Capture One uses the same
+            # workaround model.
+            #
+            # If the cache is empty (first-ever run), we fall back to
+            # snapshotting after init — those values are the camera's
+            # PC-mode defaults, which become the initial cache so any
+            # subsequent panel change builds on a known baseline.
             self._emit_status("initializing", "Running Sigma init sequence (10 PTP calls)…")
             with self._ptp_lock:
                 bridge.sigma_init()
             self.log.info("init_complete")
+
+            if self.cfg.camera.preserve_user_settings:
+                if self._settings_cache is not None and not self._settings_cache.is_empty():
+                    # Replay cached user settings.
+                    self._emit_status("initializing", "カメラ設定を復元中…")
+                    settings = UserSettings(
+                        dg1=dict(self._settings_cache.dg1),
+                        dg2=dict(self._settings_cache.dg2),
+                    )
+                    try:
+                        with self._ptp_lock:
+                            results = restore_user_settings(
+                                bridge, settings, log=self.log,
+                            )
+                        self.log.info(
+                            "user_settings_restored_from_cache",
+                            saved_at=self._settings_cache.saved_at,
+                            **{k: v[0] for k, v in results.items()},
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        self.log.warning(
+                            "user_settings_restore_failed", error=str(e),
+                        )
+                else:
+                    # First-run / empty cache: seed it from the camera's
+                    # current (already-reset-to-defaults) state so panel
+                    # changes from here on build on a known baseline.
+                    try:
+                        with self._ptp_lock:
+                            snapshot = snapshot_user_settings(bridge)
+                        if not snapshot.is_empty():
+                            self._settings_cache = SettingsCache(
+                                dg1=dict(snapshot.dg1),
+                                dg2=dict(snapshot.dg2),
+                            )
+                            save_settings_cache(self._settings_cache)
+                            self.log.info(
+                                "settings_cache_seeded",
+                                **snapshot.summary(),
+                            )
+                    except Exception as e:  # noqa: BLE001
+                        self.log.warning(
+                            "settings_cache_seed_failed", error=str(e),
+                        )
 
             # Discover starting slot from camera state.
             # Note: we reset _next_slot from the camera's authoritative state
@@ -817,11 +1019,26 @@ class TetherDaemon:
             # long quiet stretches between shots. Shares the PTP lock
             # so its periodic ping serialises against everything else.
             if self.cfg.camera.keep_alive_enabled:
+                # Phase 3.6 Plan T: aggressive mode uses SnapCommand
+                # (AF_DRIVE_ONLY) as the keep-alive at a longer cadence,
+                # since shots are empirically the only opcode family
+                # that resets the fp L doze timer.
+                # Phase 3.7 Plan U: also honour ``keepalive_strategy``
+                # for the new AF-point jiggle path.
+                strategy = self.cfg.camera.keepalive_strategy
+                if self.cfg.camera.aggressive_keepalive and strategy == "info":
+                    strategy = "af_drive_only"
+                if strategy == "af_drive_only":
+                    hb_interval = self.cfg.camera.aggressive_keepalive_interval_s
+                else:
+                    hb_interval = self.cfg.camera.keep_alive_interval_s
                 self._heartbeat = HeartbeatThread(
                     bridge,
                     self._ptp_lock,
-                    interval_s=self.cfg.camera.keep_alive_interval_s,
+                    interval_s=hb_interval,
                     bus_quiet_check=self.bus_quiet_remaining,
+                    strategy=strategy,
+                    af_jiggle_delta_px=self.cfg.camera.af_jiggle_delta_px,
                 )
                 self._heartbeat.start()
 
@@ -853,15 +1070,33 @@ class TetherDaemon:
 
             # Idle-recovery counter. After each successful poll we reset
             # to 0; on a CameraIdleError we passively wait (no active
-            # PTP — see _passive_idle_wait for why). Three consecutive
-            # failures escalate to a session-level disconnect. The
-            # quiet-window guard at the top of the loop prevents this
-            # path from triggering during a post-capture commit tail
-            # (which used to manifest as benign 0-bytes here), so a
-            # 0-byte that reaches this branch genuinely indicates the
-            # camera has slipped into 5-min power-save.
+            # PTP — see _passive_idle_wait for why). Consecutive failures
+            # past the cap escalate to a session-level disconnect, at
+            # which point the outer reconnect loop fires
+            # ``_attempt_usb_recovery()`` → forced re-enumeration → fresh
+            # bridge. The quiet-window guard at the top of the loop
+            # prevents this path from triggering during a post-capture
+            # commit tail, so a 0-byte that reaches this branch
+            # genuinely indicates the camera has slipped into doze.
+            #
+            # Phase 3.6 (2026-05-13) had this at 12 (= 60 s passive wait)
+            # to give the user a chance to wake the camera by pressing
+            # Shoot. Phase 3.7 (2026-05-13) replaces that strategy with
+            # automatic IOKit re-enumerate — which is fast and reliable —
+            # so a long passive wait is no longer useful. Two attempts
+            # (~10 s) is enough to absorb the rare transient busy that
+            # happens to look like an idle, while keeping escalation to
+            # reenum quick. End-to-end idle → recovered drops from
+            # ~145 s (Phase 3.6) to ~15 s (Phase 3.7).
             idle_recovery_attempts = 0
-            idle_recovery_max = 3
+            idle_recovery_max = self.cfg.camera.idle_recovery_max
+            # Threshold (in attempts) above which we switch the
+            # "recovering" message from a transient busy-camera hint
+            # to a power-save hint asking the user to nudge the camera.
+            # With idle_recovery_max=2, this is effectively never
+            # reached and the message stays "transient busy" — which
+            # is fine, since reenum will take over on attempt 3.
+            idle_recovery_sleep_hint_after = max(1, idle_recovery_max - 1)
 
             # Per-iteration trigger source. Starts as "camera_button" since
             # we begin in "watching" mode; flips to "pc_snap" the iteration
@@ -909,10 +1144,21 @@ class TetherDaemon:
                 # happened yet). Lift any pending LV pause now
                 # — central place, so individual capture paths
                 # never have to worry about LV state.
+                #
+                # Phase 3.6 (2026-05-13): also hold pause through
+                # an in-flight idle recovery (idle_recovery_attempts
+                # > 0). When _passive_idle_wait pauses LV and
+                # sleeps, the previous behaviour resumed LV before
+                # the next status poll, so the LV worker would
+                # immediately race the poll for a still-sick bulk
+                # endpoint. We now wait for at least one successful
+                # poll (which resets the counter to 0) before
+                # resuming.
                 if (
                     self._liveview is not None
                     and self._liveview.is_paused
                     and t_shot_start is None
+                    and idle_recovery_attempts == 0
                 ):
                     self._resume_liveview()
 
@@ -1047,7 +1293,8 @@ class TetherDaemon:
                     # wait — no active PTP, since the previous
                     # active-recovery design empirically pushed a
                     # half-stalled endpoint into Errno 60. Counts
-                    # toward cap; three failures → reconnect.
+                    # toward cap; failures past idle_recovery_max
+                    # escalate to a reconnect.
                     idle_recovery_attempts += 1
                     if idle_recovery_attempts >= idle_recovery_max:
                         self.log.error(
@@ -1061,6 +1308,43 @@ class TetherDaemon:
                         reason=str(e),
                         attempt=idle_recovery_attempts,
                         sleep_s=5.0,
+                        sleep_hint_after=idle_recovery_sleep_hint_after,
+                    )
+                    continue
+                except (USBBridgeError, usb.core.USBError) as e:
+                    # Phase 3.6 (2026-05-13): some doze symptoms surface
+                    # as "PTP read too short: 0 bytes" (header bulk-in
+                    # returned 0) or Errno 60 ("Operation timed out")
+                    # instead of the 0-byte data phase that CameraIdleError
+                    # catches. Treat those as recoverable idles too —
+                    # routing them through passive_wait gives the LV
+                    # self-pause back-off ladder time to settle the
+                    # endpoint and the user a chance to wake the
+                    # camera via the Shoot button. Other USB errors
+                    # (true bus-level faults) still propagate.
+                    msg = str(e)
+                    transient_patterns = (
+                        "PTP read too short",
+                        "Operation timed out",
+                        "Errno 60",
+                    )
+                    if not any(p in msg for p in transient_patterns):
+                        raise
+                    idle_recovery_attempts += 1
+                    if idle_recovery_attempts >= idle_recovery_max:
+                        self.log.error(
+                            "camera_idle_recovery_exhausted",
+                            attempts=idle_recovery_attempts,
+                            last_error=msg,
+                        )
+                        raise USBBridgeError(
+                            "camera_idle_recovery_exhausted"
+                        ) from e
+                    self._passive_idle_wait(
+                        reason=msg,
+                        attempt=idle_recovery_attempts,
+                        sleep_s=5.0,
+                        sleep_hint_after=idle_recovery_sleep_hint_after,
                     )
                     continue
                 except PTPError as e:
@@ -1071,7 +1355,6 @@ class TetherDaemon:
                 else:
                     # Any successful poll resets the idle-recovery counter.
                     idle_recovery_attempts = 0
-                # USBBridgeError / usb.core.USBError propagates → reconnect
 
                 # Failure status (0x6XXX range). This is sticky — the camera
                 # remembers a failed slot across PTP sessions, so on startup
@@ -1385,6 +1668,13 @@ class TetherDaemon:
                 interval = poll_active_s if t_shot_start else poll_idle_s
                 time.sleep(interval)
 
+        except (USBBridgeError, usb.core.USBError):
+            # Mark the bridge wedged so the finally block can skip
+            # the PTP-level close_session — which would otherwise
+            # block for ~5 s on a libusb timeout while sending
+            # CLOSE_SESSION to a dead endpoint.
+            bridge_likely_wedged = True
+            raise
         finally:
             # Always release the bridge so the next reconnect attempt
             # starts from a clean USB state. Errors here are swallowed
@@ -1408,11 +1698,23 @@ class TetherDaemon:
                     pass
                 self._liveview = None
             if bridge is not None:
-                try:
-                    with self._ptp_lock:
-                        bridge.close_session()
-                except Exception:  # noqa: BLE001
-                    pass
+                # Phase 3.7c: skip close_session on wedged bridge —
+                # the PTP CLOSE_SESSION command would just hang on
+                # the wedged bulk endpoint for ~5 s with no benefit.
+                # USB recovery is about to re-enumerate the device,
+                # so any orphan session state on the camera dies
+                # with that anyway.
+                if not bridge_likely_wedged:
+                    try:
+                        with self._ptp_lock:
+                            bridge.close_session()
+                    except Exception:  # noqa: BLE001
+                        pass
+                else:
+                    # Mark the session closed so a subsequent close()
+                    # (or anyone else who inspects the bridge) doesn't
+                    # try to send PTP traffic.
+                    bridge._session_open = False  # noqa: SLF001
                 try:
                     bridge.close()
                 except Exception:  # noqa: BLE001
