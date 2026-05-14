@@ -292,6 +292,34 @@ class LiveViewConfig(BaseModel):
     # effective_fps down — within this window from stream start,
     # busies are tolerated without demotion.
     first_storm_grace_s: float = 30.0
+
+    # Phase 3.11 — LV overlays.
+    #
+    # ``show_histogram``: master toggle for the RGB histogram strip
+    # at the bottom of the LV viewport. Runs the compute on a single
+    # side-channel worker thread so the LV frame rate is unaffected.
+    # Hotkey ``H`` flips it at runtime.
+    #
+    # ``histogram_downsample``: box-reduction factor before compute.
+    # 1 = every pixel (~80ms on 1620×1080), 2 = every 2×2 block
+    # (default; ~25ms), 4 = every 4×4 block. Higher values trade
+    # statistical precision for compute headroom.
+    #
+    # ``grid_mode``: composition overlay cycle. "off" hides the grid,
+    # "thirds" is rule-of-thirds, "golden" is φ-ratio (0.382/0.618),
+    # "full" is a 10×6 alignment grid (best for art repro of
+    # rectangular subjects). Hotkey ``G`` cycles through modes.
+    #
+    # ``show_level``: horizon level indicator. Requires the camera
+    # firmware to expose attitude data via PTP DataGroup, which is
+    # under investigation. Off by default — flipping on without
+    # working level data is a no-op (logs a "future support" note).
+    # Hotkey ``L`` toggles when available.
+    show_histogram: bool = True
+    histogram_downsample: int = 2
+    grid_mode: Literal["off", "thirds", "golden", "full"] = "off"
+    show_level: bool = False
+    level_poll_interval_s: float = 0.2
     # Note: the old ``resume_delay_after_capture_s`` knob was superseded
     # by the burst-aware quiet window in CameraConfig
     # (commit_window_base_s / commit_window_per_shot_s). LV resume is

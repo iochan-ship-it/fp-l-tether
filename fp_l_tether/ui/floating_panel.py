@@ -108,6 +108,7 @@ from fp_l_tether.camera.sigma_datagroup import (
     resolution_label,
     wb_label,
 )
+from fp_l_tether.ui.histogram_view import HistogramView
 
 if TYPE_CHECKING:
     from fp_l_tether.config import AppConfig
@@ -234,6 +235,10 @@ AF_MARKER_SIZE = 40
 AF_TICK_ARM = 8
 AF_TICK_STROKE = 1.5
 
+# Phase 3.11 — bottom-strip RGB histogram inside the LV viewport.
+# 50pt high per spec, full LV width, hugs the LV bottom edge.
+HIST_STRIP_H = 50
+
 # Vertical LV padding values kept for backwards compatibility with
 # cam_to_view callers — these mirror the new LV_Y / LV_HEIGHT layout.
 LV_PAD_TOP = PAD_TOP
@@ -358,6 +363,16 @@ class FloatingTetherPanel(NSObject):
             lv_layer.setCornerRadius_(4.0)
             lv_layer.setMasksToBounds_(True)
         content.addSubview_(self._live_view)
+
+        # ----- Histogram strip (Phase 3.11) ------------------------
+        # Bottom 50pt inside the LV viewport. Hidden by default if
+        # the cfg says so; the daemon's compute side respects the
+        # same flag so a hidden strip costs zero CPU.
+        self._hist_view = HistogramView.alloc().initWithFrame_(
+            NSMakeRect(LV_X, LV_Y, LV_WIDTH, HIST_STRIP_H)
+        )
+        self._hist_view.setHidden_(not self._cfg.liveview.show_histogram)
+        content.addSubview_(self._hist_view)
 
         # ----- LV pause overlay (Saving…) --------------------------
         self._lv_overlay = NSView.alloc().initWithFrame_(
@@ -577,7 +592,7 @@ class FloatingTetherPanel(NSObject):
         self._hint_label.setFont_(F_HINT)
         self._hint_label.setTextColor_(C_FG_TERTIARY)
         self._hint_label.setAlignment_(NSTextAlignmentCenter)
-        self._hint_label.setStringValue_("␣ shoot · A focus · ⌘Q quit")
+        self._hint_label.setStringValue_("␣ shoot · A focus · H hist · ⌘Q quit")
         content.addSubview_(self._hint_label)
 
         # ----- internal state --------------------------------------
@@ -662,7 +677,7 @@ class FloatingTetherPanel(NSObject):
         """
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
             "updateLiveFrame:",
-            (event.jpeg, event.width, event.height),
+            (event.jpeg, event.width, event.height, event.histogram),
             False,
         )
 
@@ -716,7 +731,7 @@ class FloatingTetherPanel(NSObject):
             text = "Quit and relaunch after power cycle"
             color = C_STATE_ERROR
         else:
-            text = "␣ shoot · A focus · ⌘Q quit"
+            text = "␣ shoot · A focus · H hist · ⌘Q quit"
             color = C_FG_TERTIARY
         self._hint_label.setStringValue_(text)
         self._hint_label.setTextColor_(color)
@@ -967,7 +982,14 @@ class FloatingTetherPanel(NSObject):
         shows it's too heavy, switch to a CIImage / CGImageSource
         pipeline or pre-decode on the LV thread.
         """
-        jpeg, width, height = tup
+        # 4-tuple since Phase 3.11 — histogram trails the jpeg/w/h.
+        # Tolerate the old 3-tuple shape for any in-flight performSelector
+        # marshalled before the panel rebuilt (e.g. across a config reload).
+        if len(tup) == 4:
+            jpeg, width, height, histogram = tup
+        else:
+            jpeg, width, height = tup
+            histogram = None
         # Cheap aliveness counter — useful from the debugger / a future
         # debug overlay.
         self._lv_frame_count = getattr(self, "_lv_frame_count", 0) + 1
@@ -997,6 +1019,12 @@ class FloatingTetherPanel(NSObject):
             # previous image up so the viewport doesn't flicker.
             return
         self._live_view.setImage_(image)
+
+        # Push the side-channel histogram snapshot into the bottom-strip
+        # view. ``setData_`` is cheap (stash + setNeedsDisplay) so it's
+        # fine to call on every frame even when the strip is hidden.
+        if histogram is not None and getattr(self, "_hist_view", None) is not None:
+            self._hist_view.setData_(histogram)
 
     # ----- dropdown helpers -------------------------------------------
 
@@ -1200,6 +1228,32 @@ class FloatingTetherPanel(NSObject):
     def quitClicked_(self, sender) -> None:
         self.stop()
 
+    # ----- Phase 3.11 overlay toggles ---------------------------------
+
+    def _toggle_histogram(self) -> None:
+        """Hotkey H — flip the bottom-strip histogram visibility.
+
+        Also tells the daemon (→ LV stream) to stop / start computing
+        so a hidden strip doesn't waste CPU. The compute state and the
+        view-hidden state are kept in sync via this single entry point.
+        """
+        view = getattr(self, "_hist_view", None)
+        if view is None:
+            return
+        new_visible = bool(view.isHidden())  # toggle
+        view.setHidden_(not new_visible)
+        try:
+            self._daemon.set_histogram_enabled(new_visible)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("histogram toggle: daemon side raised: %s", e)
+        # Persist into the in-memory config so a recovery / restart
+        # picks up the user's choice. (Disk-level persistence is a
+        # future enhancement — see config.toml docs.)
+        try:
+            self._cfg.liveview.show_histogram = new_visible
+        except Exception:  # noqa: BLE001
+            pass
+
     # ----- live-view staleness watchdog -------------------------------
 
     def _install_lv_staleness_watch(self) -> None:
@@ -1292,6 +1346,10 @@ class FloatingTetherPanel(NSObject):
                 return None  # consume
             if key == "a":
                 self._daemon.request_af()
+                return None  # consume
+            # Phase 3.11 — overlay toggles.
+            if key == "h":
+                self._toggle_histogram()
                 return None  # consume
             return event
 

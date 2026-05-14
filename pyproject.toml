@@ -32,6 +32,9 @@ dependencies = [
     "pyusb>=1.2",
     "libusb-package>=1.0.26",  # bundles libusb binaries, no Homebrew needed
 
+    # Live-view image decode + histogram compute (Phase 3.11)
+    "Pillow>=10.0",
+
     # CLI & UI
     "typer>=0.12",
     "rumps>=0.4.0",

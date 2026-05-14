@@ -33,11 +33,13 @@ import struct
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Callable, TYPE_CHECKING
 
 from fp_l_tether.camera.usb_bridge import PTPError, USBBridgeError
 from fp_l_tether.telemetry.logger import get_logger
+from fp_l_tether.transfer.histogram import HistogramData, compute_histogram
 
 if TYPE_CHECKING:
     from fp_l_tether.camera.usb_bridge import USBBridge
@@ -50,6 +52,13 @@ class LiveViewFrame:
     ``width`` / ``height`` are best-effort: extracted from the JPEG
     SOF marker. They may be 0 if the marker wasn't found (the JPEG
     bytes are still valid for display in either case).
+
+    ``histogram`` is filled in by the LV stream's side-channel
+    ``ThreadPoolExecutor`` when histogram computation is enabled. It
+    may be ``None`` for the first few frames (until the first
+    compute completes) or any time the previous compute is still
+    in flight — see ``LiveViewStream._run`` for the "at most one
+    outstanding" pattern that keeps the LV loop at full speed.
     """
 
     jpeg: bytes
@@ -57,6 +66,7 @@ class LiveViewFrame:
     height: int
     fps_avg: float
     frame_kb: float
+    histogram: HistogramData | None = None
 
 
 # Module-level default — callers may override per-stream.
@@ -157,6 +167,8 @@ class LiveViewStream:
         promote_after_consecutive_ok: int = 10,
         post_snap_busy_grace_s: float = 1.5,
         first_storm_grace_s: float = 30.0,
+        histogram_enabled: bool = True,
+        histogram_downsample: int = 2,
     ) -> None:
         if target_fps <= 0:
             raise ValueError(f"target_fps must be positive, got {target_fps}")
@@ -200,6 +212,20 @@ class LiveViewStream:
         self._recent: deque[tuple[float, int]] = deque(maxlen=64)
         self._metrics_lock = threading.Lock()
 
+        # ---- Phase 3.11: side-channel histogram compute -----------
+        # One worker thread, one in-flight task max. After each
+        # successful frame, if no compute is running we submit a new
+        # one with the just-arrived JPEG; otherwise we skip (the
+        # displayed histogram lags at most one frame, which is
+        # imperceptible at 10 fps). The LV main loop never blocks on
+        # the histogram, so the camera-side fps target is unaffected.
+        self._hist_enabled = histogram_enabled
+        self._hist_downsample = max(1, int(histogram_downsample))
+        self._hist_executor: ThreadPoolExecutor | None = None
+        self._hist_future: Future[HistogramData] | None = None
+        self._latest_hist: HistogramData | None = None
+        self._hist_lock = threading.Lock()
+
     # ----- lifecycle ---------------------------------------------------
 
     def start(self) -> None:
@@ -207,11 +233,19 @@ class LiveViewStream:
             return
         self._stop_event.clear()
         self._stream_started_at = time.monotonic()
+        if self._hist_enabled and self._hist_executor is None:
+            self._hist_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="HistCalc"
+            )
         self._thread = threading.Thread(
             target=self._run, name="LiveViewStream", daemon=True
         )
         self._thread.start()
-        self.log.info("liveview_started", target_fps=self._target_fps)
+        self.log.info(
+            "liveview_started",
+            target_fps=self._target_fps,
+            histogram_enabled=self._hist_enabled,
+        )
 
     def stop(self, timeout: float = 2.0) -> None:
         self._stop_event.set()
@@ -221,7 +255,28 @@ class LiveViewStream:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        if self._hist_executor is not None:
+            # Don't wait for an in-flight histogram — the worker is a
+            # daemon thread and the work item only touches Pillow.
+            self._hist_executor.shutdown(wait=False, cancel_futures=True)
+            self._hist_executor = None
         self.log.info("liveview_stopped")
+
+    def set_histogram_enabled(self, enabled: bool) -> None:
+        """Toggle histogram compute at runtime (panel hotkey path).
+
+        When turned off mid-stream, the in-flight future is left to
+        finish (cheap) but the result is discarded; no new computes
+        are submitted until the next ``True``.
+        """
+        self._hist_enabled = bool(enabled)
+        if not enabled:
+            with self._hist_lock:
+                self._latest_hist = None
+        elif self._hist_executor is None and self.is_running:
+            self._hist_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="HistCalc"
+            )
 
     @property
     def is_running(self) -> bool:
@@ -484,15 +539,45 @@ class LiveViewStream:
             with self._metrics_lock:
                 self._recent.append((now, len(jpeg)))
 
+            # ---- Side-channel histogram compute (Phase 3.11) -----
+            # Collect the previous frame's result if it's ready; never
+            # block. Then, if no compute is in flight, submit this
+            # frame's JPEG. The "at most one outstanding" policy means
+            # heavy frames just get skipped rather than queued — the
+            # displayed histogram is at most one frame stale, which
+            # is invisible at 10 fps.
+            if self._hist_enabled and self._hist_executor is not None:
+                if self._hist_future is not None and self._hist_future.done():
+                    try:
+                        result = self._hist_future.result()
+                        with self._hist_lock:
+                            self._latest_hist = result
+                    except Exception as e:  # noqa: BLE001
+                        self.log.warning("histogram_compute_failed", error=str(e))
+                    self._hist_future = None
+                if self._hist_future is None:
+                    try:
+                        self._hist_future = self._hist_executor.submit(
+                            compute_histogram, jpeg, self._hist_downsample
+                        )
+                    except RuntimeError:
+                        # Executor was shut down (stop() race). Drop
+                        # the submit silently — the next start()
+                        # rebuilds it.
+                        self._hist_future = None
+
             # Dispatch to the consumer.
             if self._on_frame is not None:
                 w, h = _jpeg_dimensions(jpeg)
+                with self._hist_lock:
+                    hist_snapshot = self._latest_hist
                 frame = LiveViewFrame(
                     jpeg=jpeg,
                     width=w,
                     height=h,
                     fps_avg=self.current_fps(),
                     frame_kb=len(jpeg) / 1024.0,
+                    histogram=hist_snapshot,
                 )
                 try:
                     self._on_frame(frame)

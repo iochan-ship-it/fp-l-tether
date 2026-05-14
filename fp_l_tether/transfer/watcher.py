@@ -139,6 +139,8 @@ class LiveViewEvent:
 
     ``fps_avg`` and ``frame_kb`` are rolling 1-second metrics from the
     stream so the UI can show stream health without computing it itself.
+    ``histogram`` carries the side-channel RGB histogram result (or
+    ``None`` while compute is still warming up / disabled).
     """
 
     jpeg: bytes
@@ -146,6 +148,7 @@ class LiveViewEvent:
     height: int
     fps_avg: float
     frame_kb: float
+    histogram: object | None = None  # HistogramData; typed as object to avoid Pillow import here
 
 
 @dataclass
@@ -402,6 +405,20 @@ class TetherDaemon:
             self._shots_by_item.clear()
         self.log.info("session_started", session=cleaned)
         self._emit_status("ready", f"Session: {cleaned}")
+
+    def set_histogram_enabled(self, enabled: bool) -> None:
+        """Toggle LV histogram compute from the UI side (hotkey H).
+
+        Safe to call before/after the LV stream is up. When the stream
+        isn't running yet this just updates the runtime config flag so
+        the next stream restart picks up the new value. No PTP traffic.
+        """
+        self.cfg.liveview.show_histogram = bool(enabled)
+        if self._liveview is not None:
+            try:
+                self._liveview.set_histogram_enabled(enabled)
+            except Exception as e:  # noqa: BLE001
+                self.log.warning("histogram_toggle_failed", error=str(e))
 
     def set_current_item(self, name: str) -> None:
         """Change the active item name. Filenames written from now on use
@@ -733,6 +750,7 @@ class TetherDaemon:
                     height=frame.height,
                     fps_avg=frame.fps_avg,
                     frame_kb=frame.frame_kb,
+                    histogram=frame.histogram,
                 )
             )
         except Exception as e:  # noqa: BLE001
@@ -1062,6 +1080,8 @@ class TetherDaemon:
                     first_storm_grace_s=(
                         self.cfg.liveview.first_storm_grace_s
                     ),
+                    histogram_enabled=self.cfg.liveview.show_histogram,
+                    histogram_downsample=self.cfg.liveview.histogram_downsample,
                 )
                 self._liveview.start()
 
