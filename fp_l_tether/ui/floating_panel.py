@@ -108,6 +108,7 @@ from fp_l_tether.camera.sigma_datagroup import (
     resolution_label,
     wb_label,
 )
+from fp_l_tether.ui.grid_overlay import GridOverlayView, cycle_mode as _grid_cycle
 from fp_l_tether.ui.histogram_view import HistogramView
 
 if TYPE_CHECKING:
@@ -364,6 +365,19 @@ class FloatingTetherPanel(NSObject):
             lv_layer.setMasksToBounds_(True)
         content.addSubview_(self._live_view)
 
+        # ----- Composition grid (Phase 3.11) -----------------------
+        # Full-LV-area overlay; drawRect is a no-op when mode == "off"
+        # so cycling through hotkey G is free when the grid is hidden.
+        # Added BEFORE the histogram strip so the strip's translucent
+        # background tints any grid lines underneath without obscuring
+        # them — the spec calls for the histogram strip to feel like
+        # an integral layer of the LV rather than a sticker on top.
+        self._grid_view = GridOverlayView.alloc().initWithFrame_(
+            NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT)
+        )
+        self._grid_view.setMode_(self._cfg.liveview.grid_mode)
+        content.addSubview_(self._grid_view)
+
         # ----- Histogram strip (Phase 3.11) ------------------------
         # Bottom 50pt inside the LV viewport. Hidden by default if
         # the cfg says so; the daemon's compute side respects the
@@ -592,7 +606,7 @@ class FloatingTetherPanel(NSObject):
         self._hint_label.setFont_(F_HINT)
         self._hint_label.setTextColor_(C_FG_TERTIARY)
         self._hint_label.setAlignment_(NSTextAlignmentCenter)
-        self._hint_label.setStringValue_("␣ shoot · A focus · H hist · ⌘Q quit")
+        self._hint_label.setStringValue_("␣ shoot · A focus · H hist · G grid · ⌘Q quit")
         content.addSubview_(self._hint_label)
 
         # ----- internal state --------------------------------------
@@ -731,7 +745,7 @@ class FloatingTetherPanel(NSObject):
             text = "Quit and relaunch after power cycle"
             color = C_STATE_ERROR
         else:
-            text = "␣ shoot · A focus · H hist · ⌘Q quit"
+            text = "␣ shoot · A focus · H hist · G grid · ⌘Q quit"
             color = C_FG_TERTIARY
         self._hint_label.setStringValue_(text)
         self._hint_label.setTextColor_(color)
@@ -1254,6 +1268,32 @@ class FloatingTetherPanel(NSObject):
         except Exception:  # noqa: BLE001
             pass
 
+    def _cycle_grid(self) -> None:
+        """Hotkey G — cycle composition grid mode off → thirds → golden → full.
+
+        Pure presentation: the grid view's drawRect is a no-op when
+        mode == "off", so cycling through "off" does NOT cost any
+        redraw beyond a single setNeedsDisplay tick.
+        """
+        view = getattr(self, "_grid_view", None)
+        if view is None:
+            return
+        current = str(view.mode())
+        new_mode = _grid_cycle(current)  # type: ignore[arg-type]
+        view.setMode_(new_mode)
+        try:
+            self._cfg.liveview.grid_mode = new_mode  # type: ignore[assignment]
+        except Exception:  # noqa: BLE001
+            pass
+        # Briefly surface the new mode in the hint footer so the user
+        # has visual confirmation the keystroke registered.
+        try:
+            self._hint_label.setStringValue_(
+                f"Grid: {new_mode}    ␣ shoot · A focus · H hist · G grid · ⌘Q quit"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     # ----- live-view staleness watchdog -------------------------------
 
     def _install_lv_staleness_watch(self) -> None:
@@ -1350,6 +1390,9 @@ class FloatingTetherPanel(NSObject):
             # Phase 3.11 — overlay toggles.
             if key == "h":
                 self._toggle_histogram()
+                return None  # consume
+            if key == "g":
+                self._cycle_grid()
                 return None  # consume
             return event
 
