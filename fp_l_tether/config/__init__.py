@@ -310,16 +310,14 @@ class LiveViewConfig(BaseModel):
     # "full" is a 10×6 alignment grid (best for art repro of
     # rectangular subjects). Hotkey ``G`` cycles through modes.
     #
-    # ``show_level``: horizon level indicator. Requires the camera
-    # firmware to expose attitude data via PTP DataGroup, which is
-    # under investigation. Off by default — flipping on without
-    # working level data is a no-op (logs a "future support" note).
-    # Hotkey ``L`` toggles when available.
+    # NOTE: a horizon-level overlay was investigated for Phase 3.11c
+    # and skipped — the fp L does not expose attitude/tilt data via
+    # PTP. See ``workshop/traces/level_search.md`` for the full
+    # negative-result writeup. Hotkey ``L`` is intentionally
+    # unassigned so it remains free for future use.
     show_histogram: bool = True
     histogram_downsample: int = 2
     grid_mode: Literal["off", "thirds", "golden", "full"] = "off"
-    show_level: bool = False
-    level_poll_interval_s: float = 0.2
     # Note: the old ``resume_delay_after_capture_s`` knob was superseded
     # by the burst-aware quiet window in CameraConfig
     # (commit_window_base_s / commit_window_per_shot_s). LV resume is
