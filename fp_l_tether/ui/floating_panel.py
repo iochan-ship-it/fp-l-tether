@@ -46,6 +46,7 @@ from AppKit import (
     NSApp,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
+    NSAppearance,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
     NSButton,
@@ -54,16 +55,23 @@ from AppKit import (
     NSEventMaskKeyDown,
     NSFloatingWindowLevel,
     NSFont,
+    NSFontAttributeName,
+    NSForegroundColorAttributeName,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSKernAttributeName,
     NSMakeRect,
     NSMakeSize,
+    NSMutableParagraphStyle,
     NSPanel,
+    NSParagraphStyleAttributeName,
     NSPopUpButton,
     NSScreen,
     NSStatusWindowLevel,
     NSTextAlignmentCenter,
+    NSTextAlignmentLeft,
+    NSTextAlignmentRight,
     NSTextField,
     NSTextView,
     NSTitledWindowMask,
@@ -78,7 +86,19 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSData, NSObject, NSTimer
+from Foundation import NSAttributedString, NSData, NSObject, NSTimer
+
+# Font-weight constants — usually exported from AppKit, but the names
+# vary by PyObjC version. Use the documented literal values so the
+# import survives regardless of bridge metadata.
+NSFontWeightRegular = 0.0
+NSFontWeightMedium = 0.23
+NSFontWeightSemibold = 0.3
+NSFontWeightBold = 0.4
+
+# NSPopUpArrowPosition.noArrow — hide the dropdown chevron on the
+# hero exposure popups (the title text itself is the affordance).
+_NS_POPUP_NO_ARROW = 0
 
 from fp_l_tether.camera.sigma_datagroup import (
     apex_to_aperture,
@@ -96,33 +116,133 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-PANEL_WIDTH = 320
-# CONTROLS_HEIGHT is the height of the original (pre-LV) control area.
-# Existing widget Y offsets are computed against this constant so that
-# growing the panel to add a live-view viewport at the top doesn't
-# require touching every NSMakeRect below.
-#
-# Bumped from 280 → 308 in Phase 3.5d to make room for a third
-# exposure-dropdown row (Format + Size). All widgets anchored to the
-# top of the controls area use ``CONTROLS_HEIGHT - N`` so they shift
-# down with the bump; widgets anchored to the bottom (item field,
-# buttons, hint) use absolute y values and stay put. The shot label
-# at ``CONTROLS_HEIGHT - 166`` lands at the same absolute pixel row
-# as before so its alignment with the bottom-anchored widgets is
-# preserved.
-CONTROLS_HEIGHT = 308
-# Live-view viewport — placed above the controls area. Sized for the
-# fp L's 3:2 capture ratio so frames don't distort when scaled to fit.
-LV_WIDTH = 220
-LV_HEIGHT = 140  # 220x140 ≈ 3:1.9 — close to 3:2, avoids letterboxing
-LV_PAD_TOP = 12
-LV_PAD_BOTTOM = 10
-PANEL_HEIGHT = CONTROLS_HEIGHT + LV_PAD_BOTTOM + LV_HEIGHT + LV_PAD_TOP
+# ---------------------------------------------------------------------
+# Phase 3.10 — design tokens (anodized black + amber, mono hero values).
+# These are intentionally module-level so the build_window method reads
+# as layout-only and tweaking the palette doesn't require editing the
+# widget tree. See docs/PHASE_3_10_UI_POLISH.md for the source spec.
+# ---------------------------------------------------------------------
 
-# AF marker dimensions (px) — the on-LV reticle shown at the current
-# AF point. The camera's AF coord bounds are dynamic (populated from
-# CamCanSetInfo5 on connect, fp L V90 defaults via FloatingTetherPanel.af_bounds).
-AF_MARKER_SIZE = 28
+
+def _c(r: int, g: int, b: int, a: float = 1.0):
+    return NSColor.colorWithCalibratedRed_green_blue_alpha_(
+        r / 255.0, g / 255.0, b / 255.0, a
+    )
+
+
+# Backgrounds
+C_BG_PANEL = _c(26, 26, 28)
+C_BG_ELEVATED = _c(38, 38, 41)
+C_BG_INPUT = _c(14, 14, 16)
+C_BG_LV_FRAME = _c(10, 10, 12)
+
+# Foregrounds
+C_FG_PRIMARY = _c(240, 240, 242)
+C_FG_SECONDARY = _c(144, 144, 160)
+C_FG_TERTIARY = _c(106, 106, 120)
+C_FG_INVERSE = _c(26, 26, 28)
+
+# Accents
+C_AMBER = _c(232, 161, 58)
+C_AMBER_BRIGHT = _c(247, 180, 69)
+
+# State colours (used by the status-row dot + LV chrome)
+C_STATE_READY = _c(52, 199, 89)
+C_STATE_BUSY = _c(255, 159, 10)
+C_STATE_RECOVER = _c(255, 204, 0)
+C_STATE_ERROR = _c(255, 69, 58)
+
+# Strokes
+C_STROKE_SUBTLE = _c(46, 46, 52)
+C_STROKE_DEFAULT = _c(58, 58, 64)
+C_STROKE_STRONG = _c(82, 82, 92)
+
+# Typography. Mono for numeric exposure values so the digits don't
+# bounce around as the user spins through dial codes; SF Pro for
+# everything else.
+F_HERO = NSFont.monospacedSystemFontOfSize_weight_(18, NSFontWeightBold)
+F_NUMERIC = NSFont.monospacedSystemFontOfSize_weight_(11, NSFontWeightMedium)
+F_LABEL = NSFont.systemFontOfSize_weight_(10, NSFontWeightMedium)
+F_BODY = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
+F_BUTTON = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
+F_HINT = NSFont.systemFontOfSize_weight_(10, NSFontWeightRegular)
+
+# Status-row presets — keep the daemon's internal state names (these
+# match the keys the daemon emits through on_status) but render with
+# the clean human-readable strings the spec asks for.
+STATUS_PRESETS = {
+    "ready":        (C_STATE_READY,   "Ready"),
+    "shooting":     (C_STATE_BUSY,    "Capturing…"),
+    "downloading":  (C_STATE_BUSY,    "Saving…"),
+    "recovering":   (C_STATE_RECOVER, "USB recovery"),
+    "error":        (C_STATE_ERROR,   "Camera unresponsive"),
+    "focusing":     (C_AMBER,         "Focusing…"),
+    "connecting":   (C_FG_TERTIARY,   "Connecting…"),
+    "initializing": (C_FG_TERTIARY,   "Warming up…"),
+    "stopped":      (C_FG_TERTIARY,   "Stopped"),
+    "disconnected": (C_STATE_ERROR,   "Disconnected"),
+}
+
+# ---------------------------------------------------------------------
+# Layout constants
+# ---------------------------------------------------------------------
+PANEL_WIDTH = 320
+PANEL_HEIGHT = 480
+PAD_X = 16
+PAD_TOP = 14
+PAD_BOTTOM = 14
+
+# Live-view viewport
+LV_WIDTH = PANEL_WIDTH - 2 * PAD_X  # 288
+LV_HEIGHT = 200
+LV_X = PAD_X  # 16
+LV_Y = PANEL_HEIGHT - PAD_TOP - LV_HEIGHT  # 266
+
+# Status row (dot + state + shot count) — between LV and exposure block
+STATUS_H = 18
+STATUS_Y = LV_Y - 10 - STATUS_H  # 238
+
+# Exposure hero block (top stroke, label row, value row, bottom stroke)
+EXP_TOP_STROKE_Y = STATUS_Y - 14            # 224
+EXP_LABEL_H = 14
+EXP_LABEL_Y = EXP_TOP_STROKE_Y - 6 - EXP_LABEL_H   # 204
+EXP_VALUE_H = 26
+EXP_VALUE_Y = EXP_LABEL_Y - 4 - EXP_VALUE_H        # 174
+EXP_BOT_STROKE_Y = EXP_VALUE_Y - 8                 # 166
+
+# Secondary dropdown row (WB / Format / Size)
+SEC_H = 24
+SEC_Y = EXP_BOT_STROKE_Y - 14 - SEC_H              # 128
+
+# Subject text field
+SUB_H = 26
+SUB_Y = SEC_Y - 14 - SUB_H                         # 88
+
+# Buttons (Shoot 2/3 + AF 1/3)
+BTN_H = 32
+BTN_Y = SUB_Y - 14 - BTN_H                         # 42
+BTN_GAP = 6
+SHOOT_W = round(LV_WIDTH * 2 / 3) - BTN_GAP // 2   # 189
+AF_W = LV_WIDTH - SHOOT_W - BTN_GAP                # 93
+
+# Footer hint
+HINT_H = 12
+HINT_Y = 14  # PAD_BOTTOM
+
+# AF reticle on the LV — 4 amber corner ticks
+AF_MARKER_SIZE = 40
+AF_TICK_ARM = 8
+AF_TICK_STROKE = 1.5
+
+# Vertical LV padding values kept for backwards compatibility with
+# cam_to_view callers — these mirror the new LV_Y / LV_HEIGHT layout.
+LV_PAD_TOP = PAD_TOP
+LV_PAD_BOTTOM = STATUS_Y + STATUS_H + 10  # how much room is under the LV
+# CONTROLS_HEIGHT is no longer meaningful with the new top-down layout,
+# but is referenced by the historic cam_to_view math. We map it to the
+# top edge of the status row so cam→view conversion still resolves to
+# the LV rect.
+CONTROLS_HEIGHT = LV_Y - LV_PAD_BOTTOM  # = LV_Y - (STATUS_Y + STATUS_H + 10)
 
 
 class FloatingTetherPanel(NSObject):
@@ -168,9 +288,15 @@ class FloatingTetherPanel(NSObject):
     # ----- window construction ----------------------------------------
 
     def _build_window(self) -> None:
+        """Build the floating panel — Phase 3.10 layout.
+
+        Anodized-black panel, amber accent, mono hero exposure values.
+        Layout constants are at module-top (LV_*, EXP_*, SEC_Y, SUB_Y,
+        BTN_Y, HINT_Y) so this method reads as widget placement only —
+        no magic numbers buried in the call sites.
+        """
         screen = NSScreen.mainScreen()
         frame = screen.visibleFrame()
-        # Position top-right by default
         origin_x = frame.origin.x + frame.size.width - PANEL_WIDTH - 20
         origin_y = frame.origin.y + frame.size.height - PANEL_HEIGHT - 20
 
@@ -185,12 +311,28 @@ class FloatingTetherPanel(NSObject):
             rect, style, NSBackingStoreBuffered, False
         )
         panel.setTitle_("fp L tether")
-        panel.setLevel_(NSStatusWindowLevel)  # higher than floating, beats fullscreen
-        panel.setOpaque_(False)
+        panel.setLevel_(NSStatusWindowLevel)
+        panel.setOpaque_(True)
+        panel.setBackgroundColor_(C_BG_PANEL)
         panel.setHasShadow_(True)
         panel.setMovableByWindowBackground_(True)
 
-        # Make it follow the user across Spaces and stay over fullscreen apps
+        # Dark appearance so NSPopUpButton + system controls render
+        # readable text on our anodized-black background without each
+        # control needing an explicit attributedTitle.
+        try:
+            panel.setAppearance_(
+                NSAppearance.appearanceNamed_("NSAppearanceNameDarkAqua")
+            )
+        except Exception:  # noqa: BLE001
+            # appearanceNamed_ on very old macOS versions may fail;
+            # the panel still renders, just with default chrome.
+            pass
+
+        # Wire the close button → graceful daemon shutdown.
+        panel.setDelegate_(self)
+
+        # Follow the user across Spaces, sit over Lightroom fullscreen.
         panel.setCollectionBehavior_(
             NSWindowCollectionBehaviorCanJoinAllSpaces
             | NSWindowCollectionBehaviorFullScreenAuxiliary
@@ -198,308 +340,235 @@ class FloatingTetherPanel(NSObject):
         )
 
         content = panel.contentView()
+        content.setWantsLayer_(True)
+        if content.layer() is not None:
+            content.layer().setBackgroundColor_(C_BG_PANEL.CGColor())
 
-        # Live-view viewport (top of the panel, above the controls area).
-        # 3.3a only constructs the view and wires the callback; the
-        # JPEG → NSImage conversion + setImage_ marshalling lands in
-        # 3.3b. Until then the view shows an empty frame, but the
-        # callback fires (verifiable via logs) so we know the pipe is
-        # connected end-to-end.
-        lv_x = (PANEL_WIDTH - LV_WIDTH) // 2
-        lv_y = CONTROLS_HEIGHT + LV_PAD_BOTTOM
-        # LiveViewImageView is a click-aware NSImageView subclass. Click
-        # anywhere on the rendered LV → maps view-local (x, y) to camera
-        # AF coordinates via panel.af_bounds() and pushes through
-        # panel.commit_focus_point(). This replaces the AF popover as
-        # the primary way to set the AF point (the popover stays for
-        # users who want the numeric coord readout / 3×3 snap mode).
+        # ----- Live-view viewport ----------------------------------
         self._live_view = LiveViewImageView.alloc().initWithFrame_(
-            NSMakeRect(lv_x, lv_y, LV_WIDTH, LV_HEIGHT)
+            NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT)
         )
         self._live_view.setOwner_(self)
         self._live_view.setEditable_(False)
-        # Proportional scaling so non-3:2 frames (e.g. cropped sensor
-        # modes) don't distort.
         self._live_view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
-        # Dark backdrop so the viewport reads as "screen" before the
-        # first frame arrives (and during pause windows in 3.3c).
         self._live_view.setWantsLayer_(True)
-        layer = self._live_view.layer()
-        if layer is not None:
-            layer.setBackgroundColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(0.08, 1.0).CGColor()
-            )
+        lv_layer = self._live_view.layer()
+        if lv_layer is not None:
+            lv_layer.setBackgroundColor_(C_BG_LV_FRAME.CGColor())
+            lv_layer.setCornerRadius_(4.0)
+            lv_layer.setMasksToBounds_(True)
         content.addSubview_(self._live_view)
 
-        # Pause overlay — a semi-transparent dark veil with a centered
-        # "Saving…" label, sitting exactly on top of the LV image.
-        # Initially hidden; a 250 ms staleness watchdog (installed in
-        # _install_lv_staleness_watch) toggles it based on how long
-        # since the last frame arrived. This is what tells the user
-        # "the camera is mid-snap, the freeze is expected" so they
-        # don't think the app crashed during the ~5 s DNG drain.
+        # ----- LV pause overlay (Saving…) --------------------------
         self._lv_overlay = NSView.alloc().initWithFrame_(
-            NSMakeRect(lv_x, lv_y, LV_WIDTH, LV_HEIGHT)
+            NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT)
         )
         self._lv_overlay.setWantsLayer_(True)
         overlay_layer = self._lv_overlay.layer()
         if overlay_layer is not None:
             overlay_layer.setBackgroundColor_(
-                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.55).CGColor()
+                NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.62).CGColor()
             )
+            overlay_layer.setCornerRadius_(4.0)
         self._lv_overlay.setHidden_(True)
         content.addSubview_(self._lv_overlay)
 
-        # "Saving…" label — vertically centered inside the overlay.
-        # Coords are relative to the overlay view (its origin is
-        # (lv_x, lv_y), so the label rect is in overlay-local space).
+        # "Saving…" label centred inside the overlay (overlay-local coords).
         self._lv_overlay_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(0, (LV_HEIGHT - 24) // 2, LV_WIDTH, 24)
+            NSMakeRect(0, (LV_HEIGHT - 22) // 2, LV_WIDTH, 22)
         )
-        _make_label(self._lv_overlay_label, "Saving…", bold=True, size=15)
+        _make_label(self._lv_overlay_label, "Saving…", bold=False, size=13)
+        self._lv_overlay_label.setFont_(F_BUTTON)
         self._lv_overlay_label.setAlignment_(NSTextAlignmentCenter)
-        self._lv_overlay_label.setTextColor_(NSColor.whiteColor())
+        self._lv_overlay_label.setTextColor_(C_FG_PRIMARY)
         self._lv_overlay.addSubview_(self._lv_overlay_label)
 
-        # AF marker — a small yellow-amber reticle drawn on top of the
-        # LV showing the camera's current AF point. Added AFTER the
-        # _lv_overlay so it sits higher in z-order; we hide it
-        # explicitly whenever the overlay shows (the pause-state
-        # semantic is "stale info, don't trust this view"). Initial
-        # frame is placed at the LV centre as a sensible default
-        # until the first focus-point event arrives.
-        self._af_marker_view = NSView.alloc().initWithFrame_(
+        # ----- AF reticle (4 amber corner ticks) -------------------
+        self._af_marker_view = _build_corner_reticle()
+        self._af_marker_view.setFrame_(
             NSMakeRect(
-                lv_x + (LV_WIDTH - AF_MARKER_SIZE) // 2,
-                lv_y + (LV_HEIGHT - AF_MARKER_SIZE) // 2,
+                LV_X + (LV_WIDTH - AF_MARKER_SIZE) // 2,
+                LV_Y + (LV_HEIGHT - AF_MARKER_SIZE) // 2,
                 AF_MARKER_SIZE,
                 AF_MARKER_SIZE,
             )
         )
-        self._af_marker_view.setWantsLayer_(True)
-        marker_layer = self._af_marker_view.layer()
-        if marker_layer is not None:
-            marker_layer.setBorderColor_(
-                NSColor.colorWithCalibratedRed_green_blue_alpha_(
-                    1.0, 0.78, 0.0, 1.0
-                ).CGColor()
-            )
-            marker_layer.setBorderWidth_(2.0)
-            marker_layer.setBackgroundColor_(NSColor.clearColor().CGColor())
-            marker_layer.setCornerRadius_(2.0)
-        # Hidden until the first focus-point event lands — avoids a
-        # stray reticle at the LV centre before we know where the
-        # camera actually has its AF point.
+        # Hidden until a focus-point event lands — no stray reticle
+        # at the LV centre before we know where the camera is aimed.
         self._af_marker_view.setHidden_(True)
         content.addSubview_(self._af_marker_view)
 
-        # Staleness watchdog state — overlay shows when no LV frame
-        # arrived for ``_lv_stale_threshold_s``. At 10 fps target the
-        # frame interval is ~100 ms, so 500 ms is roughly "5 missed
-        # frames" — generous enough to not flash on a single hiccup.
+        # Staleness watchdog state — preserved verbatim from 3.9.
         self._lv_last_frame_at: float = 0.0
         self._lv_stale_threshold_s: float = 0.5
-        self._lv_stale_timer = None  # set in _install_lv_staleness_watch
+        self._lv_stale_timer = None
 
-        # Status indicator label (top of the controls area — LV viewport
-        # sits ABOVE this and uses its own y range so all existing
-        # widgets stay at their original on-panel coordinates).
-        self._status_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 38, PANEL_WIDTH - 24, 20)
+        # ----- Status row ------------------------------------------
+        # Dot (small coloured circle) + state label (left) + shot
+        # counter (right-aligned). All three sit on the same baseline.
+        dot_size = 8
+        dot_y = STATUS_Y + (STATUS_H - dot_size) // 2
+        self._status_dot = NSView.alloc().initWithFrame_(
+            NSMakeRect(LV_X, dot_y, dot_size, dot_size)
         )
-        _make_label(self._status_label, "● connecting…", bold=True, size=13)
+        self._status_dot.setWantsLayer_(True)
+        dot_layer = self._status_dot.layer()
+        if dot_layer is not None:
+            dot_layer.setBackgroundColor_(C_FG_TERTIARY.CGColor())
+            dot_layer.setCornerRadius_(dot_size / 2.0)
+        content.addSubview_(self._status_dot)
+
+        self._status_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(LV_X + dot_size + 8, STATUS_Y, 180, STATUS_H)
+        )
+        _make_label(self._status_label, "Connecting…")
+        self._status_label.setFont_(F_BODY)
+        self._status_label.setTextColor_(C_FG_PRIMARY)
         content.addSubview_(self._status_label)
 
-        # Session label
-        self._session_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 60, PANEL_WIDTH - 24, 18)
-        )
-        _make_label(self._session_label, f"Session: {self._daemon.session_name}", size=11)
-        self._session_label.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(self._session_label)
-
-        # Exposure dropdowns row 1: ISO + Shutter
-        # Each NSPopUpButton's menu is populated on first CanSetInfoEvent.
-        # Selection fires _dropdown_changed which queues a SetDataGroup
-        # write via the daemon; the UI is then re-synced from the
-        # subsequent ExposureEvent (no optimistic update).
-        iso_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 82, 28, 18)
-        )
-        _make_label(iso_caption, "ISO", size=10)
-        iso_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(iso_caption)
-        self._iso_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(42, CONTROLS_HEIGHT - 86, 110, 24), False
-        )
-        self._iso_dropdown.setTarget_(self)
-        self._iso_dropdown.setAction_("isoChanged:")
-        content.addSubview_(self._iso_dropdown)
-
-        ss_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(160, CONTROLS_HEIGHT - 82, 28, 18)
-        )
-        _make_label(ss_caption, "SS", size=10)
-        ss_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(ss_caption)
-        self._ss_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(186, CONTROLS_HEIGHT - 86, 122, 24), False
-        )
-        self._ss_dropdown.setTarget_(self)
-        self._ss_dropdown.setAction_("ssChanged:")
-        content.addSubview_(self._ss_dropdown)
-
-        # Exposure dropdowns row 2: Aperture + WB
-        av_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 110, 28, 18)
-        )
-        _make_label(av_caption, "Av", size=10)
-        av_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(av_caption)
-        self._av_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(42, CONTROLS_HEIGHT - 114, 110, 24), False
-        )
-        self._av_dropdown.setTarget_(self)
-        self._av_dropdown.setAction_("avChanged:")
-        content.addSubview_(self._av_dropdown)
-
-        wb_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(160, CONTROLS_HEIGHT - 110, 28, 18)
-        )
-        _make_label(wb_caption, "WB", size=10)
-        wb_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(wb_caption)
-        self._wb_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(186, CONTROLS_HEIGHT - 114, 122, 24), False
-        )
-        self._wb_dropdown.setTarget_(self)
-        self._wb_dropdown.setAction_("wbChanged:")
-        content.addSubview_(self._wb_dropdown)
-
-        # Exposure dropdowns row 3: Format (DG2.ImageQuality) + Size
-        # (DG2.Resolution). Same two-column layout + spacing as the
-        # first two rows. Both write through ``request_set_exposure
-        # (group=2, ...)`` so the existing read-back / re-emit cycle
-        # in the daemon validates whatever the camera actually accepts.
-        fmt_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 138, 36, 18)
-        )
-        _make_label(fmt_caption, "Fmt", size=10)
-        fmt_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(fmt_caption)
-        self._fmt_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(42, CONTROLS_HEIGHT - 142, 110, 24), False
-        )
-        self._fmt_dropdown.setTarget_(self)
-        self._fmt_dropdown.setAction_("fmtChanged:")
-        content.addSubview_(self._fmt_dropdown)
-
-        size_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(160, CONTROLS_HEIGHT - 138, 28, 18)
-        )
-        _make_label(size_caption, "Size", size=10)
-        size_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(size_caption)
-        self._size_dropdown = NSPopUpButton.alloc().initWithFrame_pullsDown_(
-            NSMakeRect(186, CONTROLS_HEIGHT - 142, 122, 24), False
-        )
-        self._size_dropdown.setTarget_(self)
-        self._size_dropdown.setAction_("sizeChanged:")
-        content.addSubview_(self._size_dropdown)
-
-        # Last-shot label
+        # Shot counter — right-aligned, mono digits, tertiary colour.
         self._shot_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, CONTROLS_HEIGHT - 166, PANEL_WIDTH - 24, 18)
+            NSMakeRect(LV_X + LV_WIDTH - 110, STATUS_Y, 110, STATUS_H)
         )
-        _make_label(self._shot_label, "No shots yet", size=11)
-        self._shot_label.setTextColor_(NSColor.secondaryLabelColor())
+        _make_label(self._shot_label, "0 shots")
+        self._shot_label.setFont_(F_NUMERIC)
+        self._shot_label.setTextColor_(C_FG_TERTIARY)
+        self._shot_label.setAlignment_(NSTextAlignmentRight)
         content.addSubview_(self._shot_label)
 
-        # CanSetInfo (allowed values) — captured on connect. Used to
-        # populate dropdowns and to bound the AF popover's coord mapping.
-        self._can_set_info = None
-        # Track latest exposure bytes so we can re-select the matching
-        # dropdown item without firing the action accidentally.
-        self._exposure_raw: dict[str, int] = {}
-        # Current AF point (for the on-LV marker). None ⇒ unknown.
-        self._focus_xy: tuple[int, int] | None = None
-        # Whether the user is currently changing a dropdown — guards
-        # against re-syncing-back during the action callback.
-        self._suppress_action = False
+        # ----- Exposure hero block ---------------------------------
+        # Top + bottom 1pt strokes; label row (uppercase) above value
+        # row (mono hero).
+        top_stroke = _make_stroke(LV_X, EXP_TOP_STROKE_Y, LV_WIDTH, C_STROKE_SUBTLE)
+        content.addSubview_(top_stroke)
+        bot_stroke = _make_stroke(LV_X, EXP_BOT_STROKE_Y, LV_WIDTH, C_STROKE_SUBTLE)
+        content.addSubview_(bot_stroke)
 
-        # Item row: "Item:" label + editable text field.
-        # Typing here changes ``{item}`` in the filename template and resets
-        # the per-item shot counter to 1 on the next shot.
-        item_caption = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, 96, 40, 22)
+        # 3-column grid — equal widths, no gutters (the label/value
+        # alignment carries the visual rhythm).
+        col_w = LV_WIDTH // 3  # 96
+        col_xs = [LV_X, LV_X + col_w, LV_X + 2 * col_w]
+
+        # Uppercase labels
+        for col_x, text in zip(col_xs, ("ISO", "SHUTTER", "AV")):
+            lbl = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(col_x, EXP_LABEL_Y, col_w, EXP_LABEL_H)
+            )
+            _make_label(lbl, text)
+            lbl.setAttributedStringValue_(
+                _uppercase_attr(text, C_FG_SECONDARY, font=F_LABEL, tracking=1.0,
+                                alignment=NSTextAlignmentCenter)
+            )
+            content.addSubview_(lbl)
+
+        # Hero popups (bezel-less, centred, mono 18pt bold).
+        self._iso_dropdown = _make_hero_popup(
+            col_xs[0], EXP_VALUE_Y, col_w, EXP_VALUE_H, self, "isoChanged:"
         )
-        _make_label(item_caption, "Item:", size=11)
-        item_caption.setTextColor_(NSColor.secondaryLabelColor())
-        content.addSubview_(item_caption)
+        content.addSubview_(self._iso_dropdown)
+        self._ss_dropdown = _make_hero_popup(
+            col_xs[1], EXP_VALUE_Y, col_w, EXP_VALUE_H, self, "ssChanged:"
+        )
+        content.addSubview_(self._ss_dropdown)
+        self._av_dropdown = _make_hero_popup(
+            col_xs[2], EXP_VALUE_Y, col_w, EXP_VALUE_H, self, "avChanged:"
+        )
+        content.addSubview_(self._av_dropdown)
 
+        # ----- Secondary row (WB / Format / Size) ------------------
+        sec_gap = 6
+        sec_w = (LV_WIDTH - 2 * sec_gap) // 3  # 92
+        sec_xs = [
+            LV_X,
+            LV_X + sec_w + sec_gap,
+            LV_X + 2 * (sec_w + sec_gap),
+        ]
+        self._wb_dropdown = _make_secondary_popup(
+            sec_xs[0], SEC_Y, sec_w, SEC_H, self, "wbChanged:"
+        )
+        content.addSubview_(self._wb_dropdown)
+        self._fmt_dropdown = _make_secondary_popup(
+            sec_xs[1], SEC_Y, sec_w, SEC_H, self, "fmtChanged:"
+        )
+        content.addSubview_(self._fmt_dropdown)
+        self._size_dropdown = _make_secondary_popup(
+            sec_xs[2], SEC_Y, sec_w, SEC_H, self, "sizeChanged:"
+        )
+        content.addSubview_(self._size_dropdown)
+
+        # ----- Subject field ---------------------------------------
+        # Dark inset, rounded, with a placeholder reading "Subject" so
+        # the field self-describes without needing a separate label.
         self._item_field = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(56, 94, PANEL_WIDTH - 68, 22)
+            NSMakeRect(LV_X, SUB_Y, LV_WIDTH, SUB_H)
         )
         self._item_field.setStringValue_(self._daemon.current_item)
-        self._item_field.setFont_(NSFont.systemFontOfSize_(12))
-        self._item_field.setBezeled_(True)
+        self._item_field.setFont_(F_BODY)
+        self._item_field.setTextColor_(C_FG_PRIMARY)
+        self._item_field.setBezeled_(False)
+        self._item_field.setDrawsBackground_(False)
         self._item_field.setEditable_(True)
         self._item_field.setSelectable_(True)
-        # Fires on Return / Enter — commits text to the daemon.
+        self._item_field.setWantsLayer_(True)
+        sub_layer = self._item_field.layer()
+        if sub_layer is not None:
+            sub_layer.setBackgroundColor_(C_BG_INPUT.CGColor())
+            sub_layer.setBorderColor_(C_STROKE_DEFAULT.CGColor())
+            sub_layer.setBorderWidth_(1.0)
+            sub_layer.setCornerRadius_(4.0)
+        # Placeholder ("Subject") + uppercase label feel — use
+        # attributedPlaceholderString for the empty state.
+        self._item_field.cell().setPlaceholderAttributedString_(
+            _uppercase_attr(
+                "Subject", C_FG_TERTIARY, font=F_LABEL, tracking=1.0,
+                alignment=NSTextAlignmentLeft,
+            )
+        )
+        # Inset the text a few pt so the value doesn't touch the
+        # rounded border. NSTextFieldCell doesn't expose padding
+        # directly, but a small left content inset is supported via
+        # the cell's wraps + line-break + a focus-ring style; the
+        # simplest pragmatic move is to leave the default ~2pt
+        # padding the cell already applies under non-bezeled mode.
         self._item_field.setTarget_(self)
         self._item_field.setAction_("itemCommitted:")
         content.addSubview_(self._item_field)
 
-        # Shoot button
-        self._shoot_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(12, 58, 80, 28)
+        # ----- Buttons (Shoot 2/3 + AF 1/3) ------------------------
+        self._shoot_btn = _make_amber_button(
+            NSMakeRect(LV_X, BTN_Y, SHOOT_W, BTN_H),
+            "Shoot",
+            target=self,
+            action="shootClicked:",
         )
-        self._shoot_btn.setTitle_("Shoot ⎵")
-        self._shoot_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._shoot_btn.setTarget_(self)
-        self._shoot_btn.setAction_("shootClicked:")
         content.addSubview_(self._shoot_btn)
 
-        # AF button (drive AF only, no capture — SnapCommand mode 3).
-        # Phase 3.9 (2026-05-13): widened to fill the slot vacated by
-        # the removed "AF Point ⊞" popover button — AF point is now
-        # set by clicking on the LV, with the current point shown as
-        # a yellow reticle (see _af_marker_view).
-        self._af_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(98, 58, 132, 28)
+        self._af_btn = _make_dark_button(
+            NSMakeRect(LV_X + SHOOT_W + BTN_GAP, BTN_Y, AF_W, BTN_H),
+            "AF",
+            target=self,
+            action="afClicked:",
         )
-        self._af_btn.setTitle_("AF")
-        self._af_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._af_btn.setTarget_(self)
-        self._af_btn.setAction_("afClicked:")
         content.addSubview_(self._af_btn)
 
-        # Bottom row: New Session + Stop
-        self._new_session_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(12, 28, 72, 26)
+        # ----- Footer hint -----------------------------------------
+        self._hint_label = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(LV_X, HINT_Y, LV_WIDTH, HINT_H)
         )
-        self._new_session_btn.setTitle_("New…")
-        self._new_session_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._new_session_btn.setTarget_(self)
-        self._new_session_btn.setAction_("newSessionClicked:")
-        content.addSubview_(self._new_session_btn)
+        _make_label(self._hint_label, "")
+        self._hint_label.setFont_(F_HINT)
+        self._hint_label.setTextColor_(C_FG_TERTIARY)
+        self._hint_label.setAlignment_(NSTextAlignmentCenter)
+        self._hint_label.setStringValue_("␣ shoot · A focus · ⌘Q quit")
+        content.addSubview_(self._hint_label)
 
-        self._quit_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(248, 28, 60, 26)
-        )
-        self._quit_btn.setTitle_("Stop")
-        self._quit_btn.setBezelStyle_(NSBezelStyleRounded)
-        self._quit_btn.setTarget_(self)
-        self._quit_btn.setAction_("quitClicked:")
-        content.addSubview_(self._quit_btn)
-
-        # Hint footer
-        hint = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(12, 6, PANEL_WIDTH - 24, 16)
-        )
-        _make_label(hint, "Space = shoot  •  A = AF  •  ⌘Q = quit", size=10)
-        hint.setTextColor_(NSColor.tertiaryLabelColor())
-        content.addSubview_(hint)
+        # ----- internal state --------------------------------------
+        self._can_set_info = None
+        self._exposure_raw: dict[str, int] = {}
+        self._focus_xy: tuple[int, int] | None = None
+        self._suppress_action = False
+        # Latest shot count — driven by updateShot_.
+        self._shot_count = 0
 
         panel.orderFrontRegardless()
         self._panel = panel
@@ -583,71 +652,70 @@ class FloatingTetherPanel(NSObject):
 
     @objc.signature(b"v@:@")
     def updateStatus_(self, tup) -> None:
-        state, message = tup
-        symbol = {
-            "connecting": "○",
-            "initializing": "◐",
-            "ready": "●",
-            "shooting": "◉",
-            "downloading": "◑",
-            "recovering": "◍",
-            "error": "✕",
-            "stopped": "○",
-            "disconnected": "✕",
-            "focusing": "◐",
-        }.get(state, "●")
-        text = f"{symbol} {state}"
-        if message:
-            text += f"  —  {message}"
-        self._status_label.setStringValue_(text)
+        """Drive the status-row dot + label + per-state visual treatment.
 
-        # Colour priority: ready=green, error/disconnected=red,
-        # recovering=yellow (mid-wake-up), everything else=label colour.
-        if state == "ready":
-            color = NSColor.systemGreenColor()
-        elif state in ("error", "disconnected"):
-            color = NSColor.systemRedColor()
-        elif state == "recovering":
-            color = NSColor.systemYellowColor()
-        else:
-            color = NSColor.labelColor()
-        self._status_label.setTextColor_(color)
-
-        # ----- Fix 4: dim controls during commit window -----
-        # shooting / downloading / recovering = camera is mid-cycle
-        # or quiet, button presses just queue. ready / error /
-        # stopped / disconnected = safe to interact again. Other
-        # states (connecting / initializing / focusing) leave the
-        # current dim state alone — focusing is sub-second so we
-        # don't flash on every AF.
-        #
-        # Phase 3.6 (2026-05-13): "recovering" added to the busy set
-        # so the LV overlay forces up and dropdowns gray out while
-        # _passive_idle_wait is running. Without this the user sees
-        # a stale LV frame and can keep mashing buttons into a
-        # half-stalled endpoint.
-        if state in ("shooting", "downloading", "recovering"):
-            self._set_controls_busy(True)
-        elif state in ("ready", "error", "stopped", "disconnected"):
-            self._set_controls_busy(False)
-
-    def _set_controls_busy(self, busy: bool) -> None:
-        """Toggle interactive controls based on capture-busy state.
-
-        Disables Shoot / AF + all six exposure dropdowns when
-        ``busy=True`` (state in shooting/downloading) and re-enables
-        them on ``busy=False``. Also force-shows the LV overlay
-        during busy so the user sees "Saving…" instantly instead of
-        waiting ~500 ms for the staleness watchdog, and hides the
-        AF reticle (its position info is stale until LV resumes).
-
-        When un-busying, we DON'T force-hide the overlay — the
-        staleness watchdog still owns the post-snap visual transition
-        (overlay stays until a fresh LV frame lands, which is the
-        right "camera is back online" cue).
+        Maps the daemon's state name through STATUS_PRESETS to (dot
+        colour, display text), then flips the busy gate (which owns
+        the opacity treatment + LV overlay) for capture-cycle states.
+        Unknown / transient states fall back to a neutral preset so
+        the UI never shows the raw machine name to the user.
         """
-        if self._controls_busy == busy:
-            return
+        state, message = tup
+        dot_color, label_text = STATUS_PRESETS.get(
+            state, (C_FG_TERTIARY, state.title() if state else "—")
+        )
+        self._status_label.setStringValue_(label_text)
+        self._status_label.setTextColor_(C_FG_PRIMARY)
+        dot_layer = self._status_dot.layer()
+        if dot_layer is not None:
+            dot_layer.setBackgroundColor_(dot_color.CGColor())
+
+        # Busy gate — shooting / downloading / recovering all dim
+        # the controls and force the LV overlay. Phase 3.10 also
+        # rewrites the hint footer with per-state guidance.
+        if state in ("shooting", "downloading", "recovering"):
+            self._set_controls_busy(True, state=state)
+        elif state in ("ready", "error", "stopped", "disconnected"):
+            self._set_controls_busy(False, state=state)
+        else:
+            # Transient states (focusing, connecting, initializing) —
+            # keep current dim state, just refresh the hint label.
+            self._refresh_hint(state)
+
+    def _refresh_hint(self, state: str) -> None:
+        """Update the footer hint per state.
+
+        Default reads ``␣ shoot · A focus · ⌘Q quit`` (the keymap).
+        During capture / recovery it switches to a guidance string.
+        """
+        if state in ("shooting", "downloading"):
+            text = "Camera busy — release space to wait"
+            color = C_STATE_BUSY
+        elif state == "recovering":
+            text = "Settings preserved · auto-resume"
+            color = C_STATE_RECOVER
+        elif state == "error" or state == "disconnected":
+            text = "Quit and relaunch after power cycle"
+            color = C_STATE_ERROR
+        else:
+            text = "␣ shoot · A focus · ⌘Q quit"
+            color = C_FG_TERTIARY
+        self._hint_label.setStringValue_(text)
+        self._hint_label.setTextColor_(color)
+
+    def _set_controls_busy(self, busy: bool, *, state: str = "") -> None:
+        """Toggle interactive controls + per-state opacity per Phase 3.10.
+
+        Beyond the original enable/disable + force-overlay behaviour,
+        this method now dims the exposure block, secondary row, and
+        subject field per the spec opacity table (0.4 during capture,
+        0.3 during recovery). Hint text is rewritten via _refresh_hint
+        so the footer carries state guidance instead of the keymap.
+
+        When un-busying, opacity returns to 1.0; the LV overlay is
+        NOT force-hidden (the staleness watchdog owns that transition
+        — overlay stays until a fresh frame lands).
+        """
         self._controls_busy = busy
         enabled = not busy
         for btn in (self._shoot_btn, self._af_btn):
@@ -661,6 +729,37 @@ class FloatingTetherPanel(NSObject):
             self._size_dropdown,
         ):
             dd.setEnabled_(enabled)
+
+        # Per-state opacity treatment. Lists which views get dimmed
+        # together — the LV stays fully visible (its overlay carries
+        # the "Saving…" cue), and the status row stays sharp so the
+        # state itself remains legible.
+        dim_views = (
+            self._iso_dropdown,
+            self._ss_dropdown,
+            self._av_dropdown,
+            self._wb_dropdown,
+            self._fmt_dropdown,
+            self._size_dropdown,
+            self._item_field,
+            self._shoot_btn,
+            self._af_btn,
+        )
+        if state == "recovering":
+            alpha = 0.3
+        elif state in ("shooting", "downloading"):
+            alpha = 0.4
+        else:
+            alpha = 1.0
+        for v in dim_views:
+            try:
+                v.setAlphaValue_(alpha)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Hint footer per state.
+        self._refresh_hint(state)
+
         if busy:
             # Force the overlay up immediately so the user gets
             # feedback without waiting for the 500 ms staleness
@@ -671,12 +770,17 @@ class FloatingTetherPanel(NSObject):
 
     @objc.signature(b"v@:@")
     def updateShot_(self, tup) -> None:
-        idx, name, size, mbps = tup
-        size_mb = size / 1024 / 1024
-        self._shot_label.setStringValue_(
-            f"#{idx}  {name}  ·  {size_mb:.1f} MB  ·  {mbps:.1f} MB/s"
-        )
-        self._shot_label.setTextColor_(NSColor.labelColor())
+        """Bump the right-aligned shot counter in the status row.
+
+        The per-shot detail (filename / size / speed) is dropped from
+        the default view per the v2 mockup — only the count remains.
+        The detail still flows through the daemon's structured log.
+        """
+        idx, _name, _size, _mbps = tup
+        self._shot_count = max(int(idx), self._shot_count + 1)
+        plural = "shot" if self._shot_count == 1 else "shots"
+        self._shot_label.setStringValue_(f"{self._shot_count} {plural}")
+        self._shot_label.setTextColor_(C_FG_SECONDARY)
 
     @objc.signature(b"v@:@")
     def updateExposure_(self, tup) -> None:
@@ -827,11 +931,9 @@ class FloatingTetherPanel(NSObject):
         ny = (cam_y - y_min) / max(1, (y_max - y_min))
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
-        # LV frame origin in superview coords:
-        lv_x = (PANEL_WIDTH - LV_WIDTH) // 2
-        lv_y = CONTROLS_HEIGHT + LV_PAD_BOTTOM
-        vx = lv_x + nx * LV_WIDTH
-        vy = lv_y + (1.0 - ny) * LV_HEIGHT  # flip Y
+        # LV frame origin in panel content-view coords (Phase 3.10 layout)
+        vx = LV_X + nx * LV_WIDTH
+        vy = LV_Y + (1.0 - ny) * LV_HEIGHT  # flip Y (AppKit Y goes up)
         return vx, vy
 
     @objc.signature(b"v@:@")
@@ -1045,13 +1147,25 @@ class FloatingTetherPanel(NSObject):
         if response == NSAlertFirstButtonReturn:
             name = str(input_field.stringValue())
             self._daemon.start_new_session(name)
-            # Update the session label so the user sees confirmation
-            self._session_label.setStringValue_(
-                f"Session: {self._daemon.session_name}"
-            )
-            # Reset shot label since counter restarts
-            self._shot_label.setStringValue_("No shots yet")
-            self._shot_label.setTextColor_(NSColor.secondaryLabelColor())
+            # Reset shot counter since the session restarts.
+            self._shot_count = 0
+            self._shot_label.setStringValue_("0 shots")
+            self._shot_label.setTextColor_(C_FG_TERTIARY)
+
+    # --- panel delegate -----------------------------------------------
+
+    def windowShouldClose_(self, sender) -> bool:
+        """Wire the panel's close button (×) → graceful daemon shutdown.
+
+        Returning False keeps AppKit from auto-closing the window mid-
+        shutdown; ``self.stop()`` calls panel.close() + app.terminate_
+        in the right order.
+        """
+        try:
+            self.stop()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("stop() raised from windowShouldClose_: %s", e)
+        return False
 
     @objc.signature(b"v@:@")
     def itemCommitted_(self, sender) -> None:
@@ -1217,6 +1331,206 @@ def _make_label(field: NSTextField, text: str, *, bold: bool = False, size: floa
         field.setFont_(NSFont.boldSystemFontOfSize_(size))
     else:
         field.setFont_(NSFont.systemFontOfSize_(size))
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.10 helpers — corner-tick reticle, attributed strings, styled
+# buttons / popups. All return ready-to-add NSViews so _build_window
+# reads as widget placement rather than configuration.
+# ---------------------------------------------------------------------------
+
+
+def _make_stroke(x: float, y: float, width: float, color) -> "NSView":
+    """Return a 1pt horizontal stroke view (used for exposure dividers)."""
+    v = NSView.alloc().initWithFrame_(NSMakeRect(x, y, width, 1))
+    v.setWantsLayer_(True)
+    v.layer().setBackgroundColor_(color.CGColor())
+    return v
+
+
+def _uppercase_attr(
+    text: str,
+    color,
+    *,
+    font=None,
+    tracking: float = 1.0,
+    alignment=None,
+) -> "NSAttributedString":
+    """Build an uppercase, slightly-tracked attributed string.
+
+    Used for the small ISO/SHUTTER/AV labels above the hero values and
+    for the Subject field placeholder.
+    """
+    if font is None:
+        font = F_LABEL
+    style = NSMutableParagraphStyle.alloc().init()
+    if alignment is not None:
+        style.setAlignment_(alignment)
+    attrs = {
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
+        NSKernAttributeName: tracking,
+        NSParagraphStyleAttributeName: style,
+    }
+    return NSAttributedString.alloc().initWithString_attributes_(
+        text.upper(), attrs
+    )
+
+
+def _button_title_attr(
+    text: str,
+    color,
+    *,
+    font=None,
+    alignment=None,
+) -> "NSAttributedString":
+    """Build a centred button-title attributed string (no uppercase)."""
+    if font is None:
+        font = F_BUTTON
+    style = NSMutableParagraphStyle.alloc().init()
+    if alignment is not None:
+        style.setAlignment_(alignment)
+    attrs = {
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: color,
+        NSParagraphStyleAttributeName: style,
+    }
+    return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+
+
+def _build_corner_reticle(
+    size: int = AF_MARKER_SIZE,
+    arm: int = AF_TICK_ARM,
+    stroke: float = AF_TICK_STROKE,
+    color=None,
+) -> "NSView":
+    """4 amber L-shape corner ticks, drawn as 8 thin sub-NSViews.
+
+    Visually identical to the CAShapeLayer approach in the spec, but
+    skips the NSBezierPath → CGPath conversion. Each "L" is two thin
+    rectangles (one horizontal arm, one vertical arm) anchored to the
+    corresponding corner.
+    """
+    col = color if color is not None else C_AMBER
+    container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, size, size))
+    container.setWantsLayer_(True)
+    container.layer().setBackgroundColor_(NSColor.clearColor().CGColor())
+
+    s = stroke
+    # In AppKit y goes up, so y≈0 is the BOTTOM of the view.
+    rects = [
+        # bottom-left L
+        (0, 0, arm, s),  (0, 0, s, arm),
+        # bottom-right L
+        (size - arm, 0, arm, s),  (size - s, 0, s, arm),
+        # top-left L
+        (0, size - s, arm, s),  (0, size - arm, s, arm),
+        # top-right L
+        (size - arm, size - s, arm, s),  (size - s, size - arm, s, arm),
+    ]
+    for x, y, w, h in rects:
+        tick = NSView.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+        tick.setWantsLayer_(True)
+        tick.layer().setBackgroundColor_(col.CGColor())
+        container.addSubview_(tick)
+    return container
+
+
+def _make_hero_popup(
+    x: float, y: float, w: float, h: float, target, action: str
+) -> "NSPopUpButton":
+    """ISO / SHUTTER / AV hero popup — bezel-less, centred, mono 18pt bold.
+
+    The selected menu-item title is what gets drawn as the value.
+    Setting font on the button (and centred paragraph alignment via the
+    cell) makes the popup render as a static-looking hero number; the
+    click still pops the menu, so the affordance is intact.
+    """
+    btn = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+        NSMakeRect(x, y, w, h), False
+    )
+    btn.setBordered_(False)
+    btn.setFont_(F_HERO)
+    try:
+        btn.cell().setArrowPosition_(_NS_POPUP_NO_ARROW)
+    except Exception:  # noqa: BLE001
+        pass
+    cell = btn.cell()
+    if cell is not None:
+        try:
+            cell.setAlignment_(NSTextAlignmentCenter)
+        except Exception:  # noqa: BLE001
+            pass
+    btn.setTarget_(target)
+    btn.setAction_(action)
+    return btn
+
+
+def _make_secondary_popup(
+    x: float, y: float, w: float, h: float, target, action: str
+) -> "NSPopUpButton":
+    """Compact dropdown for the WB / Format / Size row.
+
+    Layer-backed dark background with a 1pt subtle stroke and rounded
+    corners. The selected-item title renders in F_BODY (12pt).
+    """
+    btn = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+        NSMakeRect(x, y, w, h), False
+    )
+    btn.setBordered_(False)
+    btn.setFont_(F_BODY)
+    btn.setWantsLayer_(True)
+    layer = btn.layer()
+    if layer is not None:
+        layer.setBackgroundColor_(C_BG_ELEVATED.CGColor())
+        layer.setBorderColor_(C_STROKE_DEFAULT.CGColor())
+        layer.setBorderWidth_(1.0)
+        layer.setCornerRadius_(4.0)
+    btn.setTarget_(target)
+    btn.setAction_(action)
+    return btn
+
+
+def _make_amber_button(
+    rect, title: str, *, target, action: str
+) -> "NSButton":
+    """Amber-filled primary action button (Shoot)."""
+    btn = NSButton.alloc().initWithFrame_(rect)
+    btn.setBordered_(False)
+    btn.setTitle_(title)
+    btn.setWantsLayer_(True)
+    layer = btn.layer()
+    if layer is not None:
+        layer.setBackgroundColor_(C_AMBER.CGColor())
+        layer.setCornerRadius_(4.0)
+    btn.setAttributedTitle_(
+        _button_title_attr(title, C_FG_INVERSE, alignment=NSTextAlignmentCenter)
+    )
+    btn.setTarget_(target)
+    btn.setAction_(action)
+    return btn
+
+
+def _make_dark_button(
+    rect, title: str, *, target, action: str
+) -> "NSButton":
+    """Dark-elevated secondary action button (AF)."""
+    btn = NSButton.alloc().initWithFrame_(rect)
+    btn.setBordered_(False)
+    btn.setTitle_(title)
+    btn.setWantsLayer_(True)
+    layer = btn.layer()
+    if layer is not None:
+        layer.setBackgroundColor_(C_BG_ELEVATED.CGColor())
+        layer.setBorderColor_(C_STROKE_DEFAULT.CGColor())
+        layer.setBorderWidth_(1.0)
+        layer.setCornerRadius_(4.0)
+    btn.setAttributedTitle_(
+        _button_title_attr(title, C_FG_PRIMARY, alignment=NSTextAlignmentCenter)
+    )
+    btn.setTarget_(target)
+    btn.setAction_(action)
+    return btn
 
 
 # ---------------------------------------------------------------------------
