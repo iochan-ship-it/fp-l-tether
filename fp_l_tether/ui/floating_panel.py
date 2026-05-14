@@ -497,10 +497,47 @@ class FloatingTetherPanel(NSObject):
         content.addSubview_(self._size_dropdown)
 
         # ----- Subject field ---------------------------------------
-        # Dark inset, rounded, with a placeholder reading "Subject" so
-        # the field self-describes without needing a separate label.
-        self._item_field = NSTextField.alloc().initWithFrame_(
+        # Composite: a dark inset container holds an inline uppercase
+        # "SUBJECT" label (left) and the editable text field (right),
+        # both vertically centred so the value doesn't hang in the
+        # top-left corner of an empty-looking box.
+        sub_container = NSView.alloc().initWithFrame_(
             NSMakeRect(LV_X, SUB_Y, LV_WIDTH, SUB_H)
+        )
+        sub_container.setWantsLayer_(True)
+        sub_layer = sub_container.layer()
+        if sub_layer is not None:
+            sub_layer.setBackgroundColor_(C_BG_INPUT.CGColor())
+            sub_layer.setBorderColor_(C_STROKE_DEFAULT.CGColor())
+            sub_layer.setBorderWidth_(1.0)
+            sub_layer.setCornerRadius_(4.0)
+
+        # Inline "SUBJECT" label — non-editable, uppercase, tertiary
+        SUB_PAD_X = 10
+        SUB_LABEL_W = 58   # enough for "SUBJECT" at F_LABEL with tracking
+        SUB_GAP = 10
+        SUB_TEXT_H = 16    # single-line height for F_BODY (12pt)
+        sub_text_y = (SUB_H - SUB_TEXT_H) / 2   # vertical centre
+        sub_caption = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(SUB_PAD_X, sub_text_y, SUB_LABEL_W, SUB_TEXT_H)
+        )
+        sub_caption.setAttributedStringValue_(
+            _uppercase_attr(
+                "Subject", C_FG_TERTIARY, font=F_LABEL, tracking=1.0,
+                alignment=NSTextAlignmentLeft,
+            )
+        )
+        sub_caption.setBezeled_(False)
+        sub_caption.setDrawsBackground_(False)
+        sub_caption.setEditable_(False)
+        sub_caption.setSelectable_(False)
+        sub_container.addSubview_(sub_caption)
+
+        # Editable text field — centred next to the label
+        edit_x = SUB_PAD_X + SUB_LABEL_W + SUB_GAP
+        edit_w = LV_WIDTH - edit_x - SUB_PAD_X
+        self._item_field = NSTextField.alloc().initWithFrame_(
+            NSMakeRect(edit_x, sub_text_y, edit_w, SUB_TEXT_H)
         )
         self._item_field.setStringValue_(self._daemon.current_item)
         self._item_field.setFont_(F_BODY)
@@ -509,30 +546,11 @@ class FloatingTetherPanel(NSObject):
         self._item_field.setDrawsBackground_(False)
         self._item_field.setEditable_(True)
         self._item_field.setSelectable_(True)
-        self._item_field.setWantsLayer_(True)
-        sub_layer = self._item_field.layer()
-        if sub_layer is not None:
-            sub_layer.setBackgroundColor_(C_BG_INPUT.CGColor())
-            sub_layer.setBorderColor_(C_STROKE_DEFAULT.CGColor())
-            sub_layer.setBorderWidth_(1.0)
-            sub_layer.setCornerRadius_(4.0)
-        # Placeholder ("Subject") + uppercase label feel — use
-        # attributedPlaceholderString for the empty state.
-        self._item_field.cell().setPlaceholderAttributedString_(
-            _uppercase_attr(
-                "Subject", C_FG_TERTIARY, font=F_LABEL, tracking=1.0,
-                alignment=NSTextAlignmentLeft,
-            )
-        )
-        # Inset the text a few pt so the value doesn't touch the
-        # rounded border. NSTextFieldCell doesn't expose padding
-        # directly, but a small left content inset is supported via
-        # the cell's wraps + line-break + a focus-ring style; the
-        # simplest pragmatic move is to leave the default ~2pt
-        # padding the cell already applies under non-bezeled mode.
         self._item_field.setTarget_(self)
         self._item_field.setAction_("itemCommitted:")
-        content.addSubview_(self._item_field)
+        sub_container.addSubview_(self._item_field)
+
+        content.addSubview_(sub_container)
 
         # ----- Buttons (Shoot 2/3 + AF 1/3) ------------------------
         self._shoot_btn = _make_amber_button(
