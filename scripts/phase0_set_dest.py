@@ -14,7 +14,7 @@ This script:
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_set_dest.py
 """
 
@@ -39,7 +39,7 @@ from fp_l_tether.camera.usb_bridge import (  # noqa: E402
 )
 
 
-# SgmDataGroup3 layout (18 bytes total per SDK header):
+# SgmDataGroup3 layout (18 bytes total — empirically observed on fp L):
 #  off  size  field
 #  0    1     FieldPresent1   (bits 0-7 select fields 1-8)
 #  1    1     FieldPresent2   (bits 0-7 select fields 9-16)

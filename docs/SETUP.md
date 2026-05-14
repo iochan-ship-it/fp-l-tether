@@ -102,19 +102,20 @@ Auto Power Off を OFF にしておくことを強く推奨:
   `sigma_set_datagroup_3_pc_capture` で再起動を試みる
   （panel の status は黄色 `◍ recovering` で表示）
 
-商用ソフト（Capture One 等）も内部で同等の keep-alive を持っているため、
-本機の仕様レベルで必要な対策です。
+これは fp L 本体の仕様レベルで必要な対策です（テザー用途では keep-alive
+を出し続けるか、本体側の Auto Power Off を OFF にしておくのが安全）。
 
 ---
 
 ## 5. 干渉する他アプリを終了
 
-以下のアプリは Sigma fp L の PTP セッションを掴むので、本アプリ実行中は終了しておくこと:
+他のテザー / カメラ取り込みアプリが Sigma fp L の PTP セッションを掴むと
+本アプリは接続できません。同時に動かさないでください:
 
-- **Capture One**
 - **イメージキャプチャ.app** (macOS 標準)
 - **Photos.app**（自動起動設定になっている場合）
-- **Lightroom Classic** の Tether ウィンドウ（Lightroom 自体は OK）
+- **Lightroom Classic** の Tether ウィンドウ（Lightroom 本体は OK）
+- その他のサードパーティ製テザー / PTP クライアント
 
 Photos.app が勝手に起動する場合の対策:
 1. イメージキャプチャ.app を一度起動
@@ -159,7 +160,7 @@ echo 'alias clip="pbcopy"' >> ~/.zshrc
 | `ModuleNotFoundError: No module named 'ImageCaptureCore'` | `pip install pyobjc-framework-ImageCaptureCore` を再実行 |
 | `MacOSOnlyError` | macOS で実行しているか確認 |
 | カメラが列挙されない | USB モードと電源、ケーブル、他アプリ終了をチェック |
-| PTP セッションが開けない | Capture One / イメージキャプチャ.app を完全終了 |
+| PTP セッションが開けない | 他のテザー / イメージキャプチャ.app を完全終了 |
 | シャッターが切れない（SnapCommand失敗） | カメラの「PC接続時の動作」設定を確認、FW v3.0 以降に更新 |
 
 詳しくは `docs/TROUBLESHOOTING.md` を参照。

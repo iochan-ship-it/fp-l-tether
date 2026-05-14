@@ -69,7 +69,7 @@ def main() -> int:
         print("  2. Is the USB-C cable connected to the Mac?")
         print("  3. Is the camera's USB mode set to 'Camera Control'?")
         print("     (Mass Storage and UVC modes are NOT supported by this app.)")
-        print("  4. Is another app (Capture One, Image Capture.app) "
+        print("  4. Is another tether or PTP client (Image Capture.app, etc.) "
               "holding the camera? Quit it first.")
         print("  5. macOS Privacy & Security: any prompts pending?")
         return 1

@@ -118,8 +118,8 @@ class CameraConfig(BaseModel):
     # across the PC tether handshake. The fp / fp L's well-known
     # behaviour is that switching to PC capture mode overwrites
     # several user fields (DriveMode, SpecialMode, FlashMode, possibly
-    # others) with hard-coded defaults — Capture One also has this
-    # issue. We work around it by reading DG1+DG2 right after
+    # others) with hard-coded defaults at the firmware level. We
+    # work around it by reading DG1+DG2 right after
     # open_session, running the normal sigma_init, then replaying
     # the saved fields via the per-field SetCamDataGroup setters.
     #

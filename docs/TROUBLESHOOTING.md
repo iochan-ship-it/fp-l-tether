@@ -9,7 +9,7 @@
 ### `No cameras detected` (Phase 0-A で失敗)
 
 1. **USB モードが "Mass Storage" になっている** → 設定し直す（接続前に変更）
-2. **Camera Control モードだが他アプリが掴んでいる** → イメージキャプチャ.app / Capture One / Lightroom Tether 終了
+2. **Camera Control モードだが他アプリが掴んでいる** → イメージキャプチャ.app / 他のテザー / Lightroom Tether 終了
 3. **USB ケーブルが充電専用** → データ通信対応 USB-C ケーブルを使う
 4. **USB ハブ経由で電力不足** → Mac に直結、または給電付きハブ
 5. **macOS のプライバシー許可未付与** → 設定 → プライバシーとセキュリティ → カメラ で Terminal / Claude Code を ON
@@ -103,7 +103,9 @@ fp L の DNG は ~100MB。USB 3.1 Gen 1 (5Gbps) の実効速度で 1 枚あた�
 
 ## 設定リセット問題（fp L 既知）
 
-Capture One 接続時に「シャッタースピード・WB・露出が勝手に変わる」現象。本アプリでも発生する可能性あり。
+USB 再接続のたびに「シャッタースピード・WB・露出が初期値に戻る」現象が
+fp L 本体側の挙動として知られています。本アプリは persistent settings
+cache を使って (再)接続時に直前の値を書き戻しますが、念のため:
 
 回避:
 - `config.toml` の `debug.detect_setting_reset = true` で警告を有効化

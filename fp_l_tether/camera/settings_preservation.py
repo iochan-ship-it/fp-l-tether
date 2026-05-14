@@ -1,7 +1,7 @@
 """Preserve camera-side user settings across PC tether handshake.
 
 The Sigma fp / fp L's documented behaviour, confirmed by community
-reports against both Capture One and gphoto2: switching the camera
+reports and our own observation: switching the camera
 into PC capture mode overwrites several user-settable fields with
 hard-coded defaults baked into the firmware's "PC mode" template.
 

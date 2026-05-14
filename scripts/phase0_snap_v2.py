@@ -4,9 +4,9 @@
 The first variant pass (phase0_snap_variants.py) tried different 3rd-byte
 values in the SgmSnapState data, all returning 0x201D (InvalidParameter).
 This script tries DIFFERENT PTP COMMAND PARAMETERS instead, based on
-Windows SDK trace patterns:
+public PTP trace patterns:
 
-  Windows trace: ``0x00 0x00 0x00 0x00 0x04 0x00 0x00 0x00 0x02 0x02 0x01``
+  Reference trace: ``0x00 0x00 0x00 0x00 0x04 0x00 0x00 0x00 0x02 0x02 0x01``
   Re-interpretation:
     command params: (0, 4)   ← param1=0, param2=4 (= data length?)
     data phase: ``02 02 01 05`` (struct + external checksum, no length prefix)
@@ -15,7 +15,7 @@ We also try variants without an inner length prefix wrapping the struct.
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_snap_v2.py
 """
 

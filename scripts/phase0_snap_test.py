@@ -107,7 +107,7 @@ def download_dng(session: "Camera", image_id: int, expected_size: int) -> bytes:
         remaining = expected_size - offset
         this_chunk = min(CHUNK_SIZE, remaining)
 
-        # GetBigPartialPictFile parameters (from SDK signature):
+        # GetBigPartialPictFile parameters (best-effort signature):
         #   param1 = data pointer (from GetPictFileInfo2)
         #   param2 = start offset (uint64, low 32 bits as param2, high 32 as param3?)
         #   param3 = max length to receive

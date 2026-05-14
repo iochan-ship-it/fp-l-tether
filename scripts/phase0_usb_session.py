@@ -7,7 +7,7 @@ SgmCaptStatus struct), not a stripped 4-byte ICA artifact.
 
 Run with sudo (required on macOS to detach kernel driver)::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_usb_session.py
 """
 
@@ -156,8 +156,8 @@ def main() -> int:
         print(f"\n✗ USBBridge error: {e}")
         if "kernel" in str(e).lower():
             print("\n  → Run with sudo:")
-            print("    sudo \"/Users/PI/Documents/Claude/Projects/"
-                  "FP L Tether APP/venv/bin/python\" scripts/phase0_usb_session.py")
+            print("    sudo \"/path/to/fp-l-tether/"
+                  "venv/bin/python\" scripts/phase0_usb_session.py")
         return 1
     except Exception as e:  # noqa: BLE001
         print(f"\n✗ Unexpected error: {e!r}")

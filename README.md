@@ -1,7 +1,7 @@
 # fp-l-tether
 
 > **An open-source Python tether implementation for the Sigma fp L on macOS, with Lightroom Classic auto-import.**
-> Sigma fp L のテザー撮影を macOS で動かすオープンソース Python 実装 — Lightroom Classic 連携、Capture One 不要、月額不要。
+> Sigma fp L のテザー撮影を macOS で動かすオープンソース Python 実装 — Lightroom Classic 連携対応。
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue)]()
 [![macOS](https://img.shields.io/badge/macOS-12+-lightgrey)]()
@@ -21,13 +21,11 @@ for the Sigma fp L on macOS. The headline features:
 - **Lightroom Classic Auto Import** integration — every shot lands in your
   catalog automatically
 - **Auto USB recovery** — when the fp L's bulk endpoint wedges (a known
-  firmware quirk that requires unplug/replug with every other tether tool),
-  this daemon detects the wedge and force-re-enumerates the device via
-  IOKit in ~4 seconds. No physical power cycle needed.
-- **Persistent settings cache** — the fp L resets ISO/SS/Aperture/WB/Format
-  to defaults on every USB connect (also a firmware quirk that Capture One
-  has not solved). This daemon remembers your last-dialed values and
-  replays them on every (re)connect.
+  firmware quirk), this daemon detects the wedge and force-re-enumerates
+  the device via IOKit in ~4 seconds. No physical power cycle needed.
+- **Persistent settings cache** — your ISO / SS / Aperture / WB / Format
+  stay remembered across disconnects and recoveries; no need to re-dial
+  the camera every time you reconnect.
 - **JPG / DNG / DNG+JPG** capture with dual-file extraction
 - **Exposure controls** — ISO, SS, Aperture, WB, Format, Resolution
   via floating panel dropdowns
@@ -37,25 +35,12 @@ product photography. Bug reports and pull requests very welcome.
 
 ---
 
-## Why this project exists
+## Why this project
 
-Tethered shooting with the Sigma fp L on macOS has been a known pain point
-since the camera shipped in 2021:
-
-| Alternative | Why it doesn't fully work |
-|---|---|
-| Capture One Pro | Paid subscription; "settings reset on connect" bug; no Lightroom flow |
-| Lightroom Classic native tether | No Sigma support at all |
-| libgphoto2 / gphoto2 CLI | `camera_init` double-free aborts immediately on fp L |
-| Darktable | Wraps libgphoto2; same crash |
-| sigma-ptpy | fp only, fp L untested, no Live View, no recovery |
-| Smart Shooter / Cascable / Sofortbild | No Sigma support |
-| SD-card workflow | Many L-bracket plates block the SD door |
-| Mass Storage mode | Camera locks; can't shoot while mounted |
-
-This project documents and implements the actually-working path, with a
-particular focus on the operational issues (wedge recovery, settings
-preservation) that make other tools frustrating in daily studio use.
+The Sigma fp L is a remarkable little camera that deserves a great
+tethered shooting experience. This is a community-built option for
+photographers who want their fp L shots to land directly in Lightroom
+Classic and who enjoy customizing their tools.
 
 ---
 
@@ -215,10 +200,9 @@ This is a personal project but PRs and issues are welcome — especially
 from other fp / fp L owners. Some things that would be particularly
 helpful:
 
-- Working USB packet captures of **Capture One Pro** talking to an fp L
-  (this would let us confirm or refute the Live View / AF protocol
-  details, and potentially reveal whether Capture One has a real
-  keep-alive that the public PTP opcodes don't expose).
+- USB packet captures of Sigma camera traffic that document Live View
+  or AF behaviour, especially anything that exercises keep-alive
+  patterns not visible in the public PTP opcode set.
 - fp / fp L L-mount lens correction tables (currently no lens correction
   is applied in either JPG or DNG; the camera handles JPG correction
   internally).

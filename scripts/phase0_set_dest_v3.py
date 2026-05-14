@@ -5,7 +5,7 @@ The FieldPresent bit-to-byte scan (phase0_fieldpresent_scan.py) showed:
     FieldPresent1 bit 0 (= 0x01) → writes byte 16 (DestinationToSave)
     (it also sets bytes 14 and 15 to camera-chosen defaults)
 
-NOT FieldPresent2 bit 7 as I'd assumed from the SDK header. The fp L
+NOT FieldPresent2 bit 7 as I'd assumed from earlier notes. The fp L
 firmware uses a different FieldPresent mapping than the SDK documents.
 
 This script does the corrected SET workflow:
@@ -18,7 +18,7 @@ This script does the corrected SET workflow:
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_set_dest_v3.py
 """
 

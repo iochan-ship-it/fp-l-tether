@@ -21,7 +21,7 @@ If this works, the workflow becomes:
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_storage_test.py
 """
 

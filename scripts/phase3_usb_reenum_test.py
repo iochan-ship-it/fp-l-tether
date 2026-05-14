@@ -53,7 +53,7 @@ Usage
   # Sanity check on a healthy camera (verify the IOKit dance itself works)::
 
       sudo killall ptpcamerad 2>/dev/null
-      cd "/Users/PI/Documents/Claude/Projects/FP L Tether APP"
+      cd "/path/to/fp-l-tether"
       sudo venv/bin/python scripts/phase3_usb_reenum_test.py
 
   # Real test: let the camera wedge naturally (doze for 2+ min), then::

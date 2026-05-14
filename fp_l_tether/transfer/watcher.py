@@ -940,8 +940,8 @@ class TetherDaemon:
             # The fix: maintain a disk-backed cache of the user's
             # settings, populated from their actions on the floating
             # panel. On each (re)connect we replay that cache to the
-            # camera right after init. Capture One uses the same
-            # workaround model.
+            # camera right after init. This is the standard host-side
+            # workaround for this kind of firmware reset.
             #
             # If the cache is empty (first-ever run), we fall back to
             # snapshotting after init — those values are the camera's

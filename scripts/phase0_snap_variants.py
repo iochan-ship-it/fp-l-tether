@@ -3,15 +3,15 @@
 
 SnapCommand 0x901B returned 0x201D (Sigma vendor-specific rejection)
 with our previous payload `02 01 03`. The third byte of SgmSnapState
-(named "CheckSum" in SDK headers) seems to have a different value than
+(sometimes called "CheckSum" in reference notes) seems to have a different value than
 a simple sum. This script tries several variants to find the working one.
 
 Also tries adding a fuller "warmup" sequence (GetCamDataGroup 1-5) before
-SnapCommand, matching the Windows SDK behavior in libgphoto2 #882.
+SnapCommand, matching the warmup sequence seen in the libgphoto2 #882 trace.
 
 Run::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_snap_variants.py
 """
 
@@ -48,7 +48,7 @@ def get_capt_status(bridge: USBBridge) -> SgmCaptStatus | None:
 
 
 def warmup(bridge: USBBridge) -> None:
-    """Read the camera's full setting state, matching Windows SDK behavior."""
+    """Read the camera's full setting state, matching the reference warmup."""
     print("\n=== Warmup: ConfigApi + GetCamDataGroup 1-5 + Focus + Movie + Permission ===")
     for op in [
         SigmaOperationCode.CONFIG_API,

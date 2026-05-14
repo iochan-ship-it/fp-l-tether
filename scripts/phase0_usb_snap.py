@@ -14,7 +14,7 @@ actually fires the shutter and produces an ImageDB update.
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_usb_snap.py
 """
 

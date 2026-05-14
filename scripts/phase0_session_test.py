@@ -13,8 +13,8 @@ Run::
 Run AFTER phase0_smoke_test.py has passed.
 
 If this script hangs at "Opening PTP session...":
-  * Another app (Capture One, Image Capture.app, Lightroom) is holding the
-    camera. Quit it.
+  * Another tether or PTP client (Image Capture.app, Lightroom, etc.) is
+    holding the camera. Quit it.
 
 If GetCamCaptStatus returns 0x2005 (Operation Not Supported):
   * The ConfigApi handshake didn't enter "PC control mode". Check the
@@ -105,7 +105,7 @@ def main() -> int:
                 resp = session.send_ptp(SigmaOperationCode.GET_CAM_OP_PERMISSION)
                 print(f"  Response code: 0x{resp.response_code:04X}")
                 print(f"  in_data       : {hex_dump(resp.in_data)}")
-                # The Windows SDK log showed "[opPermission] PC control mode"
+                # Earlier USB traces have shown "[opPermission] PC control mode"
                 # which suggests the in_data contains a "PC control mode" flag
             except Exception as e:  # noqa: BLE001
                 print(f"  ⚠ GetCamOpPermission raised: {e!r}")

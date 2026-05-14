@@ -31,7 +31,7 @@ class TestUSBIdentifiers:
 
 
 class TestOpcodes:
-    """Critical opcodes — values verified against SDK headers."""
+    """Critical opcodes — values verified by observation."""
 
     def test_snap_command_opcode(self):
         assert SigmaOperationCode.SNAP_COMMAND == 0x901B
@@ -56,7 +56,7 @@ class TestSigmaChecksum:
     """Verify the checksum algorithm against the libgphoto2 #882 trace."""
 
     def test_snap_payload_checksum(self):
-        # From the Windows SDK log in libgphoto2 #882:
+        # From the trace attached to libgphoto2 #882:
         #   payload [0x02, 0x02, 0x01] → CheckSum 0x05
         assert sigma_checksum(bytes([0x02, 0x02, 0x01])) == 0x05
 
@@ -183,7 +183,7 @@ class TestSgmCaptStatus:
         assert status.checksum == 0x06  # byte 7
 
     def test_from_wire_libgphoto2_trace(self):
-        """Parse the wire form seen in libgphoto2 #882 Windows SDK trace.
+        """Parse the wire form seen in the libgphoto2 #882 trace.
 
         Wire: 06 00 00 01 04 00 00 0B
           data[0] = 0x06 length

@@ -27,13 +27,13 @@ sum-mod-256 checksum at byte 17):
  16    DestinationToSave   ← TARGET
  (17th byte = external checksum, appended automatically by send_sigma_command)
 
-Note: the SDK header includes AutoRotate, TimerSound, RCChannel between
+Note: earlier reference notes include AutoRotate, TimerSound, RCChannel between
 ExtendedMode and DestinationToSave (would push DestinationToSave to byte 19),
 but the fp L apparently omits those — our read was only 18 bytes total.
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_set_dest_v2.py
 """
 
@@ -59,7 +59,7 @@ POLL_MS = 250
 POLL_TIMEOUT_S = 5.0
 STRUCT_SIZE = 17  # bytes of SgmDataGroup3 on fp L (excluding ext checksum)
 DEST_TO_SAVE_OFFSET = 16  # last byte of the 17-byte struct
-FIELD_PRESENT_2_BIT = 0x80  # bit 7 = DestinationToSave per SDK header
+FIELD_PRESENT_2_BIT = 0x80  # bit 7 = DestinationToSave (best-guess)
 
 
 def parse_status(in_data: bytes) -> SgmCaptStatus | None:

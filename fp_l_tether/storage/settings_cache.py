@@ -3,10 +3,10 @@
 The fp / fp L resets its internal DG1/DG2 state to a hard-coded
 "PC tether" template the moment USB enumeration completes — before
 any PTP traffic can read the user's pre-plug values. This is a
-firmware-level reset that Capture One also can't avoid; they work
-around it by maintaining their own settings state in the host app.
+firmware-level reset that any host-side tether has to work around
+by maintaining its own settings state.
 
-We do the same. This module owns the on-disk JSON cache. The daemon:
+We do exactly that. This module owns the on-disk JSON cache. The daemon:
 
   1. Loads the cache on startup / each (re)connect.
   2. Writes the cached values to the camera right after ``sigma_init``

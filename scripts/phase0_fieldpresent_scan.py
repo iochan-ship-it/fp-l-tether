@@ -4,8 +4,8 @@
 The fp L's SgmDataGroup3 SET command accepted our writes (response 0x2001)
 but values 0x02/0x03/0x01 appeared at bytes 14/15/16 instead of our target
 DestinationToSave=0x04. This means the FieldPresent bit-to-byte mapping
-differs from the SDK header (because fp L has fewer fields than the SDK
-documents).
+on fp L differs from what we expected — likely the body exposes fewer
+fields in this DataGroup than the bit ordering would suggest.
 
 This script:
   1. Reads original CamDataGroup3
@@ -17,7 +17,7 @@ This script:
 
 Run with sudo::
 
-    sudo "/Users/PI/Documents/Claude/Projects/FP L Tether APP/venv/bin/python" \\
+    sudo "/path/to/fp-l-tether/venv/bin/python" \\
          scripts/phase0_fieldpresent_scan.py
 """
 

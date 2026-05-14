@@ -12,7 +12,7 @@ What's different from earlier attempts:
 
   - Snap payload is the wire-correct 4 bytes ``[0x02, mode, amount, chk]``,
     not the 3-byte form we tried before.
-  - Mode 1 (libgphoto2 default) instead of mode 2 from SDK header.
+  - Mode 1 (libgphoto2 default) instead of mode 2 from prior attempts.
   - Init sequence (10 PTP calls) is run BEFORE snap, mirroring
     ``camera_init`` so the camera enters tether-ready state.
   - Status parser uses the libgphoto2 wire format (data[0]=0x06 length byte).
@@ -112,7 +112,7 @@ def main() -> int:
     parser.add_argument(
         "--mode", type=int, default=2,
         help=(
-            "Snap CaptureMode. Default 2 (NON_AF_CAPTURE per Sigma SDK + fp trace). "
+            "Snap CaptureMode. Default 2 (NON_AF_CAPTURE — observed working on fp L). "
             "libgphoto2 uses 1 which only works for the FIRST shot."
         ),
     )
