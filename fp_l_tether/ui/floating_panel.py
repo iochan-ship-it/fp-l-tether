@@ -53,6 +53,10 @@ from AppKit import (
     NSColor,
     NSEvent,
     NSEventMaskKeyDown,
+    NSEventModifierFlagCommand,
+    NSEventModifierFlagControl,
+    NSEventModifierFlagOption,
+    NSEventModifierFlagShift,
     NSFloatingWindowLevel,
     NSFont,
     NSFontAttributeName,
@@ -606,7 +610,7 @@ class FloatingTetherPanel(NSObject):
         self._hint_label.setFont_(F_HINT)
         self._hint_label.setTextColor_(C_FG_TERTIARY)
         self._hint_label.setAlignment_(NSTextAlignmentCenter)
-        self._hint_label.setStringValue_("␣ shoot · A focus · H hist · G grid · ⌘Q quit")
+        self._hint_label.setStringValue_("␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit")
         content.addSubview_(self._hint_label)
 
         # ----- internal state --------------------------------------
@@ -745,7 +749,7 @@ class FloatingTetherPanel(NSObject):
             text = "Quit and relaunch after power cycle"
             color = C_STATE_ERROR
         else:
-            text = "␣ shoot · A focus · H hist · G grid · ⌘Q quit"
+            text = "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit"
             color = C_FG_TERTIARY
         self._hint_label.setStringValue_(text)
         self._hint_label.setTextColor_(color)
@@ -1289,7 +1293,7 @@ class FloatingTetherPanel(NSObject):
         # has visual confirmation the keystroke registered.
         try:
             self._hint_label.setStringValue_(
-                f"Grid: {new_mode}    ␣ shoot · A focus · H hist · G grid · ⌘Q quit"
+                f"Grid: {new_mode}    ␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1348,6 +1352,17 @@ class FloatingTetherPanel(NSObject):
         monitor for when Lightroom has focus.
         """
 
+        # Modifier-mask helper for the pure-⌘ overlay shortcuts. We
+        # only fire when ⌘ is the SOLE active modifier (Shift / Option
+        # / Ctrl all off) so we don't claim ⌘⇧H, ⌘⌥H, etc. — those
+        # remain available for future bindings.
+        _MOD_MASK = (
+            NSEventModifierFlagCommand
+            | NSEventModifierFlagShift
+            | NSEventModifierFlagOption
+            | NSEventModifierFlagControl
+        )
+
         def _handle(event) -> object | None:  # noqa: ANN001
             responder = self._panel.firstResponder()
             in_text_field = (
@@ -1356,6 +1371,21 @@ class FloatingTetherPanel(NSObject):
 
             key = event.charactersIgnoringModifiers()
             key_code = event.keyCode()
+
+            # ---- Pure-⌘ overlay shortcuts (Phase 3.11 polish) -----
+            # Fire BEFORE the in-text-field gate so the user can
+            # toggle histogram / grid even while editing the SUBJECT
+            # field. ⌘H / ⌘G only — anything with additional
+            # modifiers falls through to the normal dispatch.
+            mods = event.modifierFlags() & _MOD_MASK
+            if mods == NSEventModifierFlagCommand:
+                k_lower = (key or "").lower()
+                if k_lower == "h":
+                    self._toggle_histogram()
+                    return None  # consume
+                if k_lower == "g":
+                    self._cycle_grid()
+                    return None  # consume
 
             # Phase 3.9 Fix 2: Escape (keyCode 53) always drops focus when
             # the user is editing a field — gives them an "oops" out
