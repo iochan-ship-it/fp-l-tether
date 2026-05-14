@@ -50,27 +50,55 @@ _CACHE_FILENAME = "user_settings.json"
 
 
 @dataclass
+class LVWindowState:
+    """Persisted state of the detachable LV window (Phase 3.12).
+
+    ``detached`` records whether the LV viewport was floated into its
+    own window at last shutdown; ``frame`` records that window's
+    geometry as ``(x, y, w, h)`` in screen points. Both values are
+    optional — a fresh cache (or one written before Phase 3.12) leaves
+    ``LVWindowState`` itself at ``None`` on the parent ``SettingsCache``,
+    which the panel treats as "start attached, use defaults".
+    """
+
+    detached: bool = False
+    frame: tuple[float, float, float, float] | None = None
+
+
+@dataclass
 class SettingsCache:
     """In-memory representation of the on-disk settings cache."""
 
     dg1: dict[str, int] = field(default_factory=dict)
     dg2: dict[str, int] = field(default_factory=dict)
+    lv_window: LVWindowState | None = None
     saved_at: str | None = None
     version: int = CACHE_SCHEMA_VERSION
 
     def is_empty(self) -> bool:
-        return not self.dg1 and not self.dg2
+        return not self.dg1 and not self.dg2 and self.lv_window is None
 
     def to_dict(self) -> dict[str, Any]:
         # Always stamp the current time on save — ``self.saved_at`` is the
         # value loaded from disk and shouldn't be reused (otherwise the
         # "saved_at" log line lies about when the cache was last persisted).
-        return {
+        out: dict[str, Any] = {
             "version": self.version,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "dg1": dict(self.dg1),
             "dg2": dict(self.dg2),
         }
+        # Optional — only written when set, so older readers (and the
+        # vast majority of sessions where the user never detaches) keep
+        # a tidy cache file. Schema version stays at 1; lv_window is
+        # additive.
+        if self.lv_window is not None:
+            frame = self.lv_window.frame
+            out["lv_window"] = {
+                "detached": bool(self.lv_window.detached),
+                "frame": list(frame) if frame is not None else None,
+            }
+        return out
 
     def update_from(self, *, dg1: dict[str, int] | None = None,
                     dg2: dict[str, int] | None = None) -> bool:
@@ -153,9 +181,37 @@ def load_settings_cache(path: Path | None = None) -> SettingsCache | None:
     return SettingsCache(
         dg1=dg1,
         dg2=dg2,
+        lv_window=_parse_lv_window(data.get("lv_window")),
         saved_at=data.get("saved_at"),
         version=version,
     )
+
+
+def _parse_lv_window(raw: Any) -> LVWindowState | None:
+    """Parse the optional ``lv_window`` section. Returns None on any issue.
+
+    Defensive: anything that doesn't look like our expected shape is
+    silently dropped so a hand-edited cache or a future schema change
+    can't crash startup.
+    """
+    if not isinstance(raw, dict):
+        return None
+    detached = bool(raw.get("detached", False))
+    frame_raw = raw.get("frame")
+    frame: tuple[float, float, float, float] | None = None
+    if isinstance(frame_raw, (list, tuple)) and len(frame_raw) == 4:
+        try:
+            x, y, w, h = (float(v) for v in frame_raw)
+        except (TypeError, ValueError):
+            return LVWindowState(detached=detached, frame=None)
+        # Sanity-check: positive size + plausible screen coords. Reject
+        # NaN / inf and pathological values rather than letting them
+        # poison the position-resolver downstream.
+        import math
+        finite = all(math.isfinite(v) for v in (x, y, w, h))
+        if finite and w > 0 and h > 0 and -50000 <= x <= 50000 and -50000 <= y <= 50000:
+            frame = (x, y, w, h)
+    return LVWindowState(detached=detached, frame=frame)
 
 
 def save_settings_cache(cache: SettingsCache, path: Path | None = None) -> bool:

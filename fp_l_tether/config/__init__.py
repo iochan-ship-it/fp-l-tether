@@ -240,6 +240,29 @@ class UIConfig(BaseModel):
     quit_key: str = "cmd+q"
 
 
+class LVWindowConfig(BaseModel):
+    """Detached LV window defaults (Phase 3.12).
+
+    Runtime state (current detached/attached state + frame geometry)
+    lives in ``~/.fp-l-tether/user_settings.json`` and overrides
+    these defaults. The knobs below are only consulted on first run
+    or when the cache doesn't pin a frame.
+    """
+
+    default_width: int = 720
+    default_height: int = 480
+    min_width: int = 360
+    min_height: int = 240
+    # Detached LV is locked to 3:2 because the fp L LV source is
+    # 1620 × 1080 — anything else would letterbox. These two values
+    # are passed to ``setContentAspectRatio_``.
+    aspect_w: int = 3
+    aspect_h: int = 2
+    # Debounce window for frame-change saves so a drag doesn't write
+    # the cache N times per second.
+    save_debounce_ms: int = 250
+
+
 class LiveViewConfig(BaseModel):
     """Live view streaming preferences.
 
@@ -318,6 +341,11 @@ class LiveViewConfig(BaseModel):
     show_histogram: bool = True
     histogram_downsample: int = 2
     grid_mode: Literal["off", "thirds", "golden", "full"] = "off"
+
+    # Phase 3.12 — detachable LV window defaults. Runtime geometry
+    # is persisted in user_settings.json; these knobs are the
+    # first-run / fallback values.
+    lv_window: LVWindowConfig = Field(default_factory=LVWindowConfig)
     # Note: the old ``resume_delay_after_capture_s`` knob was superseded
     # by the burst-aware quiet window in CameraConfig
     # (commit_window_base_s / commit_window_per_shot_s). LV resume is

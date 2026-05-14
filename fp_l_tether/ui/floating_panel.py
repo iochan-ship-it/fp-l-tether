@@ -90,7 +90,7 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSAttributedString, NSData, NSObject, NSTimer
+from Foundation import NSAttributedString, NSData, NSObject, NSPointInRect, NSTimer
 
 # Font-weight constants — usually exported from AppKit, but the names
 # vary by PyObjC version. Use the documented literal values so the
@@ -112,8 +112,16 @@ from fp_l_tether.camera.sigma_datagroup import (
     resolution_label,
     wb_label,
 )
+from fp_l_tether.storage import (
+    LVWindowState,
+    SettingsCache,
+    load_settings_cache,
+    save_settings_cache,
+)
 from fp_l_tether.ui.grid_overlay import GridOverlayView, cycle_mode as _grid_cycle
 from fp_l_tether.ui.histogram_view import HistogramView
+from fp_l_tether.ui.lv_attached_pane import LVDetachedPlaceholder
+from fp_l_tether.ui.lv_window import LVDetachedWindow
 
 if TYPE_CHECKING:
     from fp_l_tether.config import AppConfig
@@ -290,10 +298,44 @@ class FloatingTetherPanel(NSObject):
         # FW wedge. Dimming gives the user visual feedback to wait.
         self._controls_busy = False
 
+        # Phase 3.12 — detachable LV window state. Defaults to attached.
+        # ``_user_settings`` is the panel's own load of the on-disk cache;
+        # we read lv_window state from it at startup (to decide whether
+        # to detach immediately) and merge our lv_window writes back into
+        # it so subsequent saves don't blow away dg1/dg2 that the watcher
+        # populated. The watcher keeps its own copy — separate races are
+        # fine because we re-load before writing in ``_save_lv_window_state``.
+        try:
+            self._user_settings: SettingsCache | None = load_settings_cache()
+        except Exception:  # noqa: BLE001
+            self._user_settings = None
+        self._lv_window: LVDetachedWindow | None = None
+        self._placeholder: LVDetachedPlaceholder | None = None
+        # Token-based debounce for window-move/resize → settings save.
+        # ``_pending_save_token`` is bumped on every event; the queued
+        # dispatch_after closure only writes if its captured token still
+        # matches the latest, coalescing rapid drag/resize bursts.
+        self._pending_save_token: int = 0
+
         self._build_window()
         self._wire_callbacks()
         self._install_hotkeys()
         self._install_lv_staleness_watch()
+
+        # If the user quit last time with LV detached, restore that state
+        # right after window construction (per Phase 3.12 spec section 7).
+        try:
+            cached_lv = self._user_settings.lv_window if self._user_settings else None
+        except AttributeError:
+            cached_lv = None
+        if cached_lv is not None and cached_lv.detached:
+            try:
+                self._detach_lv()
+            except Exception as e:  # noqa: BLE001
+                # Best-effort restore — fall back to attached mode if any
+                # AppKit call raises (e.g. all NSScreens transient at app
+                # launch on display reconfiguration).
+                logger.warning("LV detach restore failed: %s", e)
 
     # ----- window construction ----------------------------------------
 
@@ -610,7 +652,9 @@ class FloatingTetherPanel(NSObject):
         self._hint_label.setFont_(F_HINT)
         self._hint_label.setTextColor_(C_FG_TERTIARY)
         self._hint_label.setAlignment_(NSTextAlignmentCenter)
-        self._hint_label.setStringValue_("␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit")
+        self._hint_label.setStringValue_(
+            "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘D detach · ⌘Q quit"
+        )
         content.addSubview_(self._hint_label)
 
         # ----- internal state --------------------------------------
@@ -749,7 +793,11 @@ class FloatingTetherPanel(NSObject):
             text = "Quit and relaunch after power cycle"
             color = C_STATE_ERROR
         else:
-            text = "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit"
+            detach_word = "reattach" if self._lv_window is not None else "detach"
+            text = (
+                "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · "
+                f"⌘D {detach_word} · ⌘Q quit"
+            )
             color = C_FG_TERTIARY
         self._hint_label.setStringValue_(text)
         self._hint_label.setTextColor_(color)
@@ -972,19 +1020,24 @@ class FloatingTetherPanel(NSObject):
     def cam_to_view(self, cam_x: int, cam_y: int) -> tuple[float, float]:
         """Map a camera AF coord to LV-superview coordinates.
 
-        Returns (x, y) in the panel's content-view coordinate space
-        (so the marker view's frame can be set directly to a rect
-        centred there). AppKit Y goes up from bottom-left; camera Y
-        goes down from top-left → we flip Y.
+        Returns (x, y) in the LV view's *superview* coordinate space
+        — that's panel content while attached, and the detached
+        window's content view while detached (Phase 3.12). We read
+        ``_live_view.frame()`` rather than hard-coding LV_X/LV_Y so
+        the mapping works in both states; the AF marker shares the
+        same superview as the LV view in both cases, so its frame
+        can be set directly to a rect centred on the returned coord.
+        AppKit Y goes up from bottom-left; camera Y goes down from
+        top-left → we flip Y.
         """
         x_min, x_max, y_min, y_max = self.af_bounds()
         nx = (cam_x - x_min) / max(1, (x_max - x_min))
         ny = (cam_y - y_min) / max(1, (y_max - y_min))
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
-        # LV frame origin in panel content-view coords (Phase 3.10 layout)
-        vx = LV_X + nx * LV_WIDTH
-        vy = LV_Y + (1.0 - ny) * LV_HEIGHT  # flip Y (AppKit Y goes up)
+        lv = self._live_view.frame()
+        vx = lv.origin.x + nx * lv.size.width
+        vy = lv.origin.y + (1.0 - ny) * lv.size.height  # flip Y (AppKit Y goes up)
         return vx, vy
 
     @objc.signature(b"v@:@")
@@ -1292,8 +1345,10 @@ class FloatingTetherPanel(NSObject):
         # Briefly surface the new mode in the hint footer so the user
         # has visual confirmation the keystroke registered.
         try:
+            detach_word = "reattach" if self._lv_window is not None else "detach"
             self._hint_label.setStringValue_(
-                f"Grid: {new_mode}    ␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘Q quit"
+                f"Grid: {new_mode}    ␣ shoot · A focus · H/⌘H hist · "
+                f"G/⌘G grid · ⌘D {detach_word} · ⌘Q quit"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -1341,6 +1396,335 @@ class FloatingTetherPanel(NSObject):
                 self._lv_overlay.setHidden_(True)
                 self._reposition_af_marker()
 
+    # ----- Phase 3.12 — LV detach / reattach --------------------------
+
+    def _toggle_lv_detached(self) -> None:
+        """Single ⌘D entry point — detach if attached, reattach if detached."""
+        if self._lv_window is None:
+            self._detach_lv()
+        else:
+            self._reattach_lv()
+
+    def _detach_lv(self) -> None:
+        """Lift the 5 LV-area views into a new ``LVDetachedWindow``.
+
+        Ownership move (not redraw) — histogram thread pool, grid mode,
+        AF reticle, and pause overlay all keep their state.
+        """
+        if self._lv_window is not None:
+            return  # already detached, no-op
+
+        content = self._panel.contentView()
+
+        # Step 1: lift the 5 LV-area views off the panel content. We
+        # keep strong refs via self._* already, so removeFromSuperview
+        # just unparents them — the views themselves remain alive.
+        for view in (
+            self._live_view,
+            self._grid_view,
+            self._hist_view,
+            self._lv_overlay,
+            self._af_marker_view,
+        ):
+            try:
+                view.removeFromSuperview()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Step 2: build & show the detached window with the lifted views.
+        initial_frame = self._resolve_lv_window_frame()
+        self._lv_window = LVDetachedWindow.make(
+            self,
+            initial_frame,
+            self._live_view,
+            self._grid_view,
+            self._hist_view,
+            self._lv_overlay,
+            self._af_marker_view,
+        )
+        if self._lv_window is None:
+            # Construction failed — put the views back and bail. Better
+            # to leave the user attached than half-detached.
+            content.addSubview_(self._live_view)
+            content.addSubview_(self._grid_view)
+            content.addSubview_(self._hist_view)
+            content.addSubview_(self._lv_overlay)
+            content.addSubview_(self._af_marker_view)
+            return
+        self._lv_window.makeKeyAndOrderFront_(None)
+
+        # Step 3: drop the placeholder into the panel's LV slot so the
+        # user doesn't see a black hole where the LV used to live.
+        self._placeholder = LVDetachedPlaceholder.alloc().initWithFrame_(
+            NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT)
+        )
+        self._placeholder.setOwner_(self)
+        content.addSubview_(self._placeholder)
+
+        # Step 4: reposition AF reticle relative to the detached window's
+        # LV bounds (cam_to_view now reads _live_view.frame()).
+        try:
+            self._reposition_af_marker()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Step 5: persist (detached=True, frame=initial). The frame
+        # may already match the cache; save_settings_cache short-circuits
+        # nothing internally but the I/O cost is fine for a user action.
+        self._save_lv_window_state(detached=True, frame=initial_frame)
+
+        # Step 6: refresh hint so the footer shows "⌘D reattach".
+        try:
+            self._refresh_hint(getattr(self._daemon, "state", ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _reattach_lv(self) -> None:
+        """Reverse of ``_detach_lv``. Idempotent if already attached."""
+        if self._lv_window is None:
+            return
+
+        content = self._panel.contentView()
+
+        # Capture final frame for cache before we close the window —
+        # NSWindow.frame() may return zeroes after orderOut.
+        try:
+            final_frame = self._lv_window.frame()
+            final_tuple: tuple[float, float, float, float] | None = (
+                float(final_frame.origin.x),
+                float(final_frame.origin.y),
+                float(final_frame.size.width),
+                float(final_frame.size.height),
+            )
+        except Exception:  # noqa: BLE001
+            final_tuple = None
+
+        # Step 1: remove the placeholder.
+        if self._placeholder is not None:
+            try:
+                self._placeholder.removeFromSuperview()
+            except Exception:  # noqa: BLE001
+                pass
+            self._placeholder = None
+
+        # Step 2: lift the 5 LV-area views off the detached window.
+        for view in (
+            self._live_view,
+            self._grid_view,
+            self._hist_view,
+            self._lv_overlay,
+            self._af_marker_view,
+        ):
+            try:
+                view.removeFromSuperview()
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Step 3: restore each view's original panel-relative frame.
+        # The detached window resized them to its content bounds; we
+        # need to write the canonical panel slot back so they fit.
+        self._live_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
+        self._grid_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
+        self._hist_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, HIST_STRIP_H))
+        self._lv_overlay.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
+        # Pause overlay label needs its panel-slot centre too.
+        try:
+            self._lv_overlay_label.setFrame_(
+                NSMakeRect(0, (LV_HEIGHT - 22) // 2, LV_WIDTH, 22)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        # AF marker frame is positioned by _reposition_af_marker below;
+        # initialise to a centred default so the first paint isn't junk.
+        self._af_marker_view.setFrame_(
+            NSMakeRect(
+                LV_X + (LV_WIDTH - AF_MARKER_SIZE) // 2,
+                LV_Y + (LV_HEIGHT - AF_MARKER_SIZE) // 2,
+                AF_MARKER_SIZE,
+                AF_MARKER_SIZE,
+            )
+        )
+
+        # Step 4: re-add to panel content in the original z-order.
+        content.addSubview_(self._live_view)
+        content.addSubview_(self._grid_view)
+        content.addSubview_(self._hist_view)
+        content.addSubview_(self._lv_overlay)
+        content.addSubview_(self._af_marker_view)
+
+        # Step 5: drop the window. orderOut_ + drop the ref. Window has
+        # ``releasedWhenClosed=False`` so the Python ref is what keeps
+        # it alive; clearing it lets ARC free everything.
+        try:
+            self._lv_window.orderOut_(None)
+        except Exception:  # noqa: BLE001
+            pass
+        self._lv_window = None
+
+        # Step 6: reposition AF reticle relative to panel coords.
+        try:
+            self._reposition_af_marker()
+        except Exception:  # noqa: BLE001
+            pass
+
+        # Step 7: persist (detached=False, frame=last-known so we remember
+        # the user's preferred geometry next detach).
+        self._save_lv_window_state(detached=False, frame=final_tuple)
+
+        # Step 8: refresh hint so footer shows "⌘D detach".
+        try:
+            self._refresh_hint(getattr(self._daemon, "state", ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ----- Phase 3.12 — frame resolution / persistence ----------------
+
+    def _resolve_lv_window_frame(self):  # type: ignore[no-untyped-def]
+        """Return the NSRect for the detached window at next detach.
+
+        Order of preference:
+        1. Cached frame, if its origin lies inside any current NSScreen
+           visibleFrame (display still attached).
+        2. Cached frame's *size*, re-centred on the main screen
+           (display disappeared since last save — fall back gracefully).
+        3. Default 720×480 centred on main screen (no cache yet).
+        """
+        cached_lv = None
+        try:
+            cached_lv = self._user_settings.lv_window if self._user_settings else None
+        except AttributeError:
+            cached_lv = None
+
+        if cached_lv is None or cached_lv.frame is None:
+            return self._default_lv_window_frame()
+
+        x, y, w, h = cached_lv.frame
+        saved = NSMakeRect(x, y, w, h)
+        if self._frame_origin_on_any_screen(saved):
+            return saved
+
+        # Display disappeared — keep size, re-centre on main.
+        try:
+            main = NSScreen.mainScreen().visibleFrame()
+            cx = main.origin.x + (main.size.width - w) / 2.0
+            cy = main.origin.y + (main.size.height - h) / 2.0
+            return NSMakeRect(cx, cy, w, h)
+        except Exception:  # noqa: BLE001
+            return self._default_lv_window_frame()
+
+    def _default_lv_window_frame(self):  # type: ignore[no-untyped-def]
+        """Default detached frame — 720×480 centred on main screen.
+
+        720×480 is 2.5× the original 288×200 panel slot; comfortably
+        below the LV source's native 1620×1080 so no aliasing.
+        """
+        # Pull dimensions from the static config so a future user-side
+        # tweak doesn't require touching panel code.
+        try:
+            cfg_lv = self._cfg.liveview.lv_window
+            w = float(cfg_lv.default_width)
+            h = float(cfg_lv.default_height)
+        except AttributeError:
+            w, h = 720.0, 480.0
+        try:
+            main = NSScreen.mainScreen().visibleFrame()
+            cx = main.origin.x + (main.size.width - w) / 2.0
+            cy = main.origin.y + (main.size.height - h) / 2.0
+        except Exception:  # noqa: BLE001
+            cx, cy = 100.0, 100.0
+        return NSMakeRect(cx, cy, w, h)
+
+    def _frame_origin_on_any_screen(self, rect) -> bool:  # type: ignore[no-untyped-def]
+        """Return True if the rect's origin is inside any NSScreen.visibleFrame.
+
+        Origin-only check — macOS ``constrainFrameRect`` handles the
+        oversize-vs-screen case for us, so we only need to ensure the
+        window won't open in a void.
+        """
+        try:
+            screens = NSScreen.screens()
+        except Exception:  # noqa: BLE001
+            return False
+        if screens is None:
+            return False
+        origin = rect.origin
+        for screen in screens:
+            try:
+                if NSPointInRect(origin, screen.visibleFrame()):
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
+    def _on_lv_window_frame_changed(self, frame) -> None:  # type: ignore[no-untyped-def]
+        """Debounced save: detached window moved or resized.
+
+        Bumps the pending-save token; schedules a dispatch_after that
+        only writes if the token still matches when it fires. Rapid
+        drag bursts coalesce to a single disk write.
+        """
+        self._pending_save_token += 1
+        my_token = self._pending_save_token
+        try:
+            debounce_ms = int(self._cfg.liveview.lv_window.save_debounce_ms)
+        except AttributeError:
+            debounce_ms = 250
+
+        # Capture frame as a tuple now (frame is NSRect by-value; safe
+        # to read after the dispatch_after fires too, but explicit).
+        captured: tuple[float, float, float, float] = (
+            float(frame.origin.x),
+            float(frame.origin.y),
+            float(frame.size.width),
+            float(frame.size.height),
+        )
+
+        def _flush() -> None:
+            if my_token != self._pending_save_token:
+                return  # superseded by a newer event
+            self._save_lv_window_state(detached=True, frame=captured)
+
+        # We're already on the main thread (delegate callback). Schedule
+        # via NSTimer rather than libdispatch — NSTimer is the simplest
+        # PyObjC-friendly path that doesn't need a Foundation dispatch
+        # import dance, and the main-thread runloop dispatches it.
+        try:
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                debounce_ms / 1000.0, False, lambda _t: _flush()
+            )
+        except Exception:  # noqa: BLE001
+            # Fallback: write immediately if NSTimer.block_ API is not
+            # available (older PyObjC). Misses the debounce but the
+            # disk write is cheap.
+            _flush()
+
+    def _save_lv_window_state(
+        self,
+        *,
+        detached: bool,
+        frame: tuple[float, float, float, float] | None,
+    ) -> None:
+        """Persist (detached, frame) into ~/.fp-l-tether/user_settings.json.
+
+        Re-loads the cache first so the watcher's dg1/dg2 fields aren't
+        clobbered by our lv_window-only write. If the cache file doesn't
+        exist yet, a fresh ``SettingsCache`` is created with empty dg1/dg2.
+        """
+        try:
+            on_disk = load_settings_cache()
+        except Exception:  # noqa: BLE001
+            on_disk = None
+        cache = on_disk if on_disk is not None else SettingsCache()
+        cache.lv_window = LVWindowState(detached=bool(detached), frame=frame)
+        try:
+            save_settings_cache(cache)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("lv_window cache save failed: %s", e)
+            return
+        # Update our in-memory copy so subsequent loads (e.g. on quit)
+        # see the latest state without a re-read.
+        self._user_settings = cache
+
     # ----- hotkeys (global within app) --------------------------------
 
     def _install_hotkeys(self) -> None:
@@ -1385,6 +1769,10 @@ class FloatingTetherPanel(NSObject):
                     return None  # consume
                 if k_lower == "g":
                     self._cycle_grid()
+                    return None  # consume
+                if k_lower == "d":
+                    # Phase 3.12 — detach/reattach LV viewport.
+                    self._toggle_lv_detached()
                     return None  # consume
 
             # Phase 3.9 Fix 2: Escape (keyCode 53) always drops focus when
@@ -1450,6 +1838,32 @@ class FloatingTetherPanel(NSObject):
             except Exception:  # noqa: BLE001
                 pass
             self._lv_stale_timer = None
+
+        # Phase 3.12 — final flush of LV window state, then close the
+        # detached window if it's still up. We capture frame BEFORE
+        # orderOut_ because NSWindow.frame() may return zeros after
+        # the window leaves the screen list.
+        if getattr(self, "_lv_window", None) is not None:
+            try:
+                f = self._lv_window.frame()
+                frame_tup: tuple[float, float, float, float] | None = (
+                    float(f.origin.x),
+                    float(f.origin.y),
+                    float(f.size.width),
+                    float(f.size.height),
+                )
+            except Exception:  # noqa: BLE001
+                frame_tup = None
+            try:
+                self._save_lv_window_state(detached=True, frame=frame_tup)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("lv_window final save failed: %s", e)
+            try:
+                self._lv_window.orderOut_(None)
+            except Exception:  # noqa: BLE001
+                pass
+            self._lv_window = None
+
         try:
             self._daemon.stop()
         except Exception as e:  # noqa: BLE001

@@ -7,6 +7,7 @@ restarts of the daemon itself.
 """
 
 from fp_l_tether.storage.settings_cache import (
+    LVWindowState,
     SettingsCache,
     cache_path,
     load_settings_cache,
@@ -14,6 +15,7 @@ from fp_l_tether.storage.settings_cache import (
 )
 
 __all__ = [
+    "LVWindowState",
     "SettingsCache",
     "cache_path",
     "load_settings_cache",
