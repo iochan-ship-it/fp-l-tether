@@ -1414,28 +1414,47 @@ class FloatingTetherPanel(NSObject):
     def _resize_panel_for_detach_state(self, detached: bool) -> None:
         """Resize the host panel for the given detach state (Phase 3.13).
 
-        Shrinks to ``PANEL_HEIGHT_DETACHED`` (270) on detach and expands
-        back to ``PANEL_HEIGHT_ATTACHED`` (480) on reattach. The top edge
-        is anchored to the same screen-y across the resize: AppKit uses
-        a bottom-left origin, so growing the panel by ``delta`` requires
-        translating the origin down by ``delta`` to keep the top fixed.
+        ``PANEL_HEIGHT_ATTACHED`` / ``PANEL_HEIGHT_DETACHED`` are
+        **content-area** heights (matching the initWithContentRect_
+        contract used in ``_build_window``). The actual NSWindow frame
+        adds title-bar chrome on top, so we ask AppKit to convert via
+        ``frameRectForContentRect_`` before applying.
+
+        The top edge is anchored to the same screen-y across the resize:
+        AppKit uses a bottom-left origin, so we compute the current top
+        edge first, then place the new frame so its top still hits that
+        coordinate.
 
         Uses ``setFrame_display_(frame, True)`` (no animate flag) — the
         resize is instant by design (質実剛健 / no UI transitions).
         """
-        current = self._panel.frame()
-        new_height = (
+        new_content_height = (
             PANEL_HEIGHT_DETACHED if detached else PANEL_HEIGHT_ATTACHED
         )
-        if current.size.height == new_height:
+        current_window = self._panel.frame()
+        current_content_height = self._panel.contentView().frame().size.height
+        if current_content_height == new_content_height:
             return
-        delta = current.size.height - new_height
-        new_frame = NSMakeRect(
-            current.origin.x,
-            current.origin.y + delta,
-            current.size.width,
-            new_height,
+
+        # Ask AppKit how big the WINDOW must be to host this content rect.
+        # The chrome (title bar etc.) gets added automatically.
+        desired_content_rect = NSMakeRect(
+            0, 0, PANEL_WIDTH, new_content_height
         )
+        desired_window_frame = self._panel.frameRectForContentRect_(
+            desired_content_rect
+        )
+
+        # Keep the top edge anchored: derive new origin.y so that
+        # origin.y + size.height == old top edge.
+        top_y = current_window.origin.y + current_window.size.height
+        new_frame = NSMakeRect(
+            current_window.origin.x,
+            top_y - desired_window_frame.size.height,
+            desired_window_frame.size.width,
+            desired_window_frame.size.height,
+        )
+
         try:
             self._panel.setFrame_display_(new_frame, True)
         except Exception:  # noqa: BLE001
