@@ -1471,7 +1471,16 @@ class FloatingTetherPanel(NSObject):
         # Step 5: persist (detached=True, frame=initial). The frame
         # may already match the cache; save_settings_cache short-circuits
         # nothing internally but the I/O cost is fine for a user action.
-        self._save_lv_window_state(detached=True, frame=initial_frame)
+        # NSRect → tuple conversion required: settings_cache.LVWindowState
+        # expects a 4-tuple of floats, never a raw NSRect/CGPoint (those
+        # are opaque C structs that json.dumps can't serialise).
+        initial_tuple: tuple[float, float, float, float] = (
+            float(initial_frame.origin.x),
+            float(initial_frame.origin.y),
+            float(initial_frame.size.width),
+            float(initial_frame.size.height),
+        )
+        self._save_lv_window_state(detached=True, frame=initial_tuple)
 
         # Step 6: refresh hint so the footer shows "⌘D reattach".
         try:
