@@ -42,6 +42,33 @@ product photography. Bug reports and pull requests very welcome.
 
 ---
 
+## Screenshots
+
+### Floating control panel
+
+![Floating panel with Live View, histogram, and exposure controls](docs/images/floating-panel.png)
+
+The compact panel sits above Lightroom Classic and across macOS Spaces.
+Live View at the top with click-to-AF reticle and an RGB histogram strip
+(highlight / shadow clipping percentages at the corners). Hero exposure
+values (ISO, Shutter, Aperture) in SF Mono, plus dropdowns for format,
+resolution, and white balance. Spacebar shoots; `A` focuses; `H`/`G`
+toggle the overlays.
+
+> Live View shown here is a Macbeth ColorChecker placeholder — the real
+> Live View renders camera frames at 10 fps.
+
+### Detachable Live View window
+
+![Detached Live View window with the compact panel showing a placeholder](docs/images/detached-lv.png)
+
+`⌘D` pops Live View into a resizable 3:2 window for art-repro / studio
+work. Click-to-AF, RGB histogram, and composition grid all stay alive
+in the detached window. The compact panel shrinks to expose exposure
+controls only, with a clear placeholder showing the LV is detached.
+
+---
+
 ## Why this project
 
 The Sigma fp L is a remarkable little camera that deserves a great
