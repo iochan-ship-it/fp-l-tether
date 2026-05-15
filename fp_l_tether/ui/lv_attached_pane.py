@@ -65,7 +65,15 @@ _GLYPH = "\u2922"  # ⤢
 
 
 class LVDetachedPlaceholder(NSView):
-    """Static slot view shown when LV is in the detached window.
+    """[DEPRECATED — Phase 3.13] Static slot view formerly shown when
+    LV was detached.
+
+    Phase 3.13 replaced the placeholder approach with a full panel
+    shrink (PANEL_HEIGHT_ATTACHED → PANEL_HEIGHT_DETACHED): when LV
+    is elsewhere, the LV slot is removed entirely and only the
+    control elements remain. This class is kept in tree for now in
+    case a future "attach with small thumb LV" mode reuses it, but
+    the floating panel no longer constructs or attaches instances.
 
     The view is purely presentational — it stores a back-ref to the
     panel so ``mouseDown_`` can drive the same toggle the ⌘D hotkey

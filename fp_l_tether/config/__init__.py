@@ -240,6 +240,26 @@ class UIConfig(BaseModel):
     quit_key: str = "cmd+q"
 
 
+class HistogramConfig(BaseModel):
+    """Histogram strip placement (Phase 3.13).
+
+    bottom_strip — full LV width × 50pt high band at the LV's bottom.
+                   Compact, no overlay over the photo. Best for the
+                   compact panel.
+
+    top_right    — 180×90pt rounded box anchored to the LV's top-right
+                   corner, 12pt margin, semi-transparent background.
+                   Best for large detached LV windows.
+    """
+
+    position: Literal["bottom_strip", "top_right"] = "bottom_strip"
+
+    # When True (default), the detached LV window auto-switches to
+    # 'top_right' regardless of ``position``. Reattaching restores
+    # 'bottom_strip' on the compact panel.
+    auto_top_right_when_detached: bool = True
+
+
 class LVWindowConfig(BaseModel):
     """Detached LV window defaults (Phase 3.12).
 
@@ -341,6 +361,10 @@ class LiveViewConfig(BaseModel):
     show_histogram: bool = True
     histogram_downsample: int = 2
     grid_mode: Literal["off", "thirds", "golden", "full"] = "off"
+
+    # Phase 3.13 — histogram placement (bottom strip vs top-right
+    # overlay on the detached window).
+    histogram: HistogramConfig = Field(default_factory=HistogramConfig)
 
     # Phase 3.12 — detachable LV window defaults. Runtime geometry
     # is persisted in user_settings.json; these knobs are the

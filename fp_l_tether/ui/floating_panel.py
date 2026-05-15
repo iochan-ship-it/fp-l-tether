@@ -201,7 +201,13 @@ STATUS_PRESETS = {
 # Layout constants
 # ---------------------------------------------------------------------
 PANEL_WIDTH = 320
-PANEL_HEIGHT = 480
+# Phase 3.13 — two-state panel height. Attached = LV slot + controls;
+# detached = controls only (LV lives in its own window so the slot is
+# removed, not just hidden). PANEL_HEIGHT keeps its historical value
+# as an alias for layout math + the initial NSPanel rect.
+PANEL_HEIGHT_ATTACHED = 480
+PANEL_HEIGHT_DETACHED = 270  # STATUS_Y + STATUS_H + PAD_TOP = 238 + 18 + 14
+PANEL_HEIGHT = PANEL_HEIGHT_ATTACHED
 PAD_X = 16
 PAD_TOP = 14
 PAD_BOTTOM = 14
@@ -1405,6 +1411,39 @@ class FloatingTetherPanel(NSObject):
         else:
             self._reattach_lv()
 
+    def _resize_panel_for_detach_state(self, detached: bool) -> None:
+        """Resize the host panel for the given detach state (Phase 3.13).
+
+        Shrinks to ``PANEL_HEIGHT_DETACHED`` (270) on detach and expands
+        back to ``PANEL_HEIGHT_ATTACHED`` (480) on reattach. The top edge
+        is anchored to the same screen-y across the resize: AppKit uses
+        a bottom-left origin, so growing the panel by ``delta`` requires
+        translating the origin down by ``delta`` to keep the top fixed.
+
+        Uses ``setFrame_display_(frame, True)`` (no animate flag) — the
+        resize is instant by design (質実剛健 / no UI transitions).
+        """
+        current = self._panel.frame()
+        new_height = (
+            PANEL_HEIGHT_DETACHED if detached else PANEL_HEIGHT_ATTACHED
+        )
+        if current.size.height == new_height:
+            return
+        delta = current.size.height - new_height
+        new_frame = NSMakeRect(
+            current.origin.x,
+            current.origin.y + delta,
+            current.size.width,
+            new_height,
+        )
+        try:
+            self._panel.setFrame_display_(new_frame, True)
+        except Exception:  # noqa: BLE001
+            # Resize failure is non-fatal — the LV ownership move
+            # already succeeded; a stuck-large panel is recoverable
+            # via reattach, a stuck-small panel via detach toggle.
+            pass
+
     def _detach_lv(self) -> None:
         """Lift the 5 LV-area views into a new ``LVDetachedWindow``.
 
@@ -1453,13 +1492,12 @@ class FloatingTetherPanel(NSObject):
             return
         self._lv_window.makeKeyAndOrderFront_(None)
 
-        # Step 3: drop the placeholder into the panel's LV slot so the
-        # user doesn't see a black hole where the LV used to live.
-        self._placeholder = LVDetachedPlaceholder.alloc().initWithFrame_(
-            NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT)
-        )
-        self._placeholder.setOwner_(self)
-        content.addSubview_(self._placeholder)
+        # Step 3 (Phase 3.13): no more placeholder. Instead, shrink the
+        # host panel so only the control surface (status + exposure +
+        # dropdowns + subject + buttons + hint) remains visible. Top
+        # edge is preserved so the user's panel position doesn't jump.
+        self._placeholder = None
+        self._resize_panel_for_detach_state(detached=True)
 
         # Step 4: reposition AF reticle relative to the detached window's
         # LV bounds (cam_to_view now reads _live_view.frame()).
@@ -1508,7 +1546,10 @@ class FloatingTetherPanel(NSObject):
         except Exception:  # noqa: BLE001
             final_tuple = None
 
-        # Step 1: remove the placeholder.
+        # Step 1: defensive placeholder cleanup. Phase 3.13 no longer
+        # constructs LVDetachedPlaceholder, but a stale instance could
+        # exist if some earlier code path attached one — clear it so
+        # the panel content view doesn't keep an orphaned subview.
         if self._placeholder is not None:
             try:
                 self._placeholder.removeFromSuperview()
@@ -1529,12 +1570,23 @@ class FloatingTetherPanel(NSObject):
             except Exception:  # noqa: BLE001
                 pass
 
+        # Step 2.5 (Phase 3.13): expand the panel back to attached
+        # height BEFORE we write the canonical view frames. Top edge
+        # stays anchored so the panel grows down, not up.
+        self._resize_panel_for_detach_state(detached=False)
+
         # Step 3: restore each view's original panel-relative frame.
         # The detached window resized them to its content bounds; we
         # need to write the canonical panel slot back so they fit.
         self._live_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
         self._grid_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
         self._hist_view.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, HIST_STRIP_H))
+        # Phase 3.13: revert hist to bottom-strip rendering on the
+        # compact panel. setMode_ is no-op if already bottom_strip.
+        try:
+            self._hist_view.setMode_("bottom_strip")
+        except Exception:  # noqa: BLE001
+            pass
         self._lv_overlay.setFrame_(NSMakeRect(LV_X, LV_Y, LV_WIDTH, LV_HEIGHT))
         # Pause overlay label needs its panel-slot centre too.
         try:

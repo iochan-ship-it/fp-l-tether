@@ -1,4 +1,4 @@
-"""RGB histogram strip — bottom overlay inside the LV viewport.
+"""RGB histogram — bottom strip or top-right overlay inside the LV.
 
 NSView subclass that owns a ``HistogramData`` snapshot and renders it
 in ``drawRect:`` using NSBezierPath. Three overlapping line paths
@@ -6,6 +6,11 @@ in ``drawRect:`` using NSBezierPath. Three overlapping line paths
 brightens toward white — the standard additive-blend RGB histogram look.
 
 Numeric clipping markers (▲ X.X% / ▽ X.X%) are drawn at the corners.
+
+Phase 3.13 adds a second placement mode: a 180×90 rounded box anchored
+to the LV's top-right corner. Mode selection lives in
+:py:meth:`HistogramView.setMode_`; the caller is responsible for
+matching the view's frame to the chosen mode.
 
 The view is purely presentation: it stores the latest data, calls
 ``setNeedsDisplay_(True)``, and lets AppKit redraw on the next runloop
@@ -72,6 +77,22 @@ _MARKER_BLUE = NSColor.colorWithCalibratedRed_green_blue_alpha_(
 # of UI cycles.
 _MARKER_FONT = NSFont.monospacedSystemFontOfSize_weight_(11, 0.23)
 
+# Compact (top-right) marker font — SF Mono Medium 10pt. The compact
+# box is 180×90, so the 11pt label crowds the 14pt top margin; 10pt
+# leaves a comfortable optical gap.
+_COMPACT_MARKER_FONT = NSFont.monospacedSystemFontOfSize_weight_(10, 0.23)
+
+# Phase 3.13 — compact (top-right) chrome tokens. The layer paints
+# the background + border so drawRect_ doesn't repaint them per frame.
+_COMPACT_BG_COLOR = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+    10 / 255.0, 10 / 255.0, 12 / 255.0, 0.78
+)
+_COMPACT_BORDER_COLOR = NSColor.colorWithCalibratedWhite_alpha_(1.0, 0.12)
+_COMPACT_CORNER_RADIUS = 4.0
+_COMPACT_BORDER_WIDTH = 0.5
+_COMPACT_PADDING = 6
+_COMPACT_TOP_MARGIN = 14
+
 # Padding inside the strip — leaves room for the corner markers.
 _PADDING = 8
 
@@ -95,18 +116,33 @@ def _log_scale(count: int, max_log: float, height: float) -> float:
 
 
 class HistogramView(NSView):
-    """Bottom-strip RGB histogram with clipping % markers.
+    """RGB histogram with clipping % markers — two render modes.
 
     Use ``setData_`` from the main thread to push a new
     ``HistogramData`` snapshot — the view marks itself dirty and
     AppKit redraws on the next runloop tick.
+
+    Two modes (Phase 3.13):
+      - ``bottom_strip`` (default): full-width band at the LV's
+        bottom edge, translucent dark background painted in
+        ``drawRect_`` — the historical layout.
+      - ``top_right``: 180×90 rounded box with the background and
+        border painted by the CALayer (so ``_draw_compact`` only
+        renders traces + markers).
+
+    Switch via :py:meth:`setMode_`; the caller is responsible for
+    also setting the correct frame.
     """
+
+    _MODE_BOTTOM_STRIP = "bottom_strip"
+    _MODE_TOP_RIGHT = "top_right"
 
     def initWithFrame_(self, frame):  # type: ignore[no-untyped-def]
         self = objc.super(HistogramView, self).initWithFrame_(frame)
         if self is None:
             return None
         self._data: HistogramData | None = None
+        self._mode: str = self._MODE_BOTTOM_STRIP
         # Layer-backing keeps the strip composited on top of the LV
         # image without redraw flicker when the LV refreshes at 10 fps.
         self.setWantsLayer_(True)
@@ -119,11 +155,49 @@ class HistogramView(NSView):
         self._data = data
         self.setNeedsDisplay_(True)
 
+    def setMode_(self, mode):  # type: ignore[no-untyped-def]
+        """Switch between 'bottom_strip' and 'top_right' rendering.
+
+        Callers must also ``setFrame_`` to the appropriate frame; this
+        method only flips the rendering style + layer chrome.
+        No-op when the mode is unchanged or unrecognised.
+        """
+        if mode not in (self._MODE_BOTTOM_STRIP, self._MODE_TOP_RIGHT):
+            return
+        if getattr(self, "_mode", None) == mode:
+            return
+        self._mode = mode
+        self.setWantsLayer_(True)
+        layer = self.layer()
+        if layer is None:
+            self.setNeedsDisplay_(True)
+            return
+        if mode == self._MODE_TOP_RIGHT:
+            # Layer paints the box chrome — drawRect_ stays out of it.
+            layer.setBackgroundColor_(_COMPACT_BG_COLOR.CGColor())
+            layer.setCornerRadius_(_COMPACT_CORNER_RADIUS)
+            layer.setBorderWidth_(_COMPACT_BORDER_WIDTH)
+            layer.setBorderColor_(_COMPACT_BORDER_COLOR.CGColor())
+        else:
+            # Bottom strip: drawRect_ fills _BG_COLOR manually.
+            layer.setBackgroundColor_(NSColor.clearColor().CGColor())
+            layer.setCornerRadius_(0.0)
+            layer.setBorderWidth_(0.0)
+        self.setNeedsDisplay_(True)
+
     def isOpaque(self) -> bool:  # type: ignore[override]
         # Translucent — the LV image must remain visible behind the strip.
         return False
 
     def drawRect_(self, dirty_rect) -> None:  # type: ignore[no-untyped-def]
+        if self._mode == self._MODE_TOP_RIGHT:
+            self._draw_compact(dirty_rect)
+        else:
+            self._draw_strip(dirty_rect)
+
+    # ----- bottom-strip rendering (existing layout) ----------------
+
+    def _draw_strip(self, dirty_rect) -> None:  # type: ignore[no-untyped-def]
         bounds = self.bounds()
         w = bounds.size.width
         h = bounds.size.height
@@ -179,6 +253,55 @@ class HistogramView(NSView):
         # ---- Clipping markers (drawn AFTER the histogram so they
         #      sit on top, not blended additively into white) -------
         self._draw_markers(data, w, h)
+
+    # ----- compact (top-right) rendering (Phase 3.13) --------------
+
+    def _draw_compact(self, dirty_rect) -> None:  # type: ignore[no-untyped-def]
+        """Render the 180×90 top-right overlay.
+
+        Layer-painted background + border, so we only draw the traces
+        and the corner markers here. Padding 6pt, top 14pt reserved
+        for markers, plot area ≈ 168 × 70.
+        """
+        data = self._data
+        if data is None:
+            return
+        bounds = self.bounds()
+        w = bounds.size.width
+        h = bounds.size.height
+        pad = _COMPACT_PADDING
+        top_margin = _COMPACT_TOP_MARGIN
+        inner_w = max(1.0, w - 2 * pad)
+        inner_h = max(1.0, h - top_margin - pad)
+
+        max_count = max(
+            max(data.r) if data.r else 0,
+            max(data.g) if data.g else 0,
+            max(data.b) if data.b else 0,
+        )
+        if max_count <= 0:
+            self._draw_markers_compact(data, w, h)
+            return
+        max_log = math.log10(max_count + 1)
+
+        ctx = NSGraphicsContext.currentContext()
+        if ctx is not None:
+            ctx.saveGraphicsState()
+            ctx.setCompositingOperation_(NSCompositingOperationPlusLighter)
+        try:
+            for channel, color in (
+                (data.r, _R_COLOR),
+                (data.g, _G_COLOR),
+                (data.b, _B_COLOR),
+            ):
+                self._stroke_channel(
+                    channel, color, max_log, inner_w, inner_h, pad
+                )
+        finally:
+            if ctx is not None:
+                ctx.restoreGraphicsState()
+
+        self._draw_markers_compact(data, w, h)
 
     # ----- helpers ---------------------------------------------------
 
@@ -258,4 +381,48 @@ class HistogramView(NSView):
         )
         right_str.drawInRect_(
             NSMakeRect(w - _PADDING - marker_w, text_y, marker_w, text_h)
+        )
+
+    def _draw_markers_compact(self, data, w: float, h: float) -> None:
+        """Compact-mode marker variant — 10pt font, 6pt padding."""
+        high_pct = max(0.0, float(data.clipped_high_pct))
+        low_pct = max(0.0, float(data.clipped_low_pct))
+
+        high_color = _MARKER_RED if high_pct > _CLIP_WARN_PCT else _MARKER_WHITE
+        low_color = _MARKER_BLUE if low_pct > _CLIP_WARN_PCT else _MARKER_WHITE
+
+        high_text = f"\u25b2 {high_pct:4.1f}%"  # ▲
+        low_text = f"\u25bd {low_pct:4.1f}%"    # ▽
+
+        pad = _COMPACT_PADDING
+        text_h = 12
+        text_y = h - pad - text_h + 1
+
+        left_style = NSMutableParagraphStyle.alloc().init()
+        left_style.setAlignment_(NSTextAlignmentLeft)
+        right_style = NSMutableParagraphStyle.alloc().init()
+        right_style.setAlignment_(NSTextAlignmentRight)
+
+        left_attrs = {
+            NSFontAttributeName: _COMPACT_MARKER_FONT,
+            NSForegroundColorAttributeName: high_color,
+            NSParagraphStyleAttributeName: left_style,
+        }
+        right_attrs = {
+            NSFontAttributeName: _COMPACT_MARKER_FONT,
+            NSForegroundColorAttributeName: low_color,
+            NSParagraphStyleAttributeName: right_style,
+        }
+        left_str = NSAttributedString.alloc().initWithString_attributes_(
+            high_text, left_attrs
+        )
+        right_str = NSAttributedString.alloc().initWithString_attributes_(
+            low_text, right_attrs
+        )
+        marker_w = 72
+        left_str.drawInRect_(
+            NSMakeRect(pad, text_y, marker_w, text_h)
+        )
+        right_str.drawInRect_(
+            NSMakeRect(w - pad - marker_w, text_y, marker_w, text_h)
         )

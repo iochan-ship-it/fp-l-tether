@@ -21,8 +21,10 @@ Window style:
     the way the panel itself does.
 
 Resize layout: all five views snap to the content bounds in
-``windowDidResize_``. The histogram remains a bottom 50pt strip; the
-overlay label re-centres; AF reticle is re-positioned by the panel's
+``windowDidResize_``. The histogram defaults to a 180×90 top-right
+overlay (Phase 3.13) so it doesn't crop the photo; ``HistogramConfig``
+in user config can opt back to the bottom 50pt strip. The overlay
+label re-centres; AF reticle is re-positioned by the panel's
 ``_reposition_af_marker`` (which reads ``_live_view.frame()`` so it
 naturally tracks whichever superview the marker is currently parented
 to).
@@ -56,6 +58,13 @@ if TYPE_CHECKING:
 # and the strip height changes, update both sides together.
 _HIST_STRIP_H = 50
 
+# Phase 3.13 — compact (top-right) histogram overlay geometry. Fixed
+# 180×90 box, 12pt margin from the LV's top-right corner regardless
+# of window size. Matches the size HistogramView._draw_compact assumes.
+_COMPACT_HIST_W = 180
+_COMPACT_HIST_H = 90
+_COMPACT_HIST_MARGIN = 12
+
 # Pause overlay label height — kept in sync with the panel's
 # _lv_overlay_label construction (NSMakeRect(0, (h-22)//2, w, 22)).
 _OVERLAY_LABEL_H = 22
@@ -69,6 +78,17 @@ _WINDOW_TITLE = "fp L · Live View"
 _C_BG_PANEL = NSColor.colorWithCalibratedRed_green_blue_alpha_(
     26 / 255.0, 26 / 255.0, 28 / 255.0, 1.0
 )
+
+
+def _compact_hist_frame_for_bounds(bounds):  # type: ignore[no-untyped-def]
+    """Return the top-right histogram overlay NSRect inside ``bounds``.
+
+    Anchors a 180×90 box to the top-right corner with a 12pt inset on
+    top and right, regardless of LV window size. Phase 3.13.
+    """
+    x = bounds.origin.x + bounds.size.width - _COMPACT_HIST_W - _COMPACT_HIST_MARGIN
+    y = bounds.origin.y + bounds.size.height - _COMPACT_HIST_H - _COMPACT_HIST_MARGIN
+    return NSMakeRect(x, y, _COMPACT_HIST_W, _COMPACT_HIST_H)
 
 
 class LVDetachedWindow(NSWindow):
@@ -195,13 +215,39 @@ class LVDetachedWindow(NSWindow):
         except Exception:  # noqa: BLE001
             pass
 
-        # Histogram = bottom 50pt strip; width follows.
-        self._hist_view.setFrame_(NSMakeRect(
-            bounds.origin.x,
-            bounds.origin.y,
-            w,
-            _HIST_STRIP_H,
-        ))
+        # Histogram placement: Phase 3.13 — default to top-right 180×90
+        # overlay on the detached window; fall back to the bottom strip
+        # if HistogramConfig.auto_top_right_when_detached is False and
+        # position != "top_right".
+        use_top_right = True
+        try:
+            hist_cfg = self._panel._cfg.liveview.histogram
+            if not (
+                hist_cfg.auto_top_right_when_detached
+                or hist_cfg.position == "top_right"
+            ):
+                use_top_right = False
+        except Exception:  # noqa: BLE001
+            # Config missing fields → safe default (top-right).
+            pass
+
+        if use_top_right:
+            self._hist_view.setFrame_(_compact_hist_frame_for_bounds(bounds))
+            try:
+                self._hist_view.setMode_("top_right")
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            self._hist_view.setFrame_(NSMakeRect(
+                bounds.origin.x,
+                bounds.origin.y,
+                w,
+                _HIST_STRIP_H,
+            ))
+            try:
+                self._hist_view.setMode_("bottom_strip")
+            except Exception:  # noqa: BLE001
+                pass
 
         # Pause overlay covers the whole viewport; its centred label
         # also needs re-centring (label uses overlay-local coords).
