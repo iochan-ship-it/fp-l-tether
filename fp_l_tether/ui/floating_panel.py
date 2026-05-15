@@ -664,7 +664,7 @@ class FloatingTetherPanel(NSObject):
         self._hint_label.setTextColor_(C_FG_TERTIARY)
         self._hint_label.setAlignment_(NSTextAlignmentCenter)
         self._hint_label.setStringValue_(
-            "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · ⌘D detach · ⌘Q quit"
+            "␣ shoot · A/⌘A focus · H/⌘H hist · G/⌘G grid · ⌘D detach · ⌘Q quit"
         )
         content.addSubview_(self._hint_label)
 
@@ -791,7 +791,7 @@ class FloatingTetherPanel(NSObject):
     def _refresh_hint(self, state: str) -> None:
         """Update the footer hint per state.
 
-        Default reads ``␣ shoot · A focus · ⌘Q quit`` (the keymap).
+        Default reads ``␣ shoot · A/⌘A focus · ⌘Q quit`` (the keymap).
         During capture / recovery it switches to a guidance string.
         """
         if state in ("shooting", "downloading"):
@@ -806,7 +806,7 @@ class FloatingTetherPanel(NSObject):
         else:
             detach_word = "reattach" if self._lv_window is not None else "detach"
             text = (
-                "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · "
+                "␣ shoot · A/⌘A focus · H/⌘H hist · G/⌘G grid · "
                 f"⌘D {detach_word} · ⌘, prefs · ⌘Q quit"
             )
             color = C_FG_TERTIARY
@@ -1358,7 +1358,7 @@ class FloatingTetherPanel(NSObject):
         try:
             detach_word = "reattach" if self._lv_window is not None else "detach"
             self._hint_label.setStringValue_(
-                f"Grid: {new_mode}    ␣ shoot · A focus · H/⌘H hist · "
+                f"Grid: {new_mode}    ␣ shoot · A/⌘A focus · H/⌘H hist · "
                 f"G/⌘G grid · ⌘D {detach_word} · ⌘Q quit"
             )
         except Exception:  # noqa: BLE001
@@ -1879,6 +1879,14 @@ class FloatingTetherPanel(NSObject):
                 if k_lower == "d":
                     # Phase 3.12 — detach/reattach LV viewport.
                     self._toggle_lv_detached()
+                    return None  # consume
+                if k_lower == "a":
+                    # AF trigger that works even when SUBJECT (or any
+                    # text field) has focus. Consumes ⌘A inside the
+                    # SUBJECT field — Select All is a minor loss in a
+                    # one-line item-name input. The bare ``a`` binding
+                    # below still works outside text fields.
+                    self._daemon.request_af()
                     return None  # consume
                 if key == ",":
                     # Phase 3.14 — Preferences window. Use the raw
