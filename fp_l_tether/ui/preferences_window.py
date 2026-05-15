@@ -37,10 +37,8 @@ from AppKit import (
     NSMakeSize,
     NSModalResponseOK,
     NSNormalWindowLevel,
-    NSOnState,
     NSOpenPanel,
     NSPopUpButton,
-    NSSwitchButton,
     NSTextAlignmentLeft,
     NSTextField,
     NSView,
@@ -48,6 +46,17 @@ from AppKit import (
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskTitled,
 )
+
+# Raw AppKit constants for setButtonType_ / setState_. PyObjC has
+# dropped the named ``NSOnState`` and ``NSSwitchButton`` aliases on
+# modern macOS (those were deprecated in 10.14 in favour of
+# NSControlStateValueOn / NSButtonTypeSwitch), but the underlying
+# integer values are stable. We use the integers directly so the code
+# works across PyObjC versions without conditional imports.
+_NS_BTN_RADIO = 4      # NSButtonTypeRadio
+_NS_BTN_SWITCH = 3     # NSButtonTypeSwitch
+_NS_STATE_ON = 1       # NSControlStateValueOn
+_NS_STATE_OFF = 0      # NSControlStateValueOff
 from Foundation import NSObject, NSURL
 
 from fp_l_tether.storage import (
@@ -363,7 +372,7 @@ class PreferencesWindow(NSObject):
         self._json_log_btn = NSButton.alloc().initWithFrame_(
             NSMakeRect(CONTROL_X, y, CONTROL_W, ROW_H)
         )
-        self._json_log_btn.setButtonType_(NSSwitchButton)
+        self._json_log_btn.setButtonType_(_NS_BTN_SWITCH)
         self._json_log_btn.setTitle_("Save structured JSON log")
         self._json_log_btn.setTarget_(self)
         self._json_log_btn.setAction_("jsonLogToggled:")
@@ -447,10 +456,10 @@ class PreferencesWindow(NSObject):
         # Mode radio
         current_mode = prefs.lightroom_mode or cfg.lightroom.mode
         self._mode_watch_btn.setState_(
-            NSOnState if current_mode == "watch" else 0
+            _NS_STATE_ON if current_mode == "watch" else 0
         )
         self._mode_session_btn.setState_(
-            NSOnState if current_mode == "session" else 0
+            _NS_STATE_ON if current_mode == "session" else 0
         )
 
         # Path fields
@@ -485,7 +494,7 @@ class PreferencesWindow(NSObject):
             if prefs.json_log_enabled is not None
             else True
         )
-        self._json_log_btn.setState_(NSOnState if json_enabled else 0)
+        self._json_log_btn.setState_(_NS_STATE_ON if json_enabled else 0)
 
         # Snapshot the restart-required values so we can flag divergence.
         self._snapshot_log_dir = self._log_dir_field.stringValue()
@@ -530,8 +539,8 @@ class PreferencesWindow(NSObject):
     def modeChanged_(self, sender) -> None:  # type: ignore[no-untyped-def]
         # Mutex: clicking one radio clears the other.
         is_watch = sender is self._mode_watch_btn
-        self._mode_watch_btn.setState_(NSOnState if is_watch else 0)
-        self._mode_session_btn.setState_(0 if is_watch else NSOnState)
+        self._mode_watch_btn.setState_(_NS_STATE_ON if is_watch else 0)
+        self._mode_session_btn.setState_(0 if is_watch else _NS_STATE_ON)
         new_mode = "watch" if is_watch else "session"
         self._commit({"lightroom_mode": new_mode})
         try:
