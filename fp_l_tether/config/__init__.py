@@ -430,6 +430,13 @@ def load_config(path: str | Path | None = None) -> AppConfig:
       1. ``./config.toml`` in the project root
       2. ``~/.config/fp-l-tether/config.toml``
       3. Built-in defaults
+
+    After the TOML layer is resolved, Phase 3.14 overlays
+    ``user_settings.json`` ``app_prefs`` on top so values the user has
+    tuned via the Preferences window win over the file-shipped defaults.
+    Override precedence:
+
+        built-in defaults  <  config.toml  <  user_settings.json:app_prefs
     """
     if path is not None:
         toml_path = Path(os.path.expanduser(str(path)))
@@ -442,11 +449,54 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         )
 
     if toml_path is None:
-        return AppConfig()  # all defaults
+        cfg = AppConfig()
+    else:
+        with toml_path.open("rb") as f:
+            raw = tomllib.load(f)
+        cfg = AppConfig(**raw)
 
-    with toml_path.open("rb") as f:
-        raw = tomllib.load(f)
-    return AppConfig(**raw)
+    _apply_app_prefs_overrides(cfg)
+    return cfg
+
+
+def _apply_app_prefs_overrides(cfg: "AppConfig") -> None:
+    """Overlay user_settings.json:app_prefs onto a fresh ``AppConfig``.
+
+    Reads the cache via :func:`fp_l_tether.storage.load_settings_cache`,
+    pulls the ``app_prefs`` section, and writes each override into the
+    matching nested model. Sections / keys we don't recognise (e.g.
+    ``logging.log_dir`` — slated for a future telemetry refactor) are
+    silently skipped so an older binary can still read a newer cache
+    without crashing.
+
+    Best-effort: any error during cache load is swallowed and the
+    config is returned as the TOML / defaults gave it.
+    """
+    try:
+        # Imported here to avoid a config ↔ storage import cycle at
+        # module-init time; load_config is called once at startup so
+        # the per-call import cost is negligible.
+        from fp_l_tether.storage import load_settings_cache
+    except ImportError:
+        return
+    try:
+        cache = load_settings_cache()
+    except Exception:  # noqa: BLE001
+        return
+    if cache is None or cache.app_prefs is None:
+        return
+    for (section, key), value in cache.app_prefs.to_config_overrides().items():
+        target = getattr(cfg, section, None)
+        if target is None:
+            # Unknown section — Phase 3.14 ``logging.*`` overrides land
+            # here until a future phase adds a LoggingConfig model.
+            continue
+        try:
+            setattr(target, key, value)
+        except (AttributeError, ValueError):
+            # Unknown key on a known section, or a value pydantic
+            # rejected. Skip — don't break startup on a stale cache.
+            continue
 
 
 def print_config(cfg: AppConfig) -> None:

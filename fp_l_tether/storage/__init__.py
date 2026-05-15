@@ -6,6 +6,7 @@ camera settings survive (a) the camera's internal reset on USB plug,
 restarts of the daemon itself.
 """
 
+from fp_l_tether.storage.app_prefs import AppPrefs
 from fp_l_tether.storage.settings_cache import (
     LVWindowState,
     SettingsCache,
@@ -15,6 +16,7 @@ from fp_l_tether.storage.settings_cache import (
 )
 
 __all__ = [
+    "AppPrefs",
     "LVWindowState",
     "SettingsCache",
     "cache_path",

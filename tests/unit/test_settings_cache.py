@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from fp_l_tether.storage.app_prefs import AppPrefs
 from fp_l_tether.storage.settings_cache import (
     CACHE_SCHEMA_VERSION,
     LVWindowState,
@@ -205,3 +206,160 @@ def test_lv_window_section_omitted_when_state_is_none(tmp_path: Path) -> None:
     assert save_settings_cache(src, path=cp)
     raw = json.loads(cp.read_text(encoding="utf-8"))
     assert "lv_window" not in raw
+
+
+# ---------------------------------------------------------------------
+# Phase 3.14 — app_prefs section
+# ---------------------------------------------------------------------
+
+
+def test_app_prefs_round_trip(tmp_path: Path) -> None:
+    """app_prefs survives save → load with every field intact."""
+    cp = _cache_file(tmp_path)
+    src = SettingsCache(
+        dg1={"ISOSpeed": 64},
+        app_prefs=AppPrefs(
+            lightroom_mode="session",
+            watch_folder="~/Pictures/Tether/_watch",
+            session_root="~/Pictures/Tether",
+            default_subject="still_life",
+            filename_template="{session}_{shot:04d}.{ext}",
+            on_conflict="rename",
+            log_dir="~/Library/Logs/fp-l-tether",
+            json_log_enabled=True,
+        ),
+    )
+    assert save_settings_cache(src, path=cp)
+
+    loaded = load_settings_cache(path=cp)
+    assert loaded is not None
+    assert loaded.app_prefs is not None
+    p = loaded.app_prefs
+    assert p.lightroom_mode == "session"
+    assert p.watch_folder == "~/Pictures/Tether/_watch"
+    assert p.session_root == "~/Pictures/Tether"
+    assert p.default_subject == "still_life"
+    assert p.filename_template == "{session}_{shot:04d}.{ext}"
+    assert p.on_conflict == "rename"
+    assert p.log_dir == "~/Library/Logs/fp-l-tether"
+    assert p.json_log_enabled is True
+
+
+def test_v1_cache_loads_without_app_prefs(tmp_path: Path) -> None:
+    """A v1 cache file (Phase 3.12 / 3.13 era) must still load cleanly.
+
+    Critical compat: users with a pre-3.14 cache must not see a crash
+    or have their dg1/dg2/lv_window state wiped on next launch.
+    """
+    cp = _cache_file(tmp_path)
+    cp.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "saved_at": "2026-05-13T22:30:00",
+                "dg1": {"ISOSpeed": 64, "ShutterSpeed": 112},
+                "dg2": {"ImageQuality": 18},
+                "lv_window": {
+                    "detached": True,
+                    "frame": [120.0, 800.0, 720.0, 480.0],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_settings_cache(path=cp)
+    assert loaded is not None
+    assert loaded.app_prefs is None
+    assert loaded.dg1 == {"ISOSpeed": 64, "ShutterSpeed": 112}
+    assert loaded.dg2 == {"ImageQuality": 18}
+    assert loaded.lv_window is not None
+    assert loaded.lv_window.detached is True
+
+
+def test_app_prefs_omitted_when_empty(tmp_path: Path) -> None:
+    """No user overrides → no app_prefs key in JSON, keeping the file tidy."""
+    cp = _cache_file(tmp_path)
+    src = SettingsCache(dg1={"ISOSpeed": 64}, app_prefs=AppPrefs())
+    assert save_settings_cache(src, path=cp)
+    raw = json.loads(cp.read_text(encoding="utf-8"))
+    assert "app_prefs" not in raw
+
+
+def test_v2_schema_marker_on_save(tmp_path: Path) -> None:
+    """Saving stamps the current schema version (2 after Phase 3.14)."""
+    cp = _cache_file(tmp_path)
+    src = SettingsCache(dg1={"ISOSpeed": 64})
+    assert save_settings_cache(src, path=cp)
+    raw = json.loads(cp.read_text(encoding="utf-8"))
+    assert raw["version"] == CACHE_SCHEMA_VERSION == 2
+
+
+def test_reset_app_prefs_preserves_dg1_dg2_and_lv_window(tmp_path: Path) -> None:
+    """Reset (app_prefs=None) must not touch camera state or window state.
+
+    Mirrors ``resetToDefaults_`` in preferences_window.py — that flow
+    sets ``cache.app_prefs = None`` and saves. dg1/dg2 must survive.
+    """
+    cp = _cache_file(tmp_path)
+    src = SettingsCache(
+        dg1={"ISOSpeed": 64, "ShutterSpeed": 112},
+        dg2={"ImageQuality": 18},
+        lv_window=LVWindowState(detached=True, frame=(50.0, 50.0, 720.0, 480.0)),
+        app_prefs=AppPrefs(default_subject="x", watch_folder="~/x"),
+    )
+    assert save_settings_cache(src, path=cp)
+
+    # Reset: load, blank app_prefs, save.
+    cache = load_settings_cache(path=cp)
+    assert cache is not None
+    cache.app_prefs = None
+    assert save_settings_cache(cache, path=cp)
+
+    final = load_settings_cache(path=cp)
+    assert final is not None
+    assert final.dg1 == {"ISOSpeed": 64, "ShutterSpeed": 112}
+    assert final.dg2 == {"ImageQuality": 18}
+    assert final.lv_window is not None
+    assert final.lv_window.detached is True
+    assert final.app_prefs is None
+
+
+def test_app_prefs_to_config_overrides_paths_expanded() -> None:
+    """to_config_overrides expands ``~`` and emits the expected tuples."""
+    p = AppPrefs(
+        lightroom_mode="watch",
+        watch_folder="~/wf",
+        session_root="~/sr",
+        default_subject="hero",
+        filename_template="{ext}",
+        on_conflict="overwrite",
+        log_dir="~/logs",
+        json_log_enabled=False,
+    )
+    out = p.to_config_overrides()
+    assert out[("lightroom", "mode")] == "watch"
+    # Paths come back as Path objects with $HOME expanded.
+    assert str(out[("lightroom", "watch_folder")]).startswith("/")
+    assert str(out[("lightroom", "watch_folder")]).endswith("/wf")
+    assert str(out[("output", "root")]).endswith("/sr")
+    assert out[("output", "default_item")] == "hero"
+    assert out[("output", "filename_template")] == "{ext}"
+    assert out[("output", "on_conflict")] == "overwrite"
+    assert str(out[("logging", "log_dir")]).endswith("/logs")
+    assert out[("logging", "json_log_enabled")] is False
+
+
+def test_app_prefs_only_non_none_serialised() -> None:
+    """Unset fields stay out of the JSON — keeps overrides surgical."""
+    p = AppPrefs(default_subject="only-this")
+    out = p.to_dict()
+    assert out == {"default_subject": "only-this"}
+
+
+def test_app_prefs_from_dict_ignores_unknown_keys() -> None:
+    """Hand-edited cache with stale keys must not crash the loader."""
+    p = AppPrefs.from_dict({
+        "default_subject": "x",
+        "this_field_does_not_exist": 42,
+    })
+    assert p.default_subject == "x"

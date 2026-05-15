@@ -17,11 +17,17 @@ We do exactly that. This module owns the on-disk JSON cache. The daemon:
 Cache layout (``~/.fp-l-tether/user_settings.json``)::
 
     {
-        "version": 1,
-        "saved_at": "2026-05-13T22:30:00",
+        "version": 2,
+        "saved_at": "2026-05-15T22:30:00",
         "dg1": {"ISOSpeed": 64, "ShutterSpeed": 112, "Aperture": 32, ...},
-        "dg2": {"ImageQuality": 18, "WhiteBalance": 1, "DriveMode": 1, ...}
+        "dg2": {"ImageQuality": 18, "WhiteBalance": 1, "DriveMode": 1, ...},
+        "lv_window": {"detached": false, "frame": [...]}, # Phase 3.12
+        "app_prefs": {"watch_folder": "~/Pictures/...", ...} # Phase 3.14
     }
+
+Schema versions: v1 (pre-3.14) has no ``app_prefs`` section, v2 does.
+The loader accepts both — a v1 file just loads with ``app_prefs=None``,
+which downstream code treats identically to "no overrides set".
 
 Writes are atomic (write-temp-then-rename) so a crash mid-save can't
 corrupt the cache. Reads gracefully degrade to "no cache" on any
@@ -44,7 +50,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-CACHE_SCHEMA_VERSION = 1
+from fp_l_tether.storage.app_prefs import AppPrefs
+
+# Phase 3.14 — schema version 2 adds the ``app_prefs`` section.
+# Loader accepts both 1 and 2 (v1 has no app_prefs, treated as
+# "no overrides"). Save always writes the current version.
+CACHE_SCHEMA_VERSION = 2
+_ACCEPTED_SCHEMA_VERSIONS = (1, 2)
 _DEFAULT_CACHE_DIR = Path("~/.fp-l-tether").expanduser()
 _CACHE_FILENAME = "user_settings.json"
 
@@ -72,32 +84,44 @@ class SettingsCache:
     dg1: dict[str, int] = field(default_factory=dict)
     dg2: dict[str, int] = field(default_factory=dict)
     lv_window: LVWindowState | None = None
+    app_prefs: AppPrefs | None = None
     saved_at: str | None = None
     version: int = CACHE_SCHEMA_VERSION
 
     def is_empty(self) -> bool:
-        return not self.dg1 and not self.dg2 and self.lv_window is None
+        return (
+            not self.dg1
+            and not self.dg2
+            and self.lv_window is None
+            and (self.app_prefs is None or self.app_prefs.is_empty())
+        )
 
     def to_dict(self) -> dict[str, Any]:
         # Always stamp the current time on save — ``self.saved_at`` is the
         # value loaded from disk and shouldn't be reused (otherwise the
         # "saved_at" log line lies about when the cache was last persisted).
+        # Schema is always written at the current version even if the
+        # in-memory copy was loaded from an older format — saving normalises.
         out: dict[str, Any] = {
-            "version": self.version,
+            "version": CACHE_SCHEMA_VERSION,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "dg1": dict(self.dg1),
             "dg2": dict(self.dg2),
         }
         # Optional — only written when set, so older readers (and the
         # vast majority of sessions where the user never detaches) keep
-        # a tidy cache file. Schema version stays at 1; lv_window is
-        # additive.
+        # a tidy cache file. lv_window is additive (Phase 3.12).
         if self.lv_window is not None:
             frame = self.lv_window.frame
             out["lv_window"] = {
                 "detached": bool(self.lv_window.detached),
                 "frame": list(frame) if frame is not None else None,
             }
+        # Phase 3.14 — app_prefs. Only written if at least one override
+        # is set; an empty AppPrefs is omitted so a user who never opens
+        # Preferences keeps the cache file tidy.
+        if self.app_prefs is not None and not self.app_prefs.is_empty():
+            out["app_prefs"] = self.app_prefs.to_dict()
         return out
 
     def update_from(self, *, dg1: dict[str, int] | None = None,
@@ -160,9 +184,11 @@ def load_settings_cache(path: Path | None = None) -> SettingsCache | None:
     if not isinstance(data, dict):
         return None
     version = data.get("version", 0)
-    if version != CACHE_SCHEMA_VERSION:
-        # Future-proofing: a version mismatch means the schema changed.
-        # Discard rather than risk feeding bad data to the camera.
+    if version not in _ACCEPTED_SCHEMA_VERSIONS:
+        # Future-proofing: an unrecognised version means the schema
+        # changed in a way we can't safely interpret. Discard rather
+        # than risk feeding bad data to the camera. Phase 3.14: both
+        # v1 (no app_prefs) and v2 (with app_prefs) are accepted.
         return None
     dg1_raw = data.get("dg1", {})
     dg2_raw = data.get("dg2", {})
@@ -182,9 +208,31 @@ def load_settings_cache(path: Path | None = None) -> SettingsCache | None:
         dg1=dg1,
         dg2=dg2,
         lv_window=_parse_lv_window(data.get("lv_window")),
+        app_prefs=_parse_app_prefs(data.get("app_prefs")),
         saved_at=data.get("saved_at"),
         version=version,
     )
+
+
+def _parse_app_prefs(raw: Any) -> AppPrefs | None:
+    """Parse the optional ``app_prefs`` section (Phase 3.14).
+
+    Returns None when the section is missing or malformed — same
+    contract as ``_parse_lv_window``. A None here means "no overrides
+    on file"; downstream code falls back to ``config.toml`` defaults.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        prefs = AppPrefs.from_dict(raw)
+    except (TypeError, ValueError):
+        return None
+    # Empty after filtering = no overrides; return None so callers
+    # don't need to distinguish "section present but blank" from
+    # "section missing".
+    return prefs if not prefs.is_empty() else None
 
 
 def _parse_lv_window(raw: Any) -> LVWindowState | None:

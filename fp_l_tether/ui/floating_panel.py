@@ -122,6 +122,7 @@ from fp_l_tether.ui.grid_overlay import GridOverlayView, cycle_mode as _grid_cyc
 from fp_l_tether.ui.histogram_view import HistogramView
 from fp_l_tether.ui.lv_attached_pane import LVDetachedPlaceholder
 from fp_l_tether.ui.lv_window import LVDetachedWindow
+from fp_l_tether.ui.preferences_window import PreferencesWindow
 
 if TYPE_CHECKING:
     from fp_l_tether.config import AppConfig
@@ -317,6 +318,10 @@ class FloatingTetherPanel(NSObject):
             self._user_settings = None
         self._lv_window: LVDetachedWindow | None = None
         self._placeholder: LVDetachedPlaceholder | None = None
+        # Phase 3.14 — Preferences window singleton (lazy-created on first
+        # ⌘, press). Stays alive across hide/show so its form state and
+        # focused field survive closing the window.
+        self._prefs_controller: PreferencesWindow | None = None
         # Token-based debounce for window-move/resize → settings save.
         # ``_pending_save_token`` is bumped on every event; the queued
         # dispatch_after closure only writes if its captured token still
@@ -802,7 +807,7 @@ class FloatingTetherPanel(NSObject):
             detach_word = "reattach" if self._lv_window is not None else "detach"
             text = (
                 "␣ shoot · A focus · H/⌘H hist · G/⌘G grid · "
-                f"⌘D {detach_word} · ⌘Q quit"
+                f"⌘D {detach_word} · ⌘, prefs · ⌘Q quit"
             )
             color = C_FG_TERTIARY
         self._hint_label.setStringValue_(text)
@@ -1805,6 +1810,27 @@ class FloatingTetherPanel(NSObject):
         # see the latest state without a re-read.
         self._user_settings = cache
 
+    # ----- preferences window (Phase 3.14) ----------------------------
+
+    def _open_preferences(self) -> None:
+        """Open (or re-show) the Preferences window — ⌘, handler.
+
+        Singleton: the controller is constructed on first call and
+        reused thereafter. ``show()`` recenters on first display only,
+        so reopening after the user dragged the window keeps the
+        position they chose.
+        """
+        if self._prefs_controller is None:
+            try:
+                self._prefs_controller = PreferencesWindow(self)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Preferences window construction failed: %s", e)
+                return
+        try:
+            self._prefs_controller.show()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Preferences window show failed: %s", e)
+
     # ----- hotkeys (global within app) --------------------------------
 
     def _install_hotkeys(self) -> None:
@@ -1853,6 +1879,12 @@ class FloatingTetherPanel(NSObject):
                 if k_lower == "d":
                     # Phase 3.12 — detach/reattach LV viewport.
                     self._toggle_lv_detached()
+                    return None  # consume
+                if key == ",":
+                    # Phase 3.14 — Preferences window. Use the raw
+                    # character (not lowercased) so we match the actual
+                    # comma key without colliding with letters.
+                    self._open_preferences()
                     return None  # consume
 
             # Phase 3.9 Fix 2: Escape (keyCode 53) always drops focus when
