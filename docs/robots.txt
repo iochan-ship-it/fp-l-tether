@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://iochan-ship-it.github.io/fp-l-tether/sitemap.xml

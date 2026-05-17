@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>fp-l-tether — Open-source Sigma fp L tethering for macOS + Lightroom Classic</title>
+
+<meta name="description" content="fp-l-tether is an open-source Python tethering daemon for the Sigma fp L on macOS, with Lightroom Classic Auto Import, click-to-AF Live View, RGB histogram and composition grid overlays, and a detachable LV window for iPad workflow.">
+<meta name="keywords" content="Sigma fp L, Sigma fp, tether, tethered shooting, macOS, Lightroom Classic, PTP, USB, open source, Python, PyObjC, libusb, DNG, Live View, click-to-AF, auto import">
+<meta name="author" content="iochan-kaihatsu">
+
+<link rel="canonical" href="https://iochan-ship-it.github.io/fp-l-tether/">
+
+<meta property="og:title" content="fp-l-tether — Sigma fp L tethering for macOS">
+<meta property="og:description" content="Open-source Python tethering daemon for the Sigma fp L on macOS, with Lightroom Classic Auto Import and a detachable Live View window for iPad workflows.">
+<meta property="og:image" content="https://iochan-ship-it.github.io/fp-l-tether/images/floating-panel.png">
+<meta property="og:url" content="https://iochan-ship-it.github.io/fp-l-tether/">
+<meta property="og:type" content="website">
+
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="fp-l-tether — Sigma fp L tethering for macOS">
+<meta name="twitter:description" content="Open-source Python tethering daemon for the Sigma fp L on macOS.">
+<meta name="twitter:image" content="https://iochan-ship-it.github.io/fp-l-tether/images/floating-panel.png">
+
+<style>
+:root {
+  --bg: #1A1A1C;
+  --bg-elevated: #232326;
+  --fg: #F0F0EE;
+  --fg-secondary: #B8B8B6;
+  --fg-tertiary: #6E6E6C;
+  --amber: #E8A13A;
+  --border: #3A3A3D;
+  --code-bg: #14141A;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 64px 24px 96px;
+}
+
+header {
+  text-align: center;
+  padding: 32px 0 48px;
+  border-bottom: 0.5px solid var(--border);
+  margin-bottom: 48px;
+}
+
+h1 {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 44px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  margin: 0 0 12px;
+  color: var(--fg);
+}
+
+.tagline {
+  font-size: 18px;
+  color: var(--fg-secondary);
+  margin: 0 0 32px;
+  font-weight: 400;
+}
+
+.tagline-jp {
+  font-size: 14px;
+  color: var(--fg-tertiary);
+  margin: -24px 0 32px;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 32px;
+}
+
+.badge {
+  display: inline-block;
+  padding: 4px 10px;
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--bg-elevated);
+  color: var(--fg-secondary);
+  border: 0.5px solid var(--border);
+  border-radius: 3px;
+}
+
+.badge-amber { color: var(--amber); border-color: var(--amber); }
+
+.cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px;
+  background: var(--amber);
+  color: #1A1A1C;
+  font-weight: 600;
+  font-size: 16px;
+  text-decoration: none;
+  border-radius: 4px;
+  transition: opacity 0.15s ease;
+}
+.cta:hover { opacity: 0.88; }
+
+.cta-secondary {
+  background: transparent;
+  color: var(--amber);
+  border: 0.5px solid var(--amber);
+  margin-left: 8px;
+}
+
+h2 {
+  font-size: 22px;
+  font-weight: 500;
+  margin: 56px 0 16px;
+  color: var(--fg);
+  padding-bottom: 8px;
+  border-bottom: 0.5px solid var(--border);
+}
+
+h3 { font-size: 16px; font-weight: 500; margin: 24px 0 8px; color: var(--fg); }
+
+p { margin: 0 0 16px; color: var(--fg-secondary); }
+
+a { color: var(--amber); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+ul { padding-left: 24px; margin: 0 0 16px; }
+li { margin-bottom: 6px; color: var(--fg-secondary); }
+
+code {
+  font-family: "SF Mono", Menlo, monospace;
+  font-size: 13px;
+  background: var(--code-bg);
+  padding: 2px 5px;
+  border-radius: 3px;
+  color: var(--amber);
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 16px 20px;
+  border-radius: 6px;
+  border: 0.5px solid var(--border);
+  overflow-x: auto;
+  margin: 16px 0;
+}
+pre code {
+  background: none;
+  padding: 0;
+  color: var(--fg);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+figure {
+  margin: 24px 0;
+  text-align: center;
+}
+figure img {
+  max-width: 100%;
+  height: auto;
+  border: 0.5px solid var(--border);
+  border-radius: 6px;
+}
+figcaption {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--fg-tertiary);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 14px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 0.5px solid var(--border);
+}
+th { color: var(--fg); font-weight: 500; }
+td { color: var(--fg-secondary); }
+
+footer {
+  margin-top: 96px;
+  padding-top: 32px;
+  border-top: 0.5px solid var(--border);
+  font-size: 13px;
+  color: var(--fg-tertiary);
+  text-align: center;
+}
+footer a { color: var(--fg-tertiary); text-decoration: underline; }
+
+@media (max-width: 600px) {
+  .container { padding: 32px 16px 64px; }
+  h1 { font-size: 32px; }
+  h2 { font-size: 20px; }
+  .tagline { font-size: 16px; }
+  .cta-secondary { margin-left: 0; margin-top: 8px; }
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<header>
+  <h1>fp-l-tether</h1>
+  <p class="tagline">Open-source tethered shooting for the Sigma fp L on macOS</p>
+  <p class="tagline-jp">Sigma fp L のテザー撮影を macOS で動かすオープンソース実装</p>
+
+  <div class="badges">
+    <span class="badge">Python 3.10+</span>
+    <span class="badge">macOS 12+</span>
+    <span class="badge badge-amber">MIT License</span>
+    <span class="badge">Status: Beta</span>
+  </div>
+
+  <a class="cta" href="https://github.com/iochan-ship-it/fp-l-tether">View on GitHub →</a>
+  <a class="cta cta-secondary" href="https://github.com/iochan-ship-it/fp-l-tether/releases/tag/v0.1.0">v0.1.0 release</a>
+</header>
+
+<h2>What it does</h2>
+<p>
+  <code>fp-l-tether</code> is a self-contained tethering daemon and floating
+  control panel for the Sigma fp L on macOS. Shots land directly in Lightroom
+  Classic via Auto Import. Used daily by the author for studio product and
+  art-repro photography.
+</p>
+
+<ul>
+  <li><strong>Live View</strong> at 10 fps with click-to-AF on the LV image</li>
+  <li><strong>Detachable LV window</strong> (<code>⌘D</code>) — pop Live View into a
+      resizable 3:2 window for art-repro or iPad-via-Sidecar workflows</li>
+  <li><strong>RGB histogram overlay</strong> with highlight / shadow clipping markers</li>
+  <li><strong>Composition grid</strong> — thirds / golden ratio / full alignment grid</li>
+  <li><strong>Floating control panel</strong> that follows you across macOS Spaces and
+      Lightroom fullscreen</li>
+  <li><strong>Lightroom Classic Auto Import</strong> integration — every shot lands in
+      your catalog automatically</li>
+  <li><strong>Auto USB recovery</strong> — when the fp L's bulk endpoint wedges (a
+      known firmware quirk), the daemon force-re-enumerates the device via
+      IOKit in ~4 seconds</li>
+  <li><strong>Persistent settings cache</strong> — ISO, shutter, aperture, white
+      balance, format, and LV window state stay remembered across disconnects</li>
+  <li><strong>JPG / DNG / DNG+JPG</strong> capture with dual-file extraction</li>
+  <li><strong>Preferences window</strong> (<code>⌘,</code>) — change watch folder,
+      filename pattern, and Lightroom mode without editing TOML</li>
+  <li><strong>質実剛健 design</strong> — anodized-black + amber accent + SF Mono hero
+      values, inspired by the Sigma fp's industrial aesthetic</li>
+</ul>
+
+<h2>Screenshots</h2>
+
+<figure>
+  <img src="images/floating-panel.png" alt="fp-l-tether floating control panel with Live View, RGB histogram, exposure controls, and Shoot/AF buttons">
+  <figcaption>Floating control panel — Live View, histogram, exposure controls, Shoot/AF</figcaption>
+</figure>
+
+<figure>
+  <img src="images/detached-lv.png" alt="Detached Live View window at large size with the compact panel showing exposure controls only">
+  <figcaption>Detached LV window (⌘D) for art-repro and iPad-via-Sidecar workflows</figcaption>
+</figure>
+
+<h2>Quick start</h2>
+
+<pre><code>git clone https://github.com/iochan-ship-it/fp-l-tether.git
+cd fp-l-tether
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .</code></pre>
+
+<p>Connect the Sigma fp L in <strong>Camera Control</strong> USB mode, then:</p>
+
+<pre><code># Kill macOS's built-in PTP daemon first
+sudo killall ptpcamerad
+
+# Launch the daemon + floating panel
+sudo venv/bin/fp-l-tether start</code></pre>
+
+<p>
+  <code>sudo</code> is required because libusb has to detach the kernel driver
+  from the camera's PTP interface. See <a href="SETUP">docs/SETUP</a>
+  for the full permission model.
+</p>
+
+<h2>What's working / not working</h2>
+
+<table>
+  <thead>
+    <tr><th>Feature</th><th>Status</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Capture (single shot, PC-triggered)</td><td>✅ Works</td></tr>
+    <tr><td>Capture (camera-button-triggered)</td><td>✅ Works</td></tr>
+    <tr><td>Live View (10 fps)</td><td>✅ Works</td></tr>
+    <tr><td>Click-to-AF on Live View</td><td>✅ Works</td></tr>
+    <tr><td>ISO / SS / Av / WB / Format / Resolution control</td><td>✅ Works</td></tr>
+    <tr><td>Lightroom Auto Import</td><td>✅ Works</td></tr>
+    <tr><td>Auto USB recovery from wedge</td><td>✅ Works (~4 s)</td></tr>
+    <tr><td>Settings preservation across reconnects</td><td>✅ Works</td></tr>
+    <tr><td>Detachable LV window + Sidecar (iPad as display)</td><td>✅ Works</td></tr>
+    <tr><td>Burst / continuous capture</td><td>⚠️ Single shot only — continuous on roadmap</td></tr>
+    <tr><td>Video / movie tether</td><td>❌ Not supported, no plans</td></tr>
+    <tr><td>Linux / Windows</td><td>❌ macOS only (IOKit-dependent recovery)</td></tr>
+  </tbody>
+</table>
+
+<h2>Documentation</h2>
+<ul>
+  <li><a href="https://github.com/iochan-ship-it/fp-l-tether#readme">Full README on GitHub</a></li>
+  <li><a href="SETUP">SETUP — macOS, libusb, ptpcamerad notes</a></li>
+  <li><a href="LIGHTROOM">LIGHTROOM — Lightroom Classic Auto Import setup</a></li>
+  <li><a href="TROUBLESHOOTING">TROUBLESHOOTING — common issues</a></li>
+</ul>
+
+<h2>Why this project</h2>
+<p>
+  The Sigma fp L is a remarkable little camera that deserves a great
+  tethered shooting experience. This is a community-built option for
+  photographers who want their fp L shots to land directly in Lightroom
+  Classic and who enjoy customizing their tools.
+</p>
+
+<h2>Acknowledgements</h2>
+<p>This work would not have been possible without:</p>
+<ul>
+  <li><strong>libgphoto2</strong> (LGPL-2.1+) — PTP wire-protocol reference</li>
+  <li><strong>sigma-ptpy</strong> by makanikai — independent Python implementation
+      cross-referenced for DataGroup FieldPresent bitmasks</li>
+  <li>All the fp / fp L owners who posted USB captures and protocol notes on
+      GitHub issues, Reddit r/SigmaFP, and DPReview over the years</li>
+</ul>
+
+<footer>
+  <p>
+    Released under the <a href="https://github.com/iochan-ship-it/fp-l-tether/blob/main/LICENSE">MIT License</a>.
+    See <a href="https://github.com/iochan-ship-it/fp-l-tether/blob/main/NOTICE">NOTICE</a> for full third-party attribution.
+  </p>
+  <p>
+    "SIGMA", "Sigma fp", and "Sigma fp L" are trademarks of SIGMA Corporation.
+    This project is <strong>not affiliated with, endorsed by, or sponsored by SIGMA
+    Corporation</strong>. The PTP wire-format details documented here were obtained
+    through clean-room observation of public USB traffic against a Sigma fp L,
+    in line with the interoperability provisions of 17 U.S.C. § 1201(f) and
+    EU Directive 2009/24/EC Article 6.
+  </p>
+</footer>
+
+</div>
+
+</body>
+</html>
