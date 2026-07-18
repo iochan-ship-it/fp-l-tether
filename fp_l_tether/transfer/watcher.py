@@ -65,7 +65,7 @@ from fp_l_tether.camera.usb_recovery import recover_camera
 from fp_l_tether.storage import (
     SettingsCache,
     load_settings_cache,
-    save_settings_cache,
+    save_dg_merged,
 )
 from fp_l_tether.config import AppConfig
 from fp_l_tether.lightroom import build_destination
@@ -236,6 +236,8 @@ class TetherDaemon:
         self._ptp_lock = threading.RLock()
         # Live-view stream — created on connect, torn down on stop.
         self._liveview: LiveViewStream | None = None
+        # Phase 3.16 (A13): dead-stream restarts this session (cap 3).
+        self._lv_restarts: int = 0
         # USB keep-alive heartbeat — same lifecycle as the LV stream.
         self._heartbeat: HeartbeatThread | None = None
 
@@ -549,6 +551,61 @@ class TetherDaemon:
 
     # ----- LV pause/resume helpers ------------------------------------
 
+    def _make_liveview(self, bridge: USBBridge) -> LiveViewStream:
+        """Build a LiveViewStream wired to this daemon's config + gates.
+
+        Phase 3.16: factored out of ``_run_session`` so the A13
+        restart path constructs an identical stream. Also passes
+        ``bus_quiet_check`` (A6) so LV honours the post-capture quiet
+        window exactly like the heartbeat does.
+        """
+        return LiveViewStream(
+            bridge,
+            self._ptp_lock,
+            target_fps=self.cfg.liveview.target_fps,
+            on_frame=self._emit_live_frame,
+            backoff_s=self.cfg.liveview.busy_backoff_ms / 1000.0,
+            max_consecutive_busy=self.cfg.liveview.max_consecutive_busy,
+            promote_after_consecutive_ok=(
+                self.cfg.liveview.promote_after_consecutive_ok
+            ),
+            post_snap_busy_grace_s=(
+                self.cfg.liveview.post_snap_busy_grace_s
+            ),
+            first_storm_grace_s=(
+                self.cfg.liveview.first_storm_grace_s
+            ),
+            histogram_enabled=self.cfg.liveview.show_histogram,
+            histogram_downsample=self.cfg.liveview.histogram_downsample,
+            bus_quiet_check=self.bus_quiet_remaining,
+        )
+
+    def _restart_liveview(self, bridge: USBBridge) -> None:
+        """Replace a dead LV stream with a fresh one (Phase 3.16, A13).
+
+        ``LiveViewStream._run`` returns permanently after
+        MAX_CONSECUTIVE_FAILURES ("liveview_giving_up") — previously
+        nothing ever noticed, so ``pause()``/``resume()`` silently
+        operated on the corpse and LV stayed black until the next
+        disconnect even with a healthy camera. Capped at 3 restarts
+        per session so a genuinely sick camera doesn't churn forever.
+        """
+        if self._lv_restarts >= 3:
+            return
+        self._lv_restarts += 1
+        self.log.warning(
+            "liveview_restarting",
+            attempt=self._lv_restarts,
+            max_attempts=3,
+        )
+        try:
+            if self._liveview is not None:
+                self._liveview.stop(timeout=1.0)
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("liveview_old_stop_failed", error=str(e))
+        self._liveview = self._make_liveview(bridge)
+        self._liveview.start()
+
     def _pause_liveview(self) -> None:
         """Suspend live-view for the duration of a snap+download.
 
@@ -639,7 +696,11 @@ class TetherDaemon:
                                 dg2=req.values if req.group == 2 else None,
                             )
                             if changed:
-                                ok = save_settings_cache(self._settings_cache)
+                                # Phase 3.15 (A3): merge-save — the
+                                # daemon owns only dg1/dg2; lv_window /
+                                # app_prefs on disk (written by the UI
+                                # after our startup load) must survive.
+                                ok = save_dg_merged(self._settings_cache)
                                 self.log.info(
                                     "settings_cache_updated",
                                     group=req.group,
@@ -925,12 +986,66 @@ class TetherDaemon:
         self._emit_status("stopped")
         self.log.info("daemon_stopped", shots=self._shot_count)
 
+    def _drain_stale_requests(self) -> None:
+        """Discard user requests queued while no camera session was live.
+
+        Phase 3.15 (A16): a Space pressed during a wedge/recovery used
+        to sit in ``_snap_queue`` and fire the shutter the instant the
+        ~4 s USB recovery completed — an unexpected shot while the
+        photographer is adjusting the set. Consistent with the Fix-2
+        policy (failed capture drops queued input; the user re-triggers),
+        every (re)connect starts with clean request queues.
+        """
+        drained = 0
+        for q in (
+            self._snap_queue,
+            self._af_queue,
+            self._set_exposure_queue,
+            self._set_focus_queue,
+        ):
+            while True:
+                try:
+                    q.get_nowait()
+                    drained += 1
+                except Empty:
+                    break
+        if drained:
+            self.log.info("stale_requests_dropped", count=drained)
+
+    def _spool_recovery(self, info, data: bytes, entry_idx: int):  # type: ignore[no-untyped-def]
+        """Last-resort save when the normal destination fails (A5).
+
+        By the time we hold ``data``, the camera's ImageDB entry has
+        already been cleared — these bytes exist nowhere else. Write
+        them under ``<output.root>/_recovery/`` with a collision-proof
+        name. Returns the written Path or None. Never raises.
+        """
+        try:
+            root = Path(self.cfg.output.root).expanduser() / "_recovery"
+            root.mkdir(parents=True, exist_ok=True)
+            ext = (getattr(info, "fileext", None) or "jpg").lstrip(".")
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            p = root / (
+                f"recovered_{stamp}_{self._shot_count:04d}_{entry_idx}.{ext}"
+            )
+            saved = write_atomic(p, data, on_conflict="rename")
+            self.log.warning(
+                "shot_spooled_to_recovery", path=str(saved), size=len(data),
+            )
+            return saved
+        except Exception as e:  # noqa: BLE001 — truly out of options
+            self.log.error("recovery_spool_failed", error=str(e))
+            return None
+
     def _run_session(self) -> None:
         """One connected session: find camera, open, init, run main poll loop.
 
         Raises on USB-level failures so the outer loop can reconnect.
         """
         bridge: USBBridge | None = None
+        # Phase 3.15 (A16): never let requests queued against a dead
+        # session fire into the fresh one.
+        self._drain_stale_requests()
         # Phase 3.7c (2026-05-13): track whether the session ended because
         # the bulk endpoint is wedged. If so, the finally block skips
         # ``bridge.close_session()`` — sending PTP CLOSE_SESSION (0x1003)
@@ -1004,7 +1119,10 @@ class TetherDaemon:
                                 dg1=dict(snapshot.dg1),
                                 dg2=dict(snapshot.dg2),
                             )
-                            save_settings_cache(self._settings_cache)
+                            # Phase 3.15 (A3): merge-save so a first-run
+                            # seed can't wipe lv_window/app_prefs that
+                            # the UI may already have persisted.
+                            save_dg_merged(self._settings_cache)
                             self.log.info(
                                 "settings_cache_seeded",
                                 **snapshot.summary(),
@@ -1064,25 +1182,8 @@ class TetherDaemon:
             # the PTP lock so its view-frame fetches serialise against
             # snaps/downloads on the single USB bulk endpoint.
             if self.cfg.liveview.enabled:
-                self._liveview = LiveViewStream(
-                    bridge,
-                    self._ptp_lock,
-                    target_fps=self.cfg.liveview.target_fps,
-                    on_frame=self._emit_live_frame,
-                    backoff_s=self.cfg.liveview.busy_backoff_ms / 1000.0,
-                    max_consecutive_busy=self.cfg.liveview.max_consecutive_busy,
-                    promote_after_consecutive_ok=(
-                        self.cfg.liveview.promote_after_consecutive_ok
-                    ),
-                    post_snap_busy_grace_s=(
-                        self.cfg.liveview.post_snap_busy_grace_s
-                    ),
-                    first_storm_grace_s=(
-                        self.cfg.liveview.first_storm_grace_s
-                    ),
-                    histogram_enabled=self.cfg.liveview.show_histogram,
-                    histogram_downsample=self.cfg.liveview.histogram_downsample,
-                )
+                self._lv_restarts = 0  # Phase 3.16 (A13): per-session cap
+                self._liveview = self._make_liveview(bridge)
                 self._liveview.start()
 
             poll_idle_s = self.cfg.camera.poll_idle_ms / 1000.0
@@ -1174,13 +1275,26 @@ class TetherDaemon:
                 # endpoint. We now wait for at least one successful
                 # poll (which resets the counter to 0) before
                 # resuming.
+                # Phase 3.16: two additions to the resume gate.
+                #   (A6)  ``_snap_queue.empty()`` — mid-burst, the
+                #         quiet window only arms once the queue
+                #         drains, so without this LV (and the set_*
+                #         drains) briefly woke up inside the
+                #         inter-shot commit tail.
+                #   (A13) a stream that gave up (``is_running`` False)
+                #         is replaced instead of being resumed as a
+                #         corpse — previously LV stayed black until
+                #         the next disconnect.
                 if (
                     self._liveview is not None
-                    and self._liveview.is_paused
                     and t_shot_start is None
                     and idle_recovery_attempts == 0
+                    and self._snap_queue.empty()
                 ):
-                    self._resume_liveview()
+                    if not self._liveview.is_running:
+                        self._restart_liveview(bridge)
+                    elif self._liveview.is_paused:
+                        self._resume_liveview()
 
                 # ----- 1a-pre. Drain exposure/focus queues -----
                 # Skip while a shot is in flight — between snap fire
@@ -1193,14 +1307,23 @@ class TetherDaemon:
                 # symmetric with that contract. Queue items survive —
                 # they drain on the next iteration after the quiet
                 # window closes.
-                if t_shot_start is None:
+                # Phase 3.16 (A6): also hold set_* writes while further
+                # snaps are queued — mid-burst, the inter-shot gap has
+                # no quiet window yet (it only arms when the queue
+                # drains), so an exposure write here would land in the
+                # previous shot's commit tail. Items stay queued and
+                # apply after the burst settles.
+                if t_shot_start is None and self._snap_queue.empty():
                     self._drain_set_exposure(bridge)
                     self._drain_set_focus(bridge)
 
                 # ----- 1a. Drain AF queue (only when no shot is in flight) ---
                 # AF-only drive (SnapCommand mode 3) produces no image,
                 # so we don't set t_shot_start / pending_trigger after it.
-                if t_shot_start is None:
+                # Phase 3.16 (A6): same mid-burst hold as set_* above —
+                # the 2026-05-13 wedge was literally "set_focus + AF +
+                # snap during commit window".
+                if t_shot_start is None and self._snap_queue.empty():
                     try:
                         self._af_queue.get_nowait()
                     except Empty:
@@ -1460,6 +1583,19 @@ class TetherDaemon:
                 # Image ready → download + write
                 if status.capt_status in (0x0002, 0x0005):
                     self._emit_status("downloading", f"Slot 0x{self._next_slot:02X}")
+                    # Phase 3.16 (A6): defense-in-depth pause before
+                    # ANY download. For PC snaps this is idempotent
+                    # (the snap path paused already); it also covers
+                    # every other way an image can appear in the
+                    # ImageDB — a shot re-detected after a recovery /
+                    # slot resync, or camera-button capture if a
+                    # future firmware/mode ever allows it. (NOTE
+                    # 2026-07-18: the fp L locks body controls in
+                    # Camera Control USB mode, so body-triggered
+                    # capture does NOT currently happen — verified on
+                    # hardware; an earlier README claim to the
+                    # contrary was wrong.)
+                    self._pause_liveview()
                     try:
                         with self._ptp_lock:
                             entries = bridge.sigma_download_current(
@@ -1522,8 +1658,12 @@ class TetherDaemon:
                     # the same shutter — same shot_index, same
                     # item_idx, same base filename, only the
                     # extension differs.
-                    self._shot_count += 1
+                    # Phase 3.15: _shot_count moved under _item_lock —
+                    # start_new_session resets it from the UI thread,
+                    # and the unlocked += raced that reset (stale
+                    # "Saved #N" counter after a mid-download reset).
                     with self._item_lock:
+                        self._shot_count += 1
                         item = self._current_item
                         item_idx = self._shots_by_item.get(item, 0) + 1
                         self._shots_by_item[item] = item_idx
@@ -1533,26 +1673,52 @@ class TetherDaemon:
                         if t_shot_start else 0.0
                     )
                     saved_paths: list[Path] = []
+                    spooled_paths: list[Path] = []
                     total_size = 0
                     for entry_idx, (info, data) in enumerate(entries):
-                        dest = build_destination(
-                            self.cfg,
-                            shot_index=item_idx,
-                            session_name=self.session_name,
-                            item_name=item,
-                            image_id=status.image_id,
-                            camera_name="fpL",
-                            file_ext=(info.fileext or "jpg").lstrip("."),
-                        )
-                        if dest.session_dir is not None:
-                            dest.session_dir.mkdir(
-                                parents=True, exist_ok=True
+                        # Phase 3.15 (A5): the whole save leg is
+                        # guarded. The camera's ImageDB entries are
+                        # already cleared by sigma_download_current,
+                        # so ``data`` is the ONLY copy of this frame —
+                        # a full disk, an unmounted volume, or a bad
+                        # filename_template (KeyError from .format)
+                        # used to escape to _run's fatal handler:
+                        # daemon dead AND the frame lost. Now: spool
+                        # the bytes to <output.root>/_recovery/ and
+                        # keep the session alive.
+                        try:
+                            dest = build_destination(
+                                self.cfg,
+                                shot_index=item_idx,
+                                session_name=self.session_name,
+                                item_name=item,
+                                image_id=status.image_id,
+                                camera_name="fpL",
+                                file_ext=(info.fileext or "jpg").lstrip("."),
                             )
-                        saved = write_atomic(
-                            dest.path,
-                            data,
-                            on_conflict=self.cfg.output.on_conflict,
-                        )
+                            if dest.session_dir is not None:
+                                dest.session_dir.mkdir(
+                                    parents=True, exist_ok=True
+                                )
+                            saved = write_atomic(
+                                dest.path,
+                                data,
+                                on_conflict=self.cfg.output.on_conflict,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            self.log.error(
+                                "shot_save_failed",
+                                error=str(e),
+                                entry_idx=entry_idx,
+                                template=self.cfg.output.filename_template,
+                            )
+                            rescued = self._spool_recovery(
+                                info, data, entry_idx
+                            )
+                            if rescued is not None:
+                                spooled_paths.append(rescued)
+                                total_size += len(data)
+                            continue
                         saved_paths.append(saved)
                         total_size += len(data)
                         # Per-file log so the user sees both halves of
@@ -1573,29 +1739,51 @@ class TetherDaemon:
                     # (the primary file — DNG comes first in DNG+JPG
                     # mode, so saved_paths[0] is the "main" image).
                     # size is the sum so the UI's running total is
-                    # accurate.
-                    event = ShotEvent(
-                        shot_index=self._shot_count,
-                        saved_path=saved_paths[0],
-                        size=total_size,
-                        elapsed_s=elapsed,
-                        image_id=status.image_id,
-                        db_head=status.image_db_head,
-                        db_tail=status.image_db_tail,
-                        trigger=pending_trigger,
-                    )
-                    self._emit_shot(event)
-                    if len(saved_paths) == 1:
-                        ready_msg = (
-                            f"Saved #{self._shot_count}: "
-                            f"{saved_paths[0].name}"
+                    # accurate. Spooled-only saves still emit (the
+                    # bytes DID land on disk — just in _recovery/).
+                    primary = (saved_paths or spooled_paths)
+                    if primary:
+                        event = ShotEvent(
+                            shot_index=self._shot_count,
+                            saved_path=primary[0],
+                            size=total_size,
+                            elapsed_s=elapsed,
+                            image_id=status.image_id,
+                            db_head=status.image_db_head,
+                            db_tail=status.image_db_tail,
+                            trigger=pending_trigger,
+                        )
+                        self._emit_shot(event)
+                    if not saved_paths and spooled_paths:
+                        # Saved, but only into _recovery/ — surface
+                        # loudly; the user must fix the destination
+                        # (disk space / volume / template) before the
+                        # next shot repeats the dance.
+                        self._emit_status(
+                            "ready",
+                            f"保存失敗 → _recovery に退避 "
+                            f"({spooled_paths[0].name}) — 保存先を確認",
+                        )
+                    elif not saved_paths:
+                        # Spool failed too — the frame is gone. Say so
+                        # honestly rather than pretending "ready".
+                        self._emit_status(
+                            "error",
+                            "保存失敗 — ディスク容量/保存先を確認 "
+                            "(画像を退避できませんでした)",
                         )
                     else:
-                        names = " + ".join(p.name for p in saved_paths)
-                        ready_msg = (
-                            f"Saved #{self._shot_count}: {names}"
-                        )
-                    self._emit_status("ready", ready_msg)
+                        if len(saved_paths) == 1:
+                            ready_msg = (
+                                f"Saved #{self._shot_count}: "
+                                f"{saved_paths[0].name}"
+                            )
+                        else:
+                            names = " + ".join(p.name for p in saved_paths)
+                            ready_msg = (
+                                f"Saved #{self._shot_count}: {names}"
+                            )
+                        self._emit_status("ready", ready_msg)
                     # Refresh exposure display — the user may have rolled a
                     # dial between shots.
                     self._emit_exposure(bridge)

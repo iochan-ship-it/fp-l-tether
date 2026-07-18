@@ -179,7 +179,18 @@ def load_settings_cache(path: Path | None = None) -> SettingsCache | None:
     try:
         raw = cp.read_text(encoding="utf-8")
         data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
+    except OSError:
+        return None
+    except ValueError:
+        # Phase 3.15 (A17): ValueError covers both JSONDecodeError and
+        # UnicodeDecodeError — a byte-corrupted cache previously escaped
+        # the "Never raises" contract and killed daemon startup. Rename
+        # the corrupt file to ``.bad`` (evidence preserved, next save
+        # starts clean) instead of silently re-reading it forever.
+        try:
+            cp.replace(cp.with_suffix(cp.suffix + ".bad"))
+        except OSError:
+            pass
         return None
     if not isinstance(data, dict):
         return None
@@ -260,6 +271,32 @@ def _parse_lv_window(raw: Any) -> LVWindowState | None:
         if finite and w > 0 and h > 0 and -50000 <= x <= 50000 and -50000 <= y <= 50000:
             frame = (x, y, w, h)
     return LVWindowState(detached=detached, frame=frame)
+
+
+def save_dg_merged(cache: SettingsCache, path: Path | None = None) -> bool:
+    """Persist ``cache``'s dg1/dg2 while preserving UI-owned sections on disk.
+
+    Phase 3.15 (A3): the daemon loads its ``SettingsCache`` once at
+    startup, then saved that stale full snapshot on every exposure
+    change — silently clobbering ``lv_window`` (detach state, Phase
+    3.12) and ``app_prefs`` (Preferences window, Phase 3.14) that the
+    UI had written to disk in the meantime. The panel side already
+    does load-then-merge in ``_save_lv_window_state``; this is the
+    symmetric daemon-side writer.
+
+    The caller owns ONLY dg1/dg2. Everything else is re-read from the
+    on-disk file at save time, so whichever component wrote last keeps
+    its own sections. Falls back to the caller's copy when no on-disk
+    file exists.
+    """
+    on_disk = load_settings_cache(path)
+    merged = SettingsCache(
+        dg1=dict(cache.dg1),
+        dg2=dict(cache.dg2),
+        lv_window=on_disk.lv_window if on_disk is not None else cache.lv_window,
+        app_prefs=on_disk.app_prefs if on_disk is not None else cache.app_prefs,
+    )
+    return save_settings_cache(merged, path)
 
 
 def save_settings_cache(cache: SettingsCache, path: Path | None = None) -> bool:

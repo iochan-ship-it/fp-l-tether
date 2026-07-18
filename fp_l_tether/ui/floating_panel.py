@@ -67,6 +67,7 @@ from AppKit import (
     NSKernAttributeName,
     NSMakeRect,
     NSMakeSize,
+    NSMenuItem,
     NSMutableParagraphStyle,
     NSPanel,
     NSParagraphStyleAttributeName,
@@ -779,14 +780,32 @@ class FloatingTetherPanel(NSObject):
         # Busy gate — shooting / downloading / recovering all dim
         # the controls and force the LV overlay. Phase 3.10 also
         # rewrites the hint footer with per-state guidance.
-        if state in ("shooting", "downloading", "recovering"):
+        # Phase 3.15 (A10): error / disconnected keep the controls
+        # DISABLED (spec 3.10 "Wedged" row). Previously they re-enabled
+        # everything, so clicks against a dead camera queued requests
+        # that fired unexpectedly the moment recovery succeeded —
+        # and dial changes silently no-opped.
+        if state in ("shooting", "downloading", "recovering",
+                     "error", "disconnected"):
             self._set_controls_busy(True, state=state)
-        elif state in ("ready", "error", "stopped", "disconnected"):
+        elif state in ("ready", "stopped"):
             self._set_controls_busy(False, state=state)
         else:
             # Transient states (focusing, connecting, initializing) —
             # keep current dim state, just refresh the hint label.
             self._refresh_hint(state)
+
+    def _set_overlay_label(self, text: str) -> None:
+        """Set the LV pause-overlay caption (Phase 3.15).
+
+        The overlay used to be hard-coded "Saving…" for every pause
+        cause; the label now tracks the actual state (Saving… /
+        Reconnecting… / Camera unresponsive / LV paused).
+        """
+        try:
+            self._lv_overlay_label.setStringValue_(text)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _refresh_hint(self, state: str) -> None:
         """Update the footer hint per state.
@@ -855,7 +874,7 @@ class FloatingTetherPanel(NSObject):
             self._shoot_btn,
             self._af_btn,
         )
-        if state == "recovering":
+        if state in ("recovering", "error", "disconnected"):
             alpha = 0.3
         elif state in ("shooting", "downloading"):
             alpha = 0.4
@@ -869,6 +888,16 @@ class FloatingTetherPanel(NSObject):
 
         # Hint footer per state.
         self._refresh_hint(state)
+
+        # Phase 3.15 (D): per-state overlay wording. "Saving…" during a
+        # ~4 s USB recovery was a lie (spec 3.10: "Reconnecting…"),
+        # and a wedged camera deserves the honest label.
+        if state in ("shooting", "downloading"):
+            self._set_overlay_label("Saving…")
+        elif state in ("recovering", "disconnected"):
+            self._set_overlay_label("Reconnecting…")
+        elif state == "error":
+            self._set_overlay_label("Camera unresponsive")
 
         if busy:
             # Force the overlay up immediately so the user gets
@@ -1115,12 +1144,29 @@ class FloatingTetherPanel(NSObject):
         dropdown,  # type: ignore[no-untyped-def]
         items: list[tuple[str, object]],
     ) -> None:
-        """Replace dropdown's items with ``(title, representedObject)`` pairs."""
+        """Replace dropdown's items with ``(title, representedObject)`` pairs.
+
+        Phase 3.15 (A8): items are appended as explicit ``NSMenuItem``s
+        on the popup's menu. The previous ``addItemWithTitle_`` path
+        uses AppKit's title-dedup semantics — an existing item with the
+        same title is silently REMOVED — which made shutter stops
+        disappear whenever two codes rendered the same label (0.6"/0.8"
+        both showed "1/2" before apex_to_shutter learned sub-second
+        decimals, and the fp-L-V90 fallback list produces legitimate
+        near-duplicate labels). Every code keeps its own row now, even
+        if two labels tie after rounding.
+        """
         dropdown.removeAllItems()
+        menu = dropdown.menu()
         for title, repr_obj in items:
-            dropdown.addItemWithTitle_(title)
-            menu_item = dropdown.lastItem()
-            menu_item.setRepresentedObject_(repr_obj)
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                str(title), None, ""
+            )
+            item.setRepresentedObject_(repr_obj)
+            menu.addItem_(item)
+        if dropdown.numberOfItems() > 0:
+            dropdown.selectItemAtIndex_(0)
+            dropdown.synchronizeTitleAndSelectedItem()
 
     def _select_dropdown_by_repr(self, dropdown, target) -> None:  # type: ignore[no-untyped-def]
         """Select the first menu item whose representedObject == target.
@@ -1398,6 +1444,11 @@ class FloatingTetherPanel(NSObject):
         )
         is_hidden = bool(self._lv_overlay.isHidden())
         if stale and is_hidden:
+            # Phase 3.15 (D): a stalled stream is not a save. Busy
+            # states own their own label (set in _set_controls_busy);
+            # a watchdog-triggered pause reads "LV paused".
+            if not self._controls_busy:
+                self._set_overlay_label("LV paused")
             self._lv_overlay.setHidden_(False)
         elif not stale and not is_hidden:
             # Fix 4: busy gate wins — if the daemon is in commit
@@ -1495,7 +1546,12 @@ class FloatingTetherPanel(NSObject):
                 pass
 
         # Step 2: build & show the detached window with the lifted views.
-        initial_frame = self._resolve_lv_window_frame()
+        # Phase 3.15 (A4): the resolver reports whether the rect is a
+        # cached WINDOW frame (title bar included) or a content-sized
+        # default — the factory needs to know which coordinate system
+        # it's holding, otherwise the window grows by the title-bar
+        # height on every detach cycle.
+        initial_frame, frame_is_window = self._resolve_lv_window_frame()
         self._lv_window = LVDetachedWindow.make(
             self,
             initial_frame,
@@ -1504,6 +1560,7 @@ class FloatingTetherPanel(NSObject):
             self._hist_view,
             self._lv_overlay,
             self._af_marker_view,
+            frame_is_window_frame=frame_is_window,
         )
         if self._lv_window is None:
             # Construction failed — put the views back and bail. Better
@@ -1530,17 +1587,21 @@ class FloatingTetherPanel(NSObject):
         except Exception:  # noqa: BLE001
             pass
 
-        # Step 5: persist (detached=True, frame=initial). The frame
-        # may already match the cache; save_settings_cache short-circuits
-        # nothing internally but the I/O cost is fine for a user action.
+        # Step 5: persist (detached=True, frame=actual WINDOW frame).
+        # Phase 3.15 (A4): read the frame back from the window we just
+        # made rather than echoing ``initial_frame`` — the cache field
+        # holds window-frame coordinates exclusively now (every other
+        # save site uses ``window.frame()``), so mixed content/window
+        # rects can no longer accumulate title-bar drift.
         # NSRect → tuple conversion required: settings_cache.LVWindowState
         # expects a 4-tuple of floats, never a raw NSRect/CGPoint (those
         # are opaque C structs that json.dumps can't serialise).
+        actual = self._lv_window.frame()
         initial_tuple: tuple[float, float, float, float] = (
-            float(initial_frame.origin.x),
-            float(initial_frame.origin.y),
-            float(initial_frame.size.width),
-            float(initial_frame.size.height),
+            float(actual.origin.x),
+            float(actual.origin.y),
+            float(actual.size.width),
+            float(actual.size.height),
         )
         self._save_lv_window_state(detached=True, frame=initial_tuple)
 
@@ -1665,7 +1726,7 @@ class FloatingTetherPanel(NSObject):
     # ----- Phase 3.12 — frame resolution / persistence ----------------
 
     def _resolve_lv_window_frame(self):  # type: ignore[no-untyped-def]
-        """Return the NSRect for the detached window at next detach.
+        """Return ``(NSRect, frame_is_window_frame)`` for the next detach.
 
         Order of preference:
         1. Cached frame, if its origin lies inside any current NSScreen
@@ -1673,6 +1734,10 @@ class FloatingTetherPanel(NSObject):
         2. Cached frame's *size*, re-centred on the main screen
            (display disappeared since last save — fall back gracefully).
         3. Default 720×480 centred on main screen (no cache yet).
+
+        Phase 3.15 (A4): the bool tells the caller which coordinate
+        system the rect is in — cached values are WINDOW frames
+        (``window.frame()``), the first-run default is a CONTENT size.
         """
         cached_lv = None
         try:
@@ -1681,21 +1746,21 @@ class FloatingTetherPanel(NSObject):
             cached_lv = None
 
         if cached_lv is None or cached_lv.frame is None:
-            return self._default_lv_window_frame()
+            return self._default_lv_window_frame(), False
 
         x, y, w, h = cached_lv.frame
         saved = NSMakeRect(x, y, w, h)
         if self._frame_origin_on_any_screen(saved):
-            return saved
+            return saved, True
 
         # Display disappeared — keep size, re-centre on main.
         try:
             main = NSScreen.mainScreen().visibleFrame()
             cx = main.origin.x + (main.size.width - w) / 2.0
             cy = main.origin.y + (main.size.height - h) / 2.0
-            return NSMakeRect(cx, cy, w, h)
+            return NSMakeRect(cx, cy, w, h), True
         except Exception:  # noqa: BLE001
-            return self._default_lv_window_frame()
+            return self._default_lv_window_frame(), False
 
     def _default_lv_window_frame(self):  # type: ignore[no-untyped-def]
         """Default detached frame — 720×480 centred on main screen.
@@ -1854,7 +1919,34 @@ class FloatingTetherPanel(NSObject):
         )
 
         def _handle(event) -> object | None:  # noqa: ANN001
-            responder = self._panel.firstResponder()
+            # Phase 3.15 (A1): this is an app-wide LOCAL monitor — it
+            # sees key events for EVERY window in the app, including
+            # the Preferences window and NSOpenPanel/NSAlert sheets.
+            # Only the tether panel and the detached LV window are
+            # hotkey surfaces; typing a path in Preferences must never
+            # fire the shutter. Events for any other window pass
+            # through untouched.
+            ev_window = event.window()
+            hotkey_windows = [self._panel]
+            if getattr(self, "_lv_window", None) is not None:
+                hotkey_windows.append(self._lv_window)
+            if ev_window is None or all(
+                ev_window is not w for w in hotkey_windows
+            ):
+                return event
+
+            # Phase 3.15 (A2): ignore key-autorepeat. Holding Space a
+            # beat too long used to queue snap requests at ~15/s —
+            # the exact "rapid requests into a busy camera" pattern
+            # behind the 2026-05-13 FW wedge. One keydown = one action.
+            if event.isARepeat():
+                return None
+
+            # Text-input detection belongs to the window the event is
+            # for (field editors are NSTextView), not to the panel's
+            # responder — the old panel-only check made keystrokes in
+            # other windows look like "not typing".
+            responder = ev_window.firstResponder()
             in_text_field = (
                 responder is not None and responder.isKindOfClass_(NSTextView)
             )
@@ -1886,7 +1978,19 @@ class FloatingTetherPanel(NSObject):
                     # SUBJECT field — Select All is a minor loss in a
                     # one-line item-name input. The bare ``a`` binding
                     # below still works outside text fields.
-                    self._daemon.request_af()
+                    # Phase 3.15 (A2): honour the busy gate — the AF
+                    # button is disabled during commit/recovery for
+                    # wedge-safety; the hotkey must not bypass that.
+                    if not self._controls_busy:
+                        self._daemon.request_af()
+                    return None  # consume
+                if k_lower == "q":
+                    # Phase 3.15 (A10): ⌘Q — advertised in the footer
+                    # hint (and required by PHASE_3_12) but previously
+                    # unimplemented: as an accessory app with no main
+                    # menu there is no default Quit menu item to
+                    # inherit, so the shortcut was dead.
+                    self.stop()
                     return None  # consume
                 if key == ",":
                     # Phase 3.14 — Preferences window. Use the raw
@@ -1897,8 +2001,18 @@ class FloatingTetherPanel(NSObject):
 
             # Phase 3.9 Fix 2: Escape (keyCode 53) always drops focus when
             # the user is editing a field — gives them an "oops" out
-            # without committing.
+            # without committing. Phase 3.15 (A9): restore the last
+            # COMMITTED value into the field too — spec 3.9 requires
+            # "field shows previous committed value"; leaving the
+            # abandoned text visible made the UI show "bowl" while the
+            # daemon still filed shots under "vase".
             if key_code == 53 and in_text_field:
+                try:
+                    self._item_field.setStringValue_(
+                        self._daemon.current_item
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 self._panel.makeFirstResponder_(None)
                 return None  # consume
 
@@ -1912,18 +2026,28 @@ class FloatingTetherPanel(NSObject):
                     self._daemon.set_current_item(name)
                     field.setStringValue_(self._daemon.current_item)
                     self._panel.makeFirstResponder_(None)
-                    self._daemon.request_snap()
+                    # Phase 3.15 (A2): the commit half always runs, but
+                    # the shoot half honours the busy gate (same rule
+                    # as the disabled Shoot button).
+                    if not self._controls_busy:
+                        self._daemon.request_snap()
                     return None  # consume
                 # All other keys (letters, digits, Return, Tab, arrows)
                 # pass through to the field normally.
                 return event
 
             # Outside text field: original hotkey behavior.
+            # Phase 3.15 (A2): Space/A respect the busy gate — the
+            # buttons they mirror are disabled during commit/recovery
+            # precisely because queued requests into a busy camera
+            # cascade into FW wedge (2026-05-13).
             if key == " ":
-                self._daemon.request_snap()
+                if not self._controls_busy:
+                    self._daemon.request_snap()
                 return None  # consume
             if key == "a":
-                self._daemon.request_af()
+                if not self._controls_busy:
+                    self._daemon.request_af()
                 return None  # consume
             # Phase 3.11 — overlay toggles.
             if key == "h":
@@ -2081,6 +2205,20 @@ def _button_title_attr(
     return NSAttributedString.alloc().initWithString_attributes_(text, attrs)
 
 
+class _ClickThroughView(NSView):
+    """NSView that never intercepts mouse events (Phase 3.15, D).
+
+    Used for overlay chrome that sits ON TOP of the click-to-AF
+    surface. The AF reticle in particular is parked exactly where the
+    user most often wants to click again (the current AF point) — its
+    40×40 container used to swallow those clicks. Same pattern as
+    ``GridOverlayView.hitTest_``.
+    """
+
+    def hitTest_(self, point):  # type: ignore[no-untyped-def]
+        return None
+
+
 def _build_corner_reticle(
     size: int = AF_MARKER_SIZE,
     arm: int = AF_TICK_ARM,
@@ -2095,7 +2233,9 @@ def _build_corner_reticle(
     corresponding corner.
     """
     col = color if color is not None else C_AMBER
-    container = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, size, size))
+    container = _ClickThroughView.alloc().initWithFrame_(
+        NSMakeRect(0, 0, size, size)
+    )
     container.setWantsLayer_(True)
     container.layer().setBackgroundColor_(NSColor.clearColor().CGColor())
 

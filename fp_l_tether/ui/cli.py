@@ -71,17 +71,22 @@ def start(
     config: Optional[Path] = typer.Option(None, "--config", "-c"),
     panel: bool = typer.Option(True, "--panel/--no-panel",
                                 help="Show the floating tether panel"),
-    af: bool = typer.Option(
-        False, "--af/--no-af",
-        help="Auto-focus before each shot. Default: no AF (use current focus). "
-             "Use --af to include AF in the shutter press.",
+    af: Optional[bool] = typer.Option(
+        None, "--af/--no-af",
+        help="Auto-focus before each shot. Default: use config.toml's "
+             "snap_mode (built-in default: no AF / current focus). "
+             "--af / --no-af explicitly override the config.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Boot the tether daemon. Camera shutter button just works™."""
     cfg = _load(config, verbose)
-    # Override snap mode based on --af / --no-af
-    cfg.camera.snap_mode = 1 if af else 2  # 1=GENERAL_CAPTURE, 2=NON_AF_CAPTURE
+    # Phase 3.15 (A18): only override snap_mode when the user actually
+    # passed a flag. The old ``False`` default was indistinguishable
+    # from "not passed", so ``fp-l-tether start`` always forced
+    # snap_mode=2 and the config.toml knob was dead.
+    if af is not None:
+        cfg.camera.snap_mode = 1 if af else 2  # 1=GENERAL_CAPTURE, 2=NON_AF_CAPTURE
     log = get_logger("cli")
     log.info("starting", session=session, panel=panel)
 

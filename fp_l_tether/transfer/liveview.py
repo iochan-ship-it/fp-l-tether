@@ -169,11 +169,19 @@ class LiveViewStream:
         first_storm_grace_s: float = 30.0,
         histogram_enabled: bool = True,
         histogram_downsample: int = 2,
+        bus_quiet_check: Callable[[], float] | None = None,
     ) -> None:
         if target_fps <= 0:
             raise ValueError(f"target_fps must be positive, got {target_fps}")
         self._bridge = bridge
         self._ptp_lock = ptp_lock
+        # Phase 3.16 (A6): daemon-owned "bus must stay quiet" probe —
+        # returns the remaining seconds of the post-capture quiet
+        # window (0.0 = clear to fetch). The heartbeat has honoured
+        # this since Phase 3.7; the LV stream previously pierced the
+        # window at 10 fps, which is exactly the "traffic during the
+        # ImageDB commit tail" the window exists to prevent.
+        self._bus_quiet_check = bus_quiet_check
         self._target_fps = target_fps         # configured ceiling
         self._effective_fps = target_fps      # adaptive — may be lower
         self._on_frame = on_frame
@@ -391,6 +399,29 @@ class LiveViewStream:
                     break
                 if self._stop_event.wait(min(remaining, 0.05)):
                     return
+
+            # ---- Re-check pause after the self-pause wait ---------
+            # Phase 3.16: the daemon may have called pause() while we
+            # sat in the self-pause loop above (which only watches the
+            # back-off deadline). Falling through to a fetch here
+            # would pierce a snap transaction — loop back so the
+            # pause gate at the top re-engages.
+            if not self._resume_event.is_set():
+                continue
+
+            # ---- Honor the daemon's bus quiet window (A6) ---------
+            # After a capture commits, the daemon arms a no-PTP
+            # window scaled to the burst size. Main loop and
+            # heartbeat already gate on it; the LV stream must too —
+            # a view-frame fetch into the commit tail can push a
+            # half-stalled endpoint into Errno 60. Skipped fetches
+            # are free: we just wait the window out in short slices.
+            if self._bus_quiet_check is not None:
+                quiet_remaining = self._bus_quiet_check()
+                if quiet_remaining > 0.0:
+                    if self._stop_event.wait(min(quiet_remaining, 0.2)):
+                        return
+                    continue
 
             loop_start = time.monotonic()
             period_s = 1.0 / max(1, self._effective_fps)

@@ -74,6 +74,27 @@ from .ptp_codes import (
 logger = logging.getLogger(__name__)
 
 
+def _libusb_backend():  # type: ignore[no-untyped-def]
+    """Resolve a libusb backend for pyusb, preferring the bundled wheel.
+
+    Phase 3.15 (A19): ``libusb-package`` was declared in pyproject (so
+    users without Homebrew's libusb still work) but never wired up —
+    ``usb.core.find()`` with no backend only discovers a system libusb.
+    Order: bundled wheel first, then pyusb's default discovery
+    (``backend=None``) so a Homebrew/system libusb keeps working when
+    the wheel is absent or fails to load.
+    """
+    try:
+        import libusb_package  # type: ignore[import-not-found]
+
+        backend = libusb_package.get_libusb1_backend()
+        if backend is not None:
+            return backend
+    except Exception as e:  # noqa: BLE001 — any failure → default discovery
+        logger.debug("libusb_package backend unavailable: %s", e)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # PTP USB constants
 # ---------------------------------------------------------------------------
@@ -244,9 +265,16 @@ class USBBridge:
     @classmethod
     def find_sigma_fp_l(cls) -> "USBBridge":
         """Find the first connected Sigma fp / fp L and return an unopened bridge."""
-        dev = usb.core.find(idVendor=SIGMA_VENDOR_ID, idProduct=SIGMA_FP_L_PRODUCT_ID)
+        backend = _libusb_backend()
+        dev = usb.core.find(
+            idVendor=SIGMA_VENDOR_ID, idProduct=SIGMA_FP_L_PRODUCT_ID,
+            backend=backend,
+        )
         if dev is None:
-            dev = usb.core.find(idVendor=SIGMA_VENDOR_ID, idProduct=SIGMA_FP_PRODUCT_ID)
+            dev = usb.core.find(
+                idVendor=SIGMA_VENDOR_ID, idProduct=SIGMA_FP_PRODUCT_ID,
+                backend=backend,
+            )
         if dev is None:
             raise USBBridgeError("No Sigma fp / fp L found by libusb")
         return cls(dev)
@@ -976,15 +1004,33 @@ class USBBridge:
     def sigma_get_capture_status(self, p1: int = 0) -> SgmCaptStatus:
         """0x9015 ``GetCaptureStatus``.
 
-        Returns the parsed 7-byte response struct. Pass ``p1=0`` for the
+        Returns the parsed capture-status struct. Pass ``p1=0`` for the
         "current" status (used by both pre-snap and polling).
+
+        Phase 3.15 (A14): parses via ``SgmCaptStatus.from_wire`` — the
+        hardware-verified 8-byte fp-trace layout (PHASE0 insight #4).
+        The previous ``from_libgphoto2_wire`` call reproduced libgphoto2's
+        off-by-one, misreading destination_to_save/checksum. ``from_wire``
+        still falls back to the 7-byte interpretation for short responses,
+        so firmware variants keep working.
+
+        A truncated-but-nonempty payload (doze glitch, desynced pipe)
+        raises ``USBBridgeError`` — recoverable by the watcher's
+        reconnect path — instead of a bare ``ValueError`` that would
+        escape the error contract and kill the daemon loop.
         """
         resp = self.send_command_raw(
             SigmaOperationCode.GET_CAM_CAPT_STATUS, params=(p1,)
         )
         resp.raise_for_status()
         _guard_zero_byte(resp.in_data, "capture_status")
-        return SgmCaptStatus.from_libgphoto2_wire(resp.in_data)
+        try:
+            return SgmCaptStatus.from_wire(resp.in_data)
+        except ValueError as e:
+            raise USBBridgeError(
+                f"capture_status parse failed ({e}); "
+                f"raw={resp.in_data.hex() if resp.in_data else ''}"
+            ) from e
 
     def sigma_snap(self, mode: int = 1, amount: int = 1) -> None:
         """0x901b ``Snap`` — fire the shutter.
@@ -1183,7 +1229,21 @@ class USBBridge:
             data = self.sigma_get_big_partial_pict_file(
                 info.fileaddress, 0, info.filesize
             )
-            if len(data) != info.filesize:
+            if len(data) < info.filesize:
+                # Phase 3.16 (A15): an UNDER-run is never padding — the
+                # transfer was truncated (aborted mid-commit / desynced
+                # pipe) and writing it out would hand Lightroom a
+                # corrupt file with zero warning. Raise the recoverable
+                # bridge error BEFORE any DB clear: the entries are
+                # still in the camera's ImageDB, so after the
+                # reconnect the shot is re-detected and re-downloaded
+                # intact. (Over-run stays tolerated below — the known
+                # +25-30 B USB padding.)
+                raise USBBridgeError(
+                    f"short download for {info.name}: got {len(data)} "
+                    f"of {info.filesize} bytes"
+                )
+            if len(data) > info.filesize:
                 logger.debug(
                     "sigma_download: size mismatch got=%d expected=%d "
                     "(USB ZLP padding, harmless for JPEG)",

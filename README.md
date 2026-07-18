@@ -126,7 +126,7 @@ that folder and your shots will appear in your catalog on save. See
 | Feature | Status |
 |---|---|
 | Capture (single shot, PC-triggered) | ✅ Works |
-| Capture (camera-button-triggered) | ✅ Works |
+| Capture (camera-button-triggered) | ❌ The fp L locks body controls while in Camera Control USB mode |
 | Live View (10 fps) | ✅ Works |
 | Click-to-AF on Live View | ✅ Works |
 | ISO / SS / Av / WB / Format / Resolution control | ✅ Works |

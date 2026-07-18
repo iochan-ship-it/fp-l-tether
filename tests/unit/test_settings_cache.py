@@ -363,3 +363,79 @@ def test_app_prefs_from_dict_ignores_unknown_keys() -> None:
         "this_field_does_not_exist": 42,
     })
     assert p.default_subject == "x"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.15 additions — daemon-side merge save (A3) + corrupt-cache
+# resilience (A17)
+# ---------------------------------------------------------------------------
+
+from fp_l_tether.storage.settings_cache import save_dg_merged  # noqa: E402
+
+
+def test_save_dg_merged_preserves_ui_sections(tmp_path: Path) -> None:
+    """A daemon dg-save must not clobber lv_window/app_prefs on disk (A3).
+
+    Reproduces the Phase 3.15 bug: daemon loads its cache at startup,
+    the UI later writes lv_window + app_prefs to disk, then the daemon
+    saves an exposure change from its stale in-memory snapshot.
+    """
+    cp = _cache_file(tmp_path)
+    # UI writes prefs + detach state AFTER the daemon's startup load.
+    ui_cache = SettingsCache(
+        dg1={"ISOSpeed": 32},
+        lv_window=LVWindowState(detached=True, frame=(1.0, 2.0, 720.0, 508.0)),
+        app_prefs=AppPrefs(watch_folder="~/Pictures/SomewhereElse"),
+    )
+    assert save_settings_cache(ui_cache, cp)
+
+    # Daemon's stale snapshot knows nothing of the UI sections.
+    daemon_cache = SettingsCache(
+        dg1={"ISOSpeed": 64}, dg2={"WhiteBalance": 2},
+    )
+    assert save_dg_merged(daemon_cache, cp)
+
+    on_disk = load_settings_cache(cp)
+    assert on_disk is not None
+    # dg values: daemon owns them → daemon wins.
+    assert on_disk.dg1 == {"ISOSpeed": 64}
+    assert on_disk.dg2 == {"WhiteBalance": 2}
+    # UI-owned sections: disk wins → survive the daemon save.
+    assert on_disk.lv_window is not None
+    assert on_disk.lv_window.detached is True
+    assert on_disk.lv_window.frame == (1.0, 2.0, 720.0, 508.0)
+    assert on_disk.app_prefs is not None
+    assert on_disk.app_prefs.watch_folder == "~/Pictures/SomewhereElse"
+
+
+def test_save_dg_merged_first_run_uses_caller_sections(tmp_path: Path) -> None:
+    """With no on-disk file, the caller's own sections are kept."""
+    cp = _cache_file(tmp_path)
+    cache = SettingsCache(
+        dg1={"ISOSpeed": 6},
+        lv_window=LVWindowState(detached=True, frame=(0.0, 0.0, 720.0, 508.0)),
+    )
+    assert save_dg_merged(cache, cp)
+    on_disk = load_settings_cache(cp)
+    assert on_disk is not None
+    assert on_disk.dg1 == {"ISOSpeed": 6}
+    assert on_disk.lv_window is not None
+    assert on_disk.lv_window.detached is True
+
+
+def test_corrupt_utf8_cache_never_raises_and_quarantines(tmp_path: Path) -> None:
+    """Invalid UTF-8 must return None (not raise) and rename to .bad (A17)."""
+    cp = _cache_file(tmp_path)
+    cp.write_bytes(b"\xff\xfe\x00 not utf8 json \xff")
+    assert load_settings_cache(cp) is None
+    assert not cp.exists()
+    assert cp.with_suffix(".json.bad").exists()
+
+
+def test_invalid_json_cache_quarantined(tmp_path: Path) -> None:
+    """Truncated/garbage JSON returns None and renames to .bad (A17)."""
+    cp = _cache_file(tmp_path)
+    cp.write_text('{"version": 2, "dg1": {', encoding="utf-8")
+    assert load_settings_cache(cp) is None
+    assert not cp.exists()
+    assert cp.with_suffix(".json.bad").exists()

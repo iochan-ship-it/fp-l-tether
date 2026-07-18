@@ -150,6 +150,16 @@ class HistogramView(NSView):
             self.layer().setBackgroundColor_(NSColor.clearColor().CGColor())
         return self
 
+    def hitTest_(self, point):  # type: ignore[no-untyped-def]
+        """Pass mouse events through to the LV underneath (Phase 3.15).
+
+        Without this, the visible histogram claimed clicks over its
+        whole footprint — the bottom 50 pt band (attached) or the
+        180×90 top-right box (detached) became a click-to-AF dead
+        zone. Same pattern as ``GridOverlayView.hitTest_``.
+        """
+        return None
+
     def setData_(self, data):  # type: ignore[no-untyped-def]
         """Push the latest histogram. Pass ``None`` to clear."""
         self._data = data

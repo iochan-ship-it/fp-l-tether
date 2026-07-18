@@ -132,6 +132,15 @@ def _make_text_field(text: str, frame, placeholder: str = "") -> NSTextField:
     if placeholder:
         f.setPlaceholderString_(placeholder)
     f.setFont_(NSFont.systemFontOfSize_(12.0))
+    # Phase 3.15 (A11): commit on end-editing, not just on Return.
+    # Spec 3.14 §3 requires ``controlTextDidEndEditing`` semantics —
+    # previously typing a new watch folder and clicking away (or
+    # closing the window) silently discarded the edit with zero
+    # feedback while shots kept landing in the old folder.
+    try:
+        f.cell().setSendsActionOnEndEditing_(True)
+    except Exception:  # noqa: BLE001 — very old AppKit; Return-only fallback
+        pass
     return f
 
 
@@ -526,6 +535,13 @@ class PreferencesWindow(NSObject):
         self._window.makeKeyAndOrderFront_(None)
 
     def windowShouldClose_(self, sender) -> bool:  # type: ignore[no-untyped-def]
+        # Phase 3.15 (A11): end any in-progress edit BEFORE hiding, so
+        # the focused field fires its (end-editing) action and the
+        # typed value is committed rather than silently dropped.
+        try:
+            self._window.makeFirstResponder_(None)
+        except Exception:  # noqa: BLE001
+            pass
         # Hide rather than destroy — keep the singleton alive for the
         # next ⌘, press.
         try:
@@ -582,9 +598,19 @@ class PreferencesWindow(NSObject):
     def patternChanged_(self, sender) -> None:  # type: ignore[no-untyped-def]
         value = (self._pattern_field.stringValue() or "").strip()
         if not self._validate_pattern(value):
-            # Don't persist garbage; revert to the cached value.
-            self._populate_from_cache()
+            # Phase 3.15 (A11): keep the user's typed value visible and
+            # flag it, instead of the old silent full-form revert (which
+            # also reset the "Restart to apply" snapshot as a side
+            # effect). Spec 3.14 §7 asks for a visible invalid state.
+            self._pattern_field.setTextColor_(NSColor.systemRedColor())
+            self._pattern_field.setToolTip_(
+                "無効なパターンです — {ext} が必須。使用可能キー: "
+                "{session} {item} {shot} {date} {time} {ext} "
+                "{image_id} {camera_name}"
+            )
             return
+        self._pattern_field.setTextColor_(NSColor.labelColor())
+        self._pattern_field.setToolTip_(None)
         self._commit({"filename_template": value})
         try:
             self._panel._cfg.output.filename_template = value
@@ -681,7 +707,13 @@ class PreferencesWindow(NSObject):
         if "{ext}" not in template:
             return False
         # Trial-format with sentinel values so format keyword errors
-        # surface before the user shoots.
+        # surface before the user shoots. Phase 3.15 (A11): the key set
+        # now matches ``destinations.build_destination`` exactly —
+        # ``{item}``, ``{image_id}`` and ``{camera_name}`` are
+        # legitimate template keys but were missing here, so the
+        # recommended per-item pattern
+        # ``{session}_{item}_{shot:04d}.{ext}`` was rejected as
+        # invalid by the Preferences window.
         try:
             template.format(
                 date="20260515",
@@ -691,6 +723,9 @@ class PreferencesWindow(NSObject):
                 session="s",
                 ext="dng",
                 name="x",
+                item="x",
+                image_id=0,
+                camera_name="fpL",
             )
         except (KeyError, IndexError, ValueError):
             return False

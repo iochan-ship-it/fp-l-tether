@@ -24,9 +24,26 @@ try:
 except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore[no-redef]
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+class _ValidatedModel(BaseModel):
+    """Shared base for all config sub-models.
+
+    Phase 3.15 (A17): ``validate_assignment=True`` makes the Phase 3.14
+    app_prefs overlay (``setattr`` in ``_apply_app_prefs_overrides``)
+    actually run pydantic validation — previously a stale/hand-edited
+    cache value like ``on_conflict="keep"`` or ``lightroom_mode=5``
+    was assigned unvalidated and only exploded much later (e.g. at the
+    first filename collision, after the shot was already taken). With
+    assignment validation on, the overlay's existing ``except
+    (AttributeError, ValueError)`` skips bad values exactly as its
+    comment always claimed.
+    """
+
+    model_config = ConfigDict(validate_assignment=True)
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +51,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # ---------------------------------------------------------------------------
 
 
-class CameraConfig(BaseModel):
+class CameraConfig(_ValidatedModel):
     """Camera-side knobs."""
 
     serial_number: str = ""
@@ -192,7 +209,7 @@ class CameraConfig(BaseModel):
     idle_recovery_max: int = 0
 
 
-class OutputConfig(BaseModel):
+class OutputConfig(_ValidatedModel):
     """File naming and conflict resolution."""
 
     root: Path = Field(default=Path("~/Pictures/Tether"))
@@ -212,7 +229,7 @@ class OutputConfig(BaseModel):
         raise TypeError(f"output.root must be str or Path, got {type(v)}")
 
 
-class LightroomConfig(BaseModel):
+class LightroomConfig(_ValidatedModel):
     """Lightroom Classic integration."""
 
     mode: Literal["watch", "session"] = "watch"
@@ -230,7 +247,7 @@ class LightroomConfig(BaseModel):
         )
 
 
-class UIConfig(BaseModel):
+class UIConfig(_ValidatedModel):
     """Floating panel preferences."""
 
     panel_position: Literal["top-right", "top-left", "bottom-right", "bottom-left"] = "top-right"
@@ -240,7 +257,7 @@ class UIConfig(BaseModel):
     quit_key: str = "cmd+q"
 
 
-class HistogramConfig(BaseModel):
+class HistogramConfig(_ValidatedModel):
     """Histogram strip placement (Phase 3.13).
 
     bottom_strip — full LV width × 50pt high band at the LV's bottom.
@@ -260,7 +277,7 @@ class HistogramConfig(BaseModel):
     auto_top_right_when_detached: bool = True
 
 
-class LVWindowConfig(BaseModel):
+class LVWindowConfig(_ValidatedModel):
     """Detached LV window defaults (Phase 3.12).
 
     Runtime state (current detached/attached state + frame geometry)
@@ -283,7 +300,7 @@ class LVWindowConfig(BaseModel):
     save_debounce_ms: int = 250
 
 
-class LiveViewConfig(BaseModel):
+class LiveViewConfig(_ValidatedModel):
     """Live view streaming preferences.
 
     ``pause_during_snap``: when True, the daemon explicitly suspends
@@ -377,7 +394,7 @@ class LiveViewConfig(BaseModel):
     # window expires, so this LiveViewConfig field is no longer needed.
 
 
-class TelemetryConfig(BaseModel):
+class TelemetryConfig(_ValidatedModel):
     """Logging behavior."""
 
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
@@ -401,7 +418,7 @@ class TelemetryConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AppConfig(BaseModel):
+class AppConfig(_ValidatedModel):
     """Top-level config."""
 
     camera: CameraConfig = Field(default_factory=CameraConfig)
@@ -421,6 +438,56 @@ DEFAULT_CONFIG_LOCATIONS = [
     PROJECT_ROOT / "config.toml",
     Path("~/.config/fp-l-tether/config.toml").expanduser(),
 ]
+
+# Section name → model class, used by the unknown-key scan below.
+_SECTION_MODELS: dict[str, type[BaseModel]] = {
+    "camera": CameraConfig,
+    "output": OutputConfig,
+    "lightroom": LightroomConfig,
+    "ui": UIConfig,
+    "liveview": LiveViewConfig,
+    "telemetry": TelemetryConfig,
+}
+# (section, key) pairs whose value is itself a nested model table.
+_NESTED_MODELS: dict[tuple[str, str], type[BaseModel]] = {
+    ("liveview", "histogram"): HistogramConfig,
+    ("liveview", "lv_window"): LVWindowConfig,
+}
+
+
+def _collect_unknown_keys(raw: dict) -> list[str]:
+    """Return dotted paths of TOML keys that no config model consumes.
+
+    Phase 3.15 (A12): pydantic v2's default ``extra='ignore'`` silently
+    swallowed typos and stale sections (``[logging]``, ``[debug]``,
+    pre-3.x ``[ui]`` keys) — the config "loaded fine" and the setting
+    just did nothing. We keep the forgiving load behaviour (an old
+    config must never block startup) but tell the user exactly which
+    keys were ignored.
+    """
+    unknown: list[str] = []
+    if not isinstance(raw, dict):
+        return unknown
+    for section, body in raw.items():
+        model = _SECTION_MODELS.get(section)
+        if model is None:
+            unknown.append(f"[{section}]")
+            continue
+        if not isinstance(body, dict):
+            continue
+        for key, val in body.items():
+            nested = _NESTED_MODELS.get((section, key))
+            if nested is not None:
+                if isinstance(val, dict):
+                    unknown.extend(
+                        f"{section}.{key}.{nk}"
+                        for nk in val
+                        if nk not in nested.model_fields
+                    )
+                continue
+            if key not in model.model_fields:
+                unknown.append(f"{section}.{key}")
+    return unknown
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -453,6 +520,16 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     else:
         with toml_path.open("rb") as f:
             raw = tomllib.load(f)
+        unknown = _collect_unknown_keys(raw)
+        if unknown:
+            # stderr, not the structured logger — logging isn't
+            # configured yet at config-load time (cli._load calls
+            # setup_logging AFTER load_config).
+            print(
+                f"[fp-l-tether] {toml_path.name}: 未対応のキーを無視しました "
+                f"({', '.join(unknown)}) — config.example.toml で現行キーを確認してください",
+                file=sys.stderr,
+            )
         cfg = AppConfig(**raw)
 
     _apply_app_prefs_overrides(cfg)
@@ -485,7 +562,17 @@ def _apply_app_prefs_overrides(cfg: "AppConfig") -> None:
         return
     if cache is None or cache.app_prefs is None:
         return
-    for (section, key), value in cache.app_prefs.to_config_overrides().items():
+    # Phase 3.15 (A17): the whole overlay is best-effort. Previously
+    # ``to_config_overrides()`` ran OUTSIDE any guard, so a wrong-typed
+    # value in a hand-edited cache (e.g. ``"watch_folder": 123`` →
+    # ``Path(123)`` TypeError) crashed every CLI command at startup —
+    # including read-only ``fp-l-tether info``. Nothing in this cache
+    # is ever worth failing startup over.
+    try:
+        overrides = cache.app_prefs.to_config_overrides()
+    except Exception:  # noqa: BLE001
+        return
+    for (section, key), value in overrides.items():
         target = getattr(cfg, section, None)
         if target is None:
             # Unknown section — Phase 3.14 ``logging.*`` overrides land
@@ -493,9 +580,11 @@ def _apply_app_prefs_overrides(cfg: "AppConfig") -> None:
             continue
         try:
             setattr(target, key, value)
-        except (AttributeError, ValueError):
+        except Exception:  # noqa: BLE001
             # Unknown key on a known section, or a value pydantic
-            # rejected. Skip — don't break startup on a stale cache.
+            # rejected (ValidationError via validate_assignment), or
+            # any other surprise. Skip — don't break startup on a
+            # stale cache.
             continue
 
 

@@ -1,115 +1,120 @@
 # fp-l-tether 設定ファイルテンプレ
 # このファイルを config.toml にコピーして編集してください
+# (置き場所: プロジェクト直下 または ~/.config/fp-l-tether/config.toml)
 # config.toml は .gitignore 対象です
+#
+# 下の各キーはすべて「組み込みデフォルト値」をコメントとして示して
+# います。空の config.toml も有効 (= 全部デフォルト)。変えたい行だけ
+# アンコメントしてください。
+#
+# このテンプレの正体は fp_l_tether/config/__init__.py の pydantic
+# モデルです。モデルに無いキーは起動時に警告つきで無視されるので、
+# 「設定したのに効かない」時は起動時の stderr を確認してください。
+#
+# 優先順位:  組み込みデフォルト < config.toml < Preferences ウィンドウ
+# (Preferences の値は ~/.fp-l-tether/user_settings.json に保存され、
+#  保存先フォルダ・ファイル命名はそちらで設定するのが推奨)
 
 [camera]
-# カメラの識別。複数台接続時に区別したい場合のみ設定
-# (空文字なら最初に見つかった Sigma fp/fp L を使用)
-serial_number = ""
+# serial_number = ""                  # 複数台接続時のみ指定 ("" = 最初に見つけた個体)
+# poll_idle_ms = 200                  # 待機中の状態ポーリング間隔 (ms)
+# poll_active_ms = 100                # 撮影進行中のポーリング間隔 (ms)
+# chunk_size = 1048576                # GetBigPartialPictFile の読み出しサイズ (bytes)
+# clear_image_db_after_download = true
 
-# シャッター検知ポーリング間隔 (ms)
-# 撮影中は idle_ms を無視して active_ms で短く回す
-poll_idle_ms = 200
-poll_active_ms = 100
+# PC シャッターの SnapCommand CaptureMode (実機検証済):
+#   1 = GENERAL_CAPTURE   — AF してからシャッター
+#   2 = NON_AF_CAPTURE    — AF せず現在のフォーカスで撮る (デフォルト)
+#   3 = AF_DRIVE_ONLY     — AF のみ (シャッターなし)
+#   6 = START_CAPTURE     — 連続撮影開始 (実験的)
+# CLI の --af / --no-af はこの値を起動ごとに上書きします。
+# snap_mode = 2
 
-# GetBigPartialPictFile の1チャンクサイズ (bytes)
-# 大きいほど速いが、転送途中のエラーで全体再取得になる
-chunk_size = 1048576  # 1 MiB
+# USB keep-alive heartbeat。fp L はバスが受動的になると 1-2 分で
+# 内部 doze に入り 0-byte data phase を返し始めるため、定期 ping で予防。
+# 本体メニュー System → Auto Power Off → OFF の併用推奨。
+# keep_alive_enabled = true
+# keep_alive_interval_s = 30.0
+# strategy:
+#   "info"            — 受動的な camera-info クエリ (デフォルト・副作用ゼロ)
+#   "af_drive_only"   — AF-only SnapCommand。doze 耐性最良だが
+#                       interval ごとに AF モータ音
+#   "af_point_jiggle" — AF 点 ±1px 書き込み (研究用: 2026-05-13 計測で効果なし)
+# keepalive_strategy = "info"
+# af_jiggle_delta_px = 1
+# 旧形式 (strategy="af_drive_only" の別名、後方互換のため残存):
+# aggressive_keepalive = false
+# aggressive_keepalive_interval_s = 50.0
 
-# 撮影後のクリーンアップ (ClearImageDBSingle) を実行するか
-# true 推奨: カメラ内 ImageDB が溢れて撮影できなくなるのを防ぐ
-clear_image_db_after_download = true
+# 再接続のたびに、ユーザーがダイヤルした設定 (ISO/SS/絞り/WB…) を
+# 永続キャッシュから再生してファームの PC モードリセットを打ち消す。
+# preserve_user_settings = true
 
-# USB keep-alive heartbeat
-# fp L は約5分のバス idle で内部省電力モードに入り、vendor get-*
-# が 0-byte data phase を返すようになる。1分毎に benign な ping
-# (sigma_get_camera_info) を打つことで予防。
-# true 推奨。本体メニュー System → Auto Power Off → OFF も併せて。
-keep_alive_enabled = true
-keep_alive_interval_s = 30.0
+# 撮影後の quiet window: バースト終了後
+#   base + per_shot × (バースト枚数 - 1) 秒
+# の間 PTP 通信を全停止し、ImageDB 整理中のエンドポイント wedge を防ぐ。
+# commit_window_base_s = 5.0
+# commit_window_per_shot_s = 1.0
 
-# Aggressive keep-alive (Plan T): SnapCommand(AF_DRIVE_ONLY) を
-# 50s 毎に発火して doze を防ぐ。fp L で shot 系 opcode のみ
-# 内部 doze timer を reset することが分かったための実験モード。
-# 副作用: 静物撮影中もレンズが定期的に AF を駆動する。
-# true で keep_alive_interval_s より aggressive_keepalive_interval_s が優先。
-aggressive_keepalive = false
-aggressive_keepalive_interval_s = 50.0
-
-# Burst-aware post-capture quiet window. After a burst settles
-# (snap queue drains) the daemon enforces a no-PTP-traffic window of:
-#   commit_window_base_s + commit_window_per_shot_s * (burst - 1)
-# where burst = number of contiguous shots since the previous
-# quiet window. Prevents Errno 60 wedge after long bursts
-# (10-shot burst → ~14 s with defaults; 13 s observed minimum).
-commit_window_base_s = 5.0
-commit_window_per_shot_s = 1.0
+# バルクエンドポイント wedge 時の自動 USB 再列挙 (IOKit)。
+# ケーブル抜き差しのソフトウェア版。
+# auto_recover_on_wedge = true
+# usb_recovery_timeout_s = 12.0      # 再列挙後にデバイス再出現を待つ上限
+# usb_recovery_settle_s = 1.5        # 再クレーム前の settle 時間
+# idle_recovery_max = 0              # 再列挙にエスカレートする前の受動待ち回数
 
 [output]
-# 保存先のルートディレクトリ
-root = "~/Pictures/Tether"
-
-# ファイル命名テンプレ
-# 使える変数: {session} {item} {shot:04d} {date} {time}
-filename_template = "{session}_{item}_{shot:04d}.dng"
-
-# セッション名のテンプレ (--session フラグで上書き可能)
-session_template = "{date}_{name}"
-
-# デフォルトのアイテム名 (--item フラグで上書き)
-default_item = "untitled"
-
-# ショット番号の自動採番
-auto_increment_shot = true
-
-# 既存ファイルがあった場合の動作: "skip" | "overwrite" | "rename"
-on_conflict = "rename"
+# root = "~/Pictures/Tether"          # session モードの保存ルート
+# ファイル命名テンプレ。使えるキー:
+#   {session} {item} {shot} {date} {time} {ext} {image_id} {camera_name}
+# ヒント: 撮影中に SUBJECT を切り替えるなら {item} を含めると
+# 被写体ごとに連番が独立します: "{session}_{item}_{shot:04d}.{ext}"
+# filename_template = "{session}_{shot:04d}.{ext}"
+# session_template = "{date}_{name}"  # session モードのフォルダ名
+# default_item = "untitled"           # SUBJECT の初期値
+# auto_increment_shot = true
+# on_conflict = "rename"              # rename | overwrite | skip
 
 [lightroom]
-# "watch":   Auto Import 監視フォルダ方式 (推奨)
-# "session": セッションフォルダ直書き方式 (LR側で手動Sync)
-mode = "watch"
-
-# Mode A: Lightroom Auto Import の Watched Folder
-# このフォルダは Lightroom 側でも同じパスに設定すること
-watch_folder = "~/Pictures/Tether/_watch"
-
-# Mode B: セッションフォルダのルート (output.root と統一推奨)
-session_root = "~/Pictures/Tether"
-
-# atomic rename を行う (推奨)
-# 一時拡張子で書き込み → 完了後に正式拡張子へ rename
-# Lightroom が partial file を取り込むのを防ぐ
-use_atomic_write = true
+# mode = "watch"                      # watch (Auto Import) | session (手動 Sync)
+# watch_folder = "~/Pictures/Tether/_watch"
 
 [ui]
-# "cli" のみ / "menubar" のみ / "both"
-mode = "both"
+# panel_position = "top-right"        # top-right | top-left | bottom-right | bottom-left
+# panel_opacity = 0.95
+# show_thumbnails = false
+# shutter_key = "space"
+# quit_key = "cmd+q"
 
-# 撮影音を鳴らす
-play_sound = true
-sound_file = ""  # 空ならシステムデフォルト
+[liveview]
+# enabled = true
+# target_fps = 10                     # fp L の持続上限 (15 fps は DeviceBusy 多発)
+# pause_during_snap = true            # snap → download の間 LV を停止
+# busy_backoff_ms = 500               # 0x2019 DeviceBusy 後のスリープ
+# max_consecutive_busy = 5            # 連続 busy 何回で fps を落とすか
+# promote_after_consecutive_ok = 10   # 成功何フレームで fps を戻すか
+# post_snap_busy_grace_s = 1.5        # resume 直後の busy は降格に数えない
+# first_storm_grace_s = 30.0          # 初回スナップの busy storm 猶予
+# show_histogram = true               # H / ⌘H で実行時トグル
+# histogram_downsample = 2            # 1 = 全画素 … 4 = 4×4 ブロック
+# grid_mode = "off"                   # off | thirds | golden | full (G / ⌘G で循環)
 
-# キーボードショートカット (CLI モード)
-enable_hotkeys = true
-hotkey_snap = "space"
-hotkey_quit = "q"
-hotkey_change_item = "i"
+[liveview.histogram]
+# position = "bottom_strip"           # bottom_strip | top_right
+# auto_top_right_when_detached = true
 
-[logging]
-# ログレベル: "DEBUG" | "INFO" | "WARNING" | "ERROR"
-level = "INFO"
+[liveview.lv_window]
+# Detached LV ウィンドウの初回デフォルト。実行時のジオメトリは
+# ~/.fp-l-tether/user_settings.json 側に記憶されます。
+# default_width = 720
+# default_height = 480
+# min_width = 360
+# min_height = 240
+# aspect_w = 3
+# aspect_h = 2
+# save_debounce_ms = 250
 
-# ログ保存先 (~/Library/Logs/fp-l-tether/ がデフォルト)
-log_dir = "~/Library/Logs/fp-l-tether"
-
-# 構造化JSONログも残す (events.jsonl)
-emit_jsonl = true
-
-[debug]
-# PTPトレースをファイルに保存 (Phase 0 デバッグ用)
-save_ptp_trace = false
-trace_dir = "~/Library/Logs/fp-l-tether/traces"
-
-# 起動時に GetCamDataGroup1-5 を保存し、撮影中に変化したら警告
-detect_setting_reset = true
+[telemetry]
+# log_level = "INFO"                  # DEBUG | INFO | WARNING | ERROR
+# json_log_file = ""                  # 例: "~/Library/Logs/fp-l-tether/events.jsonl" ("" = 出力しない)
+# text_log_file = ""                  # 例: "~/Library/Logs/fp-l-tether/tether.log" ("" = 出力しない)

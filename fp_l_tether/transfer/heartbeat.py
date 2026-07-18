@@ -183,12 +183,23 @@ class HeartbeatThread:
             return
 
         x, y = pt
-        # Clamp the jiggle target so we don't go negative. The fp L's
-        # AF coordinate range is ~9520x6328 (full sensor) so adding
-        # delta_px is virtually always safe; only edge cases (AF
-        # snapped to x=0) need protection.
-        dx = self._jiggle_delta if x < 8000 else -self._jiggle_delta
-        x_jig = max(0, x + dx)
+        # Phase 3.15 (A7): the fp L's AF grid is X ∈ [96, 928],
+        # Y ∈ [85, 597] (CamCanSetInfo5 tag 0x0265) — NOT the ~9520 px
+        # sensor space this code originally assumed. The old
+        # ``x < 8000`` direction test always jiggled +delta, so an AF
+        # point parked on the right edge (x=928, a documented preset)
+        # produced x=929 → the range guard in
+        # ``sigma_set_cam_datagroup_focus`` raised ValueError → the
+        # heartbeat thread died silently and the camera dozed minutes
+        # later with no visible cause. Jiggle inward from the midpoint
+        # and clamp into the valid grid so the write can never be
+        # rejected.
+        dx = self._jiggle_delta if x < 512 else -self._jiggle_delta
+        x_jig = max(96, min(928, x + dx))
+        if x_jig == x:
+            # Degenerate delta (e.g. delta=0 config) — nothing to write.
+            self._ping_info()
+            return
 
         # Two writes: shift, then restore. Short sleep between so the
         # camera registers the change rather than treating the pair
@@ -232,7 +243,7 @@ class HeartbeatThread:
                 # confirm the heartbeat is the right cadence (if we
                 # see this regularly, drop interval_s).
                 self.log.warning("heartbeat_camera_idle", error=str(e))
-            except (PTPError, USBBridgeError, usb.core.USBError) as e:
+            except (PTPError, USBBridgeError, usb.core.USBError, ValueError) as e:
                 # Quiet warning — the watcher owns recovery / reconnect.
                 # Phase 3.6 (2026-05-13): added usb.core.USBError to
                 # the catch list. Previously the heartbeat thread
@@ -241,5 +252,9 @@ class HeartbeatThread:
                 # at all once the camera came back. Catch it here so
                 # the thread survives — the daemon's status-poll path
                 # owns the actual recovery decision.
+                # Phase 3.15 (A7): ValueError added — a rejected
+                # parameter (e.g. AF coordinate outside the camera's
+                # grid) must degrade to a skipped ping, never kill
+                # the keep-alive thread.
                 self.log.warning("heartbeat_failed", error=str(e))
         self.log.info("heartbeat_stopped")

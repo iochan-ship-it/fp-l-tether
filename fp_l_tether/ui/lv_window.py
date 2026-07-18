@@ -111,6 +111,7 @@ class LVDetachedWindow(NSWindow):
         hist_view,
         lv_overlay,
         af_marker,
+        frame_is_window_frame: bool = False,
     ):
         """Build the detached window and adopt the five LV subviews.
 
@@ -123,6 +124,16 @@ class LVDetachedWindow(NSWindow):
           - Retain the returned window in ``panel._lv_window`` so the
             collection behaviour doesn't release it on the next event
             loop spin.
+
+        Phase 3.15 (A4): ``frame_is_window_frame`` disambiguates the
+        rect's coordinate meaning. The settings cache persists WINDOW
+        frames (``window.frame()``, title bar included) — feeding one
+        into ``initWithContentRect_`` reinterpreted it as a CONTENT
+        rect, so every detach/relaunch cycle grew the window by the
+        title-bar height (~28 pt) and silently broke the 3:2 aspect
+        (``setContentAspectRatio_`` only constrains user resizes).
+        Pass True for cached frames; False for first-run defaults
+        (which are sized as content).
         """
         style = NSWindowStyleMaskTitled | NSWindowStyleMaskResizable
         # NB: deliberately no Closable / Miniaturizable. See module docstring.
@@ -131,6 +142,10 @@ class LVDetachedWindow(NSWindow):
         )
         if window is None:
             return None
+        if frame_is_window_frame:
+            # Re-apply the rect with window-frame semantics now that
+            # the style mask (→ title-bar metrics) is known.
+            window.setFrame_display_(initial_frame, False)
 
         window._panel = panel
         window._live_view = lv_view
@@ -155,6 +170,23 @@ class LVDetachedWindow(NSWindow):
         # slot, large enough to be a meaningful detach.
         window.setContentAspectRatio_(NSMakeSize(3, 2))
         window.setContentMinSize_(NSMakeSize(360, 240))
+
+        # Phase 3.15 (A4b): normalise a distorted cached frame back to
+        # 3:2. Caches written before the frame/content-rect fix carry
+        # up to +28 pt of accumulated title-bar growth per detach cycle
+        # (real-world example observed: 878×907 — nearly square), and
+        # ``setContentAspectRatio_`` only constrains USER resizes, so
+        # without this the distortion would persist until a manual
+        # resize. Width wins; height is recomputed to width × 2/3.
+        try:
+            cr = window.contentRectForFrameRect_(window.frame())
+            desired_h = cr.size.width * 2.0 / 3.0
+            if abs(cr.size.height - desired_h) > 1.0:
+                window.setContentSize_(
+                    NSMakeSize(cr.size.width, desired_h)
+                )
+        except Exception:  # noqa: BLE001 — cosmetic; never block detach
+            pass
 
         window.setOpaque_(True)
         window.setBackgroundColor_(_C_BG_PANEL)

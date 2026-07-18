@@ -239,10 +239,17 @@ def apex_to_shutter(v: int) -> str:
     # camera LCD shows canonical photography values (15s not 16s, 30s not
     # 32s, 1/15 not 1/16), so we round to that table.
     seconds = 2.0 ** ((0x38 - v) / 8.0)
-    if seconds >= 1.0:
+    # Phase 3.15 (A8): the 0.55–1.0 s band renders as decimal seconds
+    # (0.6" / 0.8") like the camera LCD. Previously these fell into the
+    # fraction branch and all rounded to "1/2" — and because AppKit's
+    # ``addItemWithTitle_`` silently REMOVES an existing same-titled
+    # item, the duplicated labels made shutter stops vanish from the
+    # dropdown. Threshold 0.55 keeps the familiar 1/2 (=0.5 s) as a
+    # fraction while catching the 1/3-stop codes at ~0.63 s and 0.8 s.
+    if seconds >= 0.55:
         canonical_s = (
-            1.0, 1.3, 1.6, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 13.0,
-            15.0, 20.0, 25.0, 30.0,
+            0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0,
+            10.0, 13.0, 15.0, 20.0, 25.0, 30.0,
         )
         nearest = min(canonical_s, key=lambda c: abs(c - seconds))
         if nearest >= 10:

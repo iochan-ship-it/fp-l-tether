@@ -12,6 +12,7 @@ from fp_l_tether.storage.settings_cache import (
     SettingsCache,
     cache_path,
     load_settings_cache,
+    save_dg_merged,
     save_settings_cache,
 )
 
@@ -21,5 +22,6 @@ __all__ = [
     "SettingsCache",
     "cache_path",
     "load_settings_cache",
+    "save_dg_merged",
     "save_settings_cache",
 ]
