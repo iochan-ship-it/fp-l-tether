@@ -50,6 +50,16 @@ SIGMA_VENDOR_ID = 0x1003
 SIGMA_FP_PRODUCT_ID = 0xC432  # Sigma fp
 SIGMA_FP_L_PRODUCT_ID = 0xC442  # Sigma fp L (verified in libgphoto2 #882 logs)
 
+# Phase 3.18 (B3): the fp L's internal ImageDB is a 29-slot ring
+# (slot ids 0x00-0x1C). Observed on hardware 2026-07-18: after a
+# DNG+JPG shutter landed on slot 0x1C, db_tail wrapped into the low
+# ids instead of advancing to 0x1D — and the old ``& 0xFF`` clear
+# arithmetic aimed at nonexistent "slot 29", leaving a stale entry
+# whose data was later served for the NEXT shot's file (the
+# long-mythologised "clone return" bug). All slot arithmetic must be
+# modulo this ring size.
+SIGMA_IMAGE_DB_SLOTS = 0x1D  # 29
+
 
 # ---------------------------------------------------------------------------
 # Standard PTP operation codes (ISO 15740)

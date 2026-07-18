@@ -63,3 +63,35 @@ class TestWriteAtomic:
         target.write_bytes(b"x")
         with pytest.raises(ValueError, match="on_conflict"):
             write_atomic(target, b"y", on_conflict="invalid")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.18 (B5) — pair-aware conflict resolution
+# ---------------------------------------------------------------------------
+
+from fp_l_tether.transfer.atomic import resolve_conflicts_together  # noqa: E402
+
+
+def test_pair_no_conflict_returns_unchanged(tmp_path):
+    dng = tmp_path / "x.dng"
+    jpg = tmp_path / "x.jpg"
+    assert resolve_conflicts_together([dng, jpg]) == [dng, jpg]
+
+
+def test_pair_conflict_suffixes_both_members(tmp_path):
+    """Only the DNG pre-exists — BOTH members must take the same suffix."""
+    (tmp_path / "x.dng").write_bytes(b"old")
+    resolved = resolve_conflicts_together(
+        [tmp_path / "x.dng", tmp_path / "x.jpg"]
+    )
+    assert [p.name for p in resolved] == ["x_001.dng", "x_001.jpg"]
+
+
+def test_pair_conflict_advances_shared_suffix(tmp_path):
+    """_001 taken by either extension → both step to _002 together."""
+    (tmp_path / "x.dng").write_bytes(b"old")
+    (tmp_path / "x_001.jpg").write_bytes(b"old")
+    resolved = resolve_conflicts_together(
+        [tmp_path / "x.dng", tmp_path / "x.jpg"]
+    )
+    assert [p.name for p in resolved] == ["x_002.dng", "x_002.jpg"]

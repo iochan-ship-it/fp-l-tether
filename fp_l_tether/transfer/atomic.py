@@ -126,3 +126,28 @@ def _find_free_name(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     raise RuntimeError(f"could not find a free name for {path} after 9999 attempts")
+
+
+def resolve_conflicts_together(paths: list[Path]) -> list[Path]:
+    """Pick ONE shared ``_NNN`` suffix so every path in the group is free.
+
+    Phase 3.18 (B5): a DNG+JPG pair must keep an identical basename or
+    Lightroom's RAW+JPEG pairing breaks. Per-file conflict resolution
+    could split ``x.dng`` + ``x.jpg`` into ``x_001.dng`` + ``x.jpg``
+    when only one member collided (e.g. a reused session name where
+    only the DNG pre-existed). Group rule: if ANY member collides, ALL
+    members take the same lowest ``_NNN`` suffix that frees every
+    member. With no collision the paths return unchanged.
+    """
+    paths = [Path(p) for p in paths]
+    if not any(p.exists() for p in paths):
+        return paths
+    for n in range(1, 10_000):
+        candidates = [
+            p.parent / f"{p.stem}_{n:03d}{p.suffix}" for p in paths
+        ]
+        if not any(c.exists() for c in candidates):
+            return candidates
+    raise RuntimeError(
+        f"could not find a shared free name for {paths} after 9999 attempts"
+    )

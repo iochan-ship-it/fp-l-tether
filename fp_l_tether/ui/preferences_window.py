@@ -330,7 +330,7 @@ class PreferencesWindow(NSObject):
         ))
         self._pattern_field = _make_text_field(
             "", NSMakeRect(CONTROL_X, y, CONTROL_W, ROW_H),
-            placeholder="{session}_{shot:04d}.{ext}",
+            placeholder="{session}_{item}_{shot:04d}.{ext}",
         )
         self._pattern_field.setTarget_(self)
         self._pattern_field.setAction_("patternChanged:")

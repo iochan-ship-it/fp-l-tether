@@ -63,6 +63,7 @@ import usb.util  # type: ignore[import-not-found]
 from .ptp_codes import (
     SIGMA_FP_L_PRODUCT_ID,
     SIGMA_FP_PRODUCT_ID,
+    SIGMA_IMAGE_DB_SLOTS,
     SIGMA_VENDOR_ID,
     PTPResponseCode,
     SgmCaptStatus,
@@ -109,6 +110,13 @@ class PTPContainerType(IntEnum):
 
 PTP_HEADER_SIZE = 12  # length(4) + type(2) + code(2) + transaction_id(4)
 PTP_USB_INTERFACE_CLASS = 0x06  # Still Image (PTP)
+
+# Phase 3.19: bulk-IN read granularity for large data phases. The
+# original 64 KiB meant ~1,400 pyusb calls per 93 MB DNG+JPG shutter —
+# per-call Python overhead capped throughput around 6.5 MB/s. Reads
+# never cross the declared container length (see _read_container), so
+# a bigger request per call is purely fewer round-trips through pyusb.
+_BULK_READ_CHUNK = 1 << 20  # 1 MiB
 
 
 # ---------------------------------------------------------------------------
@@ -403,16 +411,36 @@ class USBBridge:
         # Read enough to capture small containers in one shot. For large
         # data (e.g. file content), we'll loop below.
         first = bytes(self._ep_in.read(64 * 1024, timeout=timeout))
+        if len(first) == 0:
+            # Phase 3.18 (B2): a zero-length read here can be USB's
+            # terminator for a packet-aligned previous transfer — when
+            # a container's total length is an exact multiple of
+            # wMaxPacketSize, the device sends a zero-length packet so
+            # the host knows the transfer ended. ~1/512 of large LV
+            # frames / file downloads land exactly on the boundary,
+            # and treating that ZLP as "camera died" bounced an
+            # otherwise healthy session. Absorb it and read the real
+            # container. A genuinely dozed camera returns another
+            # 0-byte read immediately, so doze detection is unchanged
+            # (just one extra read later).
+            logger.debug("B2: zero-length read absorbed (ZLP); re-reading")
+            first = bytes(self._ep_in.read(64 * 1024, timeout=timeout))
         if len(first) < PTP_HEADER_SIZE:
             raise USBBridgeError(f"PTP read too short: {len(first)} bytes")
 
         length, ctype, code, txid = parse_container_header(first)
         payload = first[PTP_HEADER_SIZE:]
 
-        # Read additional chunks if needed
+        # Read additional chunks if needed. Phase 3.19: 1 MiB per pyusb
+        # call (was 64 KiB) — never beyond the declared container
+        # length, so we can't swallow the following RESPONSE container.
         while len(payload) + PTP_HEADER_SIZE < length:
             remaining = length - PTP_HEADER_SIZE - len(payload)
-            chunk = bytes(self._ep_in.read(min(remaining, 64 * 1024), timeout=timeout))
+            chunk = bytes(
+                self._ep_in.read(
+                    min(remaining, _BULK_READ_CHUNK), timeout=timeout
+                )
+            )
             if not chunk:
                 break
             payload += chunk
@@ -1359,7 +1387,14 @@ class USBBridge:
                 "image_db_tail": post_status.image_db_tail,
             }[clear_strategy]
             for i in range(len(entries)):
-                clear_id = (base_id + i) & 0xFF
+                # Phase 3.18 (B3): modulo the REAL 29-slot ring. The
+                # old ``& 0xFF`` aimed past the wrap at nonexistent
+                # slot ids, so the wrapped half of a DNG+JPG pair was
+                # never cleared — the stale entry later served its
+                # bytes for the NEXT shot's download (clone-return,
+                # caught live by the A15 short-download guard on
+                # 2026-07-18).
+                clear_id = (base_id + i) % SIGMA_IMAGE_DB_SLOTS
                 self.sigma_clear_image_db_single(clear_id)
                 logger.debug(
                     "sigma_download: cleared id=0x%02X "

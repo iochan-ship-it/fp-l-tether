@@ -67,9 +67,9 @@
 # root = "~/Pictures/Tether"          # session モードの保存ルート
 # ファイル命名テンプレ。使えるキー:
 #   {session} {item} {shot} {date} {time} {ext} {image_id} {camera_name}
-# ヒント: 撮影中に SUBJECT を切り替えるなら {item} を含めると
-# 被写体ごとに連番が独立します: "{session}_{item}_{shot:04d}.{ext}"
-# filename_template = "{session}_{shot:04d}.{ext}"
+# {item} 入り (デフォルト) は被写体ごとに連番が独立。{item} 無しの
+# テンプレはセッション通し連番になります (どちらでも衝突しません)。
+# filename_template = "{session}_{item}_{shot:04d}.{ext}"
 # session_template = "{date}_{name}"  # session モードのフォルダ名
 # default_item = "untitled"           # SUBJECT の初期値
 # auto_increment_shot = true

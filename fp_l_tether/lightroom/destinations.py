@@ -22,6 +22,21 @@ from pathlib import Path
 from fp_l_tether.config import AppConfig
 
 
+def pick_shot_index(
+    template: str, *, per_item_next: int, session_count: int
+) -> int:
+    """Choose the ``{shot}`` counter for a filename template (Phase 3.18, B6).
+
+    Per-item numbering (vase_0001…, bowl_0001…) only makes sense when
+    the template contains ``{item}`` — without it, two subjects render
+    identical filenames and every SUBJECT switch used to cause silent
+    ``_001`` conflict renames. Templates without ``{item}`` get the
+    session-global counter instead, so numbering keeps climbing across
+    subject switches and can never collide.
+    """
+    return per_item_next if "{item}" in template else session_count
+
+
 @dataclass
 class Destination:
     """One resolved output destination for a single shot.

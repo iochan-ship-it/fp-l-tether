@@ -238,3 +238,19 @@ class TestResponseCodes:
 
     def test_operation_not_supported(self):
         assert PTPResponseCode.OPERATION_NOT_SUPPORTED == 0x2005
+
+
+def test_image_db_ring_size_locked_to_hardware() -> None:
+    """Phase 3.18 (B3): 29 slots (0x00-0x1C), observed on fp L 2026-07-18.
+
+    db_tail wrapped into the low ids after slot 0x1C; ``& 0xFF``
+    arithmetic aimed clears at nonexistent slot 29 and left the stale
+    entry that produced the clone-return download. Do not change this
+    without a new hardware observation.
+    """
+    from fp_l_tether.camera.ptp_codes import SIGMA_IMAGE_DB_SLOTS
+
+    assert SIGMA_IMAGE_DB_SLOTS == 29
+    # The wrap case that started it all: a DNG+JPG pair based at 0x1C.
+    assert (0x1C + 0) % SIGMA_IMAGE_DB_SLOTS == 0x1C
+    assert (0x1C + 1) % SIGMA_IMAGE_DB_SLOTS == 0x00

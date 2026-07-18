@@ -95,3 +95,44 @@ def test_drain_bulk_in_without_endpoint_is_noop() -> None:
     bridge = object.__new__(USBBridge)
     bridge._ep_in = None
     assert bridge._drain_bulk_in() == 0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.18 (B2) — ZLP absorption in _read_container
+# ---------------------------------------------------------------------------
+
+import struct
+
+
+class _FakeEP:
+    wMaxPacketSize = 512
+
+    def __init__(self, reads):
+        self._reads = list(reads)
+
+    def read(self, size, timeout=None):
+        if not self._reads:
+            raise AssertionError("test read past scripted data")
+        return self._reads.pop(0)
+
+
+def _resp_bytes(code: int = 0x2001, txid: int = 9) -> bytes:
+    return struct.pack("<IHHI", 12, PTPContainerType.RESPONSE, code, txid)
+
+
+def test_zlp_before_container_is_absorbed() -> None:
+    """A zero-length packet from a packet-aligned previous transfer must
+    not be mistaken for a dead camera (B2)."""
+    bridge = object.__new__(USBBridge)
+    bridge._ep_in = _FakeEP([b"", _resp_bytes()])
+    c = bridge._read_container()
+    assert c.is_response
+    assert c.transaction_id == 9
+
+
+def test_double_zero_read_still_raises() -> None:
+    """Two consecutive 0-byte reads = genuine doze — same error as before."""
+    bridge = object.__new__(USBBridge)
+    bridge._ep_in = _FakeEP([b"", b""])
+    with pytest.raises(USBBridgeError, match="too short"):
+        bridge._read_container()

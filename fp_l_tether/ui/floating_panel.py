@@ -898,6 +898,12 @@ class FloatingTetherPanel(NSObject):
             self._set_overlay_label("Reconnecting…")
         elif state == "error":
             self._set_overlay_label("Camera unresponsive")
+        elif state == "ready":
+            # Phase 3.19: the save is DONE at this point — the overlay
+            # only remains because LV sits out the post-capture quiet
+            # window. Say so instead of a stale "Saving…" (the panel
+            # showing Ready while the LV claimed Saving read as a bug).
+            self._set_overlay_label("LV resuming…")
 
         if busy:
             # Force the overlay up immediately so the user gets

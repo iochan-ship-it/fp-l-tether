@@ -48,6 +48,7 @@ from fp_l_tether.camera.sigma_datagroup import (
 from fp_l_tether.camera.ptp_codes import (
     SIGMA_FP_L_PRODUCT_ID,
     SIGMA_FP_PRODUCT_ID,
+    SIGMA_IMAGE_DB_SLOTS,
     SIGMA_VENDOR_ID,
 )
 from fp_l_tether.camera.settings_preservation import (
@@ -68,9 +69,9 @@ from fp_l_tether.storage import (
     save_dg_merged,
 )
 from fp_l_tether.config import AppConfig
-from fp_l_tether.lightroom import build_destination
+from fp_l_tether.lightroom import build_destination, pick_shot_index
 from fp_l_tether.telemetry import get_logger, log_shot
-from fp_l_tether.transfer.atomic import write_atomic
+from fp_l_tether.transfer.atomic import resolve_conflicts_together, write_atomic
 from fp_l_tether.transfer.heartbeat import HeartbeatThread
 from fp_l_tether.transfer.liveview import LiveViewFrame, LiveViewStream
 
@@ -176,6 +177,8 @@ ExposureCallback = Callable[[ExposureEvent], None]
 CanSetInfoCallback = Callable[[CanSetInfoEvent], None]
 FocusPointCallback = Callable[[FocusPointEvent], None]
 LiveFrameCallback = Callable[[LiveViewEvent], None]
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1525,7 +1528,9 @@ class TetherDaemon:
                         )
                     # USBBridgeError propagates → reconnect
                     # Advance past the broken slot
-                    self._next_slot = (self._next_slot + 1) & 0xFF
+                    self._next_slot = (
+                        self._next_slot + 1
+                    ) % SIGMA_IMAGE_DB_SLOTS  # B3: 29-slot ring
                     pending_trigger = "camera_button"
                     t_shot_start = None
                     # Capture cycle ended (in failure) → resume LV so it
@@ -1602,6 +1607,20 @@ class TetherDaemon:
                                 status,
                                 clear_strategy="image_db_head",
                             )
+                            # Phase 3.18 (B3): read back the ring state
+                            # while we still hold the lock. The fp L's
+                            # allocator SKIPS occupied slots across the
+                            # 29-slot wrap (observed 2026-07-18: head
+                            # 28 → tail 3), so local arithmetic cannot
+                            # track it. The camera's own head pointer
+                            # is the only authority.
+                            try:
+                                post_dl = bridge.sigma_get_capture_status(0)
+                                resynced_slot: int | None = (
+                                    post_dl.image_db_head
+                                )
+                            except (PTPError, USBBridgeError):
+                                resynced_slot = None
                     except PTPError as e:
                         self.log.error("download_failed", error=str(e))
                         self._emit_status("error", f"download error: {e}")
@@ -1628,7 +1647,9 @@ class TetherDaemon:
                             "error",
                             f"画像情報の解析失敗: {e}",
                         )
-                        self._next_slot = (self._next_slot + 1) & 0xFF
+                        self._next_slot = (
+                            self._next_slot + 1
+                        ) % SIGMA_IMAGE_DB_SLOTS  # B3: 29-slot ring
                         self._resume_liveview()
                         time.sleep(poll_idle_s)
                         continue
@@ -1665,13 +1686,64 @@ class TetherDaemon:
                     with self._item_lock:
                         self._shot_count += 1
                         item = self._current_item
-                        item_idx = self._shots_by_item.get(item, 0) + 1
-                        self._shots_by_item[item] = item_idx
+                        per_item_next = self._shots_by_item.get(item, 0) + 1
+                        # Phase 3.18 (B6): per-item numbering only when
+                        # the template can actually express the item —
+                        # otherwise vase_0001 and bowl_0001 render the
+                        # SAME filename and every subject switch
+                        # produced silent _001 conflict renames.
+                        item_idx = pick_shot_index(
+                            self.cfg.output.filename_template,
+                            per_item_next=per_item_next,
+                            session_count=self._shot_count,
+                        )
+                        self._shots_by_item[item] = per_item_next
 
                     elapsed = (
                         (time.monotonic() - t_shot_start)
                         if t_shot_start else 0.0
                     )
+                    # Phase 3.18 (B5): ONE timestamp per shutter. Each
+                    # build_destination used to call datetime.now()
+                    # itself, so a {time} template could split a
+                    # DNG+JPG pair across two seconds (x_174159.dng +
+                    # x_174200.jpg) — or across two {date} session
+                    # folders at midnight.
+                    shot_now = datetime.now()
+                    # B5: pair-aware conflict resolution. With
+                    # on_conflict="rename" and 2 files per shutter,
+                    # per-file suffixing could split the pair's
+                    # basename (x_001.dng + x.jpg). Resolve one shared
+                    # suffix over the whole file set up-front; best
+                    # effort — any error falls back to per-file
+                    # behavior inside the loop.
+                    pair_paths: list[Path] | None = None
+                    if (
+                        len(entries) > 1
+                        and self.cfg.output.on_conflict == "rename"
+                    ):
+                        try:
+                            raw_paths = [
+                                build_destination(
+                                    self.cfg,
+                                    shot_index=item_idx,
+                                    session_name=self.session_name,
+                                    item_name=item,
+                                    image_id=status.image_id,
+                                    camera_name="fpL",
+                                    file_ext=(
+                                        (info.fileext or "jpg").lstrip(".")
+                                    ),
+                                    now=shot_now,
+                                ).path
+                                for (info, _data) in entries
+                            ]
+                            pair_paths = resolve_conflicts_together(raw_paths)
+                        except Exception as e:  # noqa: BLE001
+                            self.log.warning(
+                                "pair_conflict_precheck_failed", error=str(e),
+                            )
+                            pair_paths = None
                     saved_paths: list[Path] = []
                     spooled_paths: list[Path] = []
                     total_size = 0
@@ -1695,13 +1767,21 @@ class TetherDaemon:
                                 image_id=status.image_id,
                                 camera_name="fpL",
                                 file_ext=(info.fileext or "jpg").lstrip("."),
+                                now=shot_now,  # B5: shared per shutter
                             )
                             if dest.session_dir is not None:
                                 dest.session_dir.mkdir(
                                     parents=True, exist_ok=True
                                 )
+                            # B5: use the pair-resolved path when the
+                            # pre-check produced one.
+                            dest_path = (
+                                pair_paths[entry_idx]
+                                if pair_paths is not None
+                                else dest.path
+                            )
                             saved = write_atomic(
-                                dest.path,
+                                dest_path,
                                 data,
                                 on_conflict=self.cfg.output.on_conflict,
                             )
@@ -1729,7 +1809,9 @@ class TetherDaemon:
                             size=len(data),
                             elapsed_s=elapsed,
                             image_id=status.image_id,
-                            slot=(self._next_slot + entry_idx) & 0xFF,
+                            slot=(
+                                self._next_slot + entry_idx
+                            ) % SIGMA_IMAGE_DB_SLOTS,
                             image_db_head=status.image_db_head,
                             image_db_tail=status.image_db_tail,
                             trigger=pending_trigger,
@@ -1788,11 +1870,26 @@ class TetherDaemon:
                     # dial between shots.
                     self._emit_exposure(bridge)
 
-                    # Advance past every slot we just consumed, then
-                    # reset trigger marker.
-                    self._next_slot = (
-                        self._next_slot + len(entries)
-                    ) & 0xFF
+                    # Advance the watch slot. Phase 3.18 (B3): prefer
+                    # the camera's own post-download head (authoritative
+                    # across the 29-slot ring wrap); modulo arithmetic
+                    # is only the fallback when that read failed.
+                    if resynced_slot is not None:
+                        if resynced_slot != (
+                            self._next_slot + len(entries)
+                        ) % SIGMA_IMAGE_DB_SLOTS:
+                            self.log.info(
+                                "slot_resync_post_download",
+                                arithmetic=(
+                                    self._next_slot + len(entries)
+                                ) % SIGMA_IMAGE_DB_SLOTS,
+                                camera=resynced_slot,
+                            )
+                        self._next_slot = resynced_slot
+                    else:
+                        self._next_slot = (
+                            self._next_slot + len(entries)
+                        ) % SIGMA_IMAGE_DB_SLOTS
                     pending_trigger = "camera_button"
                     t_shot_start = None
 

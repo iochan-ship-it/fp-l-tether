@@ -213,7 +213,12 @@ class OutputConfig(_ValidatedModel):
     """File naming and conflict resolution."""
 
     root: Path = Field(default=Path("~/Pictures/Tether"))
-    filename_template: str = "{session}_{shot:04d}.{ext}"
+    # Phase 3.18 (B6): {item} included by default so switching SUBJECT
+    # mid-session numbers each subject independently. Templates
+    # WITHOUT {item} automatically use a session-global counter
+    # instead (see watcher.pick_shot_index) so filenames can't collide
+    # either way.
+    filename_template: str = "{session}_{item}_{shot:04d}.{ext}"
     session_template: str = "{date}_{name}"
     default_item: str = "untitled"
     auto_increment_shot: bool = True
