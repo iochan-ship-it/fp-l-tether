@@ -316,7 +316,16 @@ class TetherDaemon:
     # ----- public API --------------------------------------------------
 
     def request_snap(self) -> None:
-        """Queue a PC-side shutter trigger. Non-blocking."""
+        """Queue a PC-side shutter trigger. Non-blocking.
+
+        Phase 3.20: bounded to 2 pending — mashing beyond that is
+        dropped (with a log) rather than building a minutes-long
+        surprise burst. With pipelined capture the queue drains at
+        roughly download cadence, so 2 is a full pipeline.
+        """
+        if self._snap_queue.qsize() >= 2:
+            self.log.info("snap_queue_full_dropped")
+            return
         self._snap_queue.put(None)
         self.log.info("snap_requested", source="pc")
 
@@ -1601,6 +1610,65 @@ class TetherDaemon:
                     # hardware; an earlier README claim to the
                     # contrary was wrong.)
                     self._pause_liveview()
+
+                    # ----- Phase 3.20: pipelined capture -----------
+                    # image-ready == the previous shot's commit is
+                    # DONE, which is the one provably safe moment to
+                    # fire the next shutter (the 0x6004 rapid-fire
+                    # failure came from snapping DURING a commit).
+                    # Firing here lets the camera expose/commit the
+                    # next frame in parallel with our download of
+                    # this one — the 29-slot ring exists for exactly
+                    # this producer/consumer split. Experimental:
+                    # gated behind cfg.camera.pipelined_capture.
+                    pipelined_start: float | None = None
+                    pipelined_watch_slot: int | None = None
+                    if (
+                        self.cfg.camera.pipelined_capture
+                        and not self._snap_queue.empty()
+                    ):
+                        try:
+                            self._snap_queue.get_nowait()
+                        except Empty:
+                            pass
+                        else:
+                            try:
+                                with self._ptp_lock:
+                                    bridge.sigma_set_datagroup_3_pc_capture()
+                                    # Same pre-snap resync as the serial
+                                    # PC-snap path (Phase 0 insight #1):
+                                    # the upcoming image lands at
+                                    # image_db_tail (the next-WRITE
+                                    # slot), not head. The first cut
+                                    # watched the post-download head
+                                    # instead — polling an empty slot
+                                    # into the 35 s watchdog (observed
+                                    # 43 s pipelined cycles 2026-07-18).
+                                    try:
+                                        _sync = (
+                                            bridge.sigma_get_capture_status(0)
+                                        )
+                                        pipelined_watch_slot = (
+                                            _sync.image_db_tail
+                                        )
+                                    except (PTPError, USBBridgeError):
+                                        pipelined_watch_slot = None
+                                    bridge.sigma_snap(
+                                        mode=self.cfg.camera.snap_mode,
+                                        amount=1,
+                                    )
+                                pipelined_start = time.monotonic()
+                                self.log.info(
+                                    "pipelined_snap_fired",
+                                    watch_slot=pipelined_watch_slot,
+                                )
+                            except PTPError as e:
+                                # Snap rejected — download proceeds
+                                # normally; the user re-triggers.
+                                self.log.error(
+                                    "pipelined_snap_failed", error=str(e),
+                                )
+
                     try:
                         with self._ptp_lock:
                             entries = bridge.sigma_download_current(
@@ -1674,198 +1742,202 @@ class TetherDaemon:
                     # top-of-loop guard suppresses all PTP traffic
                     # until the window expires.
 
-                    # entries is len 1 (JPG-only / DNG-only) or len 2
-                    # (DNG+JPG). All files in one entries list share
-                    # the same shutter — same shot_index, same
-                    # item_idx, same base filename, only the
-                    # extension differs.
-                    # Phase 3.15: _shot_count moved under _item_lock —
-                    # start_new_session resets it from the UI thread,
-                    # and the unlocked += raced that reset (stale
-                    # "Saved #N" counter after a mid-download reset).
-                    with self._item_lock:
-                        self._shot_count += 1
-                        item = self._current_item
-                        per_item_next = self._shots_by_item.get(item, 0) + 1
-                        # Phase 3.18 (B6): per-item numbering only when
-                        # the template can actually express the item —
-                        # otherwise vase_0001 and bowl_0001 render the
-                        # SAME filename and every subject switch
-                        # produced silent _001 conflict renames.
-                        item_idx = pick_shot_index(
-                            self.cfg.output.filename_template,
-                            per_item_next=per_item_next,
-                            session_count=self._shot_count,
+                    # Phase 3.20b: a download batch can contain SEVERAL
+                    # shutters' files. In serial mode ``entries`` is one
+                    # shutter (a single file, or a DNG+JPG pair) — but with
+                    # window-free bursts / pipelining the camera holds a
+                    # backlog and GetPictFileInfo2 returns ALL of it at
+                    # once. Treating the whole batch as one shutter gave two
+                    # DISTINCT burst JPGs the same shot number (the second
+                    # saved as *_001 — observed live 2026-07-18). Group by
+                    # the camera's own filename stem (SDIM####): same stem =
+                    # one shutter's pair; different stem = a separate
+                    # shutter with its own counter, timestamp and basename.
+                    entry_groups: list[list] = []
+                    _last_stem: str | None = None
+                    for _pair in entries:
+                        _stem = (_pair[0].name or "").rsplit(".", 1)[0]
+                        if entry_groups and _stem == _last_stem:
+                            entry_groups[-1].append(_pair)
+                        else:
+                            entry_groups.append([_pair])
+                            _last_stem = _stem
+                    if len(entry_groups) > 1:
+                        self.log.info(
+                            "multi_shutter_batch",
+                            shutters=len(entry_groups),
+                            files=len(entries),
                         )
-                        self._shots_by_item[item] = per_item_next
 
                     elapsed = (
                         (time.monotonic() - t_shot_start)
                         if t_shot_start else 0.0
                     )
-                    # Phase 3.18 (B5): ONE timestamp per shutter. Each
-                    # build_destination used to call datetime.now()
-                    # itself, so a {time} template could split a
-                    # DNG+JPG pair across two seconds (x_174159.dng +
-                    # x_174200.jpg) — or across two {date} session
-                    # folders at midnight.
-                    shot_now = datetime.now()
-                    # B5: pair-aware conflict resolution. With
-                    # on_conflict="rename" and 2 files per shutter,
-                    # per-file suffixing could split the pair's
-                    # basename (x_001.dng + x.jpg). Resolve one shared
-                    # suffix over the whole file set up-front; best
-                    # effort — any error falls back to per-file
-                    # behavior inside the loop.
-                    pair_paths: list[Path] | None = None
-                    if (
-                        len(entries) > 1
-                        and self.cfg.output.on_conflict == "rename"
-                    ):
-                        try:
-                            raw_paths = [
-                                build_destination(
+                    batch_summaries: list[str] = []
+                    batch_had_spool = False
+                    batch_had_loss = False
+                    global_entry_idx = 0
+                    for group in entry_groups:
+                        # One shutter per group: own counter (Phase 3.15
+                        # lock discipline + Phase 3.18 B6 counter choice).
+                        with self._item_lock:
+                            self._shot_count += 1
+                            item = self._current_item
+                            per_item_next = self._shots_by_item.get(item, 0) + 1
+                            item_idx = pick_shot_index(
+                                self.cfg.output.filename_template,
+                                per_item_next=per_item_next,
+                                session_count=self._shot_count,
+                            )
+                            self._shots_by_item[item] = per_item_next
+
+                        # Phase 3.18 (B5): ONE timestamp per shutter, and
+                        # pair-aware conflict resolution within the group so
+                        # a DNG+JPG pair keeps an identical basename.
+                        shot_now = datetime.now()
+                        pair_paths: list[Path] | None = None
+                        if (
+                            len(group) > 1
+                            and self.cfg.output.on_conflict == "rename"
+                        ):
+                            try:
+                                raw_paths = [
+                                    build_destination(
+                                        self.cfg,
+                                        shot_index=item_idx,
+                                        session_name=self.session_name,
+                                        item_name=item,
+                                        image_id=status.image_id,
+                                        camera_name="fpL",
+                                        file_ext=(
+                                            (info.fileext or "jpg").lstrip(".")
+                                        ),
+                                        now=shot_now,
+                                    ).path
+                                    for (info, _data) in group
+                                ]
+                                pair_paths = resolve_conflicts_together(raw_paths)
+                            except Exception as e:  # noqa: BLE001
+                                self.log.warning(
+                                    "pair_conflict_precheck_failed", error=str(e),
+                                )
+                                pair_paths = None
+                        saved_paths: list[Path] = []
+                        spooled_paths: list[Path] = []
+                        total_size = 0
+                        for entry_idx, (info, data) in enumerate(group):
+                            # Phase 3.15 (A5): the save leg is guarded — the
+                            # camera's ImageDB entries are already cleared, so
+                            # ``data`` is the ONLY copy of this frame. Failed
+                            # writes spool to <output.root>/_recovery/ and the
+                            # session stays alive.
+                            try:
+                                dest = build_destination(
                                     self.cfg,
                                     shot_index=item_idx,
                                     session_name=self.session_name,
                                     item_name=item,
                                     image_id=status.image_id,
                                     camera_name="fpL",
-                                    file_ext=(
-                                        (info.fileext or "jpg").lstrip(".")
-                                    ),
-                                    now=shot_now,
-                                ).path
-                                for (info, _data) in entries
-                            ]
-                            pair_paths = resolve_conflicts_together(raw_paths)
-                        except Exception as e:  # noqa: BLE001
-                            self.log.warning(
-                                "pair_conflict_precheck_failed", error=str(e),
-                            )
-                            pair_paths = None
-                    saved_paths: list[Path] = []
-                    spooled_paths: list[Path] = []
-                    total_size = 0
-                    for entry_idx, (info, data) in enumerate(entries):
-                        # Phase 3.15 (A5): the whole save leg is
-                        # guarded. The camera's ImageDB entries are
-                        # already cleared by sigma_download_current,
-                        # so ``data`` is the ONLY copy of this frame —
-                        # a full disk, an unmounted volume, or a bad
-                        # filename_template (KeyError from .format)
-                        # used to escape to _run's fatal handler:
-                        # daemon dead AND the frame lost. Now: spool
-                        # the bytes to <output.root>/_recovery/ and
-                        # keep the session alive.
-                        try:
-                            dest = build_destination(
-                                self.cfg,
-                                shot_index=item_idx,
-                                session_name=self.session_name,
-                                item_name=item,
-                                image_id=status.image_id,
-                                camera_name="fpL",
-                                file_ext=(info.fileext or "jpg").lstrip("."),
-                                now=shot_now,  # B5: shared per shutter
-                            )
-                            if dest.session_dir is not None:
-                                dest.session_dir.mkdir(
-                                    parents=True, exist_ok=True
+                                    file_ext=(info.fileext or "jpg").lstrip("."),
+                                    now=shot_now,  # B5: shared per shutter
                                 )
-                            # B5: use the pair-resolved path when the
-                            # pre-check produced one.
-                            dest_path = (
-                                pair_paths[entry_idx]
-                                if pair_paths is not None
-                                else dest.path
+                                if dest.session_dir is not None:
+                                    dest.session_dir.mkdir(
+                                        parents=True, exist_ok=True
+                                    )
+                                dest_path = (
+                                    pair_paths[entry_idx]
+                                    if pair_paths is not None
+                                    else dest.path
+                                )
+                                saved = write_atomic(
+                                    dest_path,
+                                    data,
+                                    on_conflict=self.cfg.output.on_conflict,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                self.log.error(
+                                    "shot_save_failed",
+                                    error=str(e),
+                                    entry_idx=global_entry_idx,
+                                    template=self.cfg.output.filename_template,
+                                )
+                                rescued = self._spool_recovery(
+                                    info, data, global_entry_idx
+                                )
+                                if rescued is not None:
+                                    spooled_paths.append(rescued)
+                                    total_size += len(data)
+                                else:
+                                    batch_had_loss = True
+                                global_entry_idx += 1
+                                continue
+                            saved_paths.append(saved)
+                            total_size += len(data)
+                            # Per-file log so the user sees both halves of
+                            # a DNG+JPG pair in the log stream.
+                            log_shot(
+                                self.log,
+                                filename=saved.name,
+                                size=len(data),
+                                elapsed_s=elapsed,
+                                image_id=status.image_id,
+                                slot=(
+                                    self._next_slot + global_entry_idx
+                                ) % SIGMA_IMAGE_DB_SLOTS,
+                                image_db_head=status.image_db_head,
+                                image_db_tail=status.image_db_tail,
+                                trigger=pending_trigger,
                             )
-                            saved = write_atomic(
-                                dest_path,
-                                data,
-                                on_conflict=self.cfg.output.on_conflict,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            self.log.error(
-                                "shot_save_failed",
-                                error=str(e),
-                                entry_idx=entry_idx,
-                                template=self.cfg.output.filename_template,
-                            )
-                            rescued = self._spool_recovery(
-                                info, data, entry_idx
-                            )
-                            if rescued is not None:
-                                spooled_paths.append(rescued)
-                                total_size += len(data)
-                            continue
-                        saved_paths.append(saved)
-                        total_size += len(data)
-                        # Per-file log so the user sees both halves of
-                        # a DNG+JPG pair in the log stream.
-                        log_shot(
-                            self.log,
-                            filename=saved.name,
-                            size=len(data),
-                            elapsed_s=elapsed,
-                            image_id=status.image_id,
-                            slot=(
-                                self._next_slot + entry_idx
-                            ) % SIGMA_IMAGE_DB_SLOTS,
-                            image_db_head=status.image_db_head,
-                            image_db_tail=status.image_db_tail,
-                            trigger=pending_trigger,
-                        )
+                            global_entry_idx += 1
 
-                    # Emit a single ShotEvent representing the shutter
-                    # (the primary file — DNG comes first in DNG+JPG
-                    # mode, so saved_paths[0] is the "main" image).
-                    # size is the sum so the UI's running total is
-                    # accurate. Spooled-only saves still emit (the
-                    # bytes DID land on disk — just in _recovery/).
-                    primary = (saved_paths or spooled_paths)
-                    if primary:
-                        event = ShotEvent(
-                            shot_index=self._shot_count,
-                            saved_path=primary[0],
-                            size=total_size,
-                            elapsed_s=elapsed,
-                            image_id=status.image_id,
-                            db_head=status.image_db_head,
-                            db_tail=status.image_db_tail,
-                            trigger=pending_trigger,
-                        )
-                        self._emit_shot(event)
-                    if not saved_paths and spooled_paths:
-                        # Saved, but only into _recovery/ — surface
-                        # loudly; the user must fix the destination
-                        # (disk space / volume / template) before the
-                        # next shot repeats the dance.
-                        self._emit_status(
-                            "ready",
-                            f"保存失敗 → _recovery に退避 "
-                            f"({spooled_paths[0].name}) — 保存先を確認",
-                        )
-                    elif not saved_paths:
-                        # Spool failed too — the frame is gone. Say so
-                        # honestly rather than pretending "ready".
+                        # One ShotEvent per shutter (primary = DNG in a
+                        # pair). Spooled-only still emits — the bytes DID
+                        # land on disk, just in _recovery/.
+                        primary = (saved_paths or spooled_paths)
+                        if primary:
+                            event = ShotEvent(
+                                shot_index=self._shot_count,
+                                saved_path=primary[0],
+                                size=total_size,
+                                elapsed_s=elapsed,
+                                image_id=status.image_id,
+                                db_head=status.image_db_head,
+                                db_tail=status.image_db_tail,
+                                trigger=pending_trigger,
+                            )
+                            self._emit_shot(event)
+                        if not saved_paths and spooled_paths:
+                            batch_had_spool = True
+                        elif saved_paths:
+                            names = " + ".join(p.name for p in saved_paths)
+                            batch_summaries.append(
+                                f"#{self._shot_count}: {names}"
+                            )
+
+                    # Batch-level status message.
+                    if batch_had_loss:
                         self._emit_status(
                             "error",
                             "保存失敗 — ディスク容量/保存先を確認 "
                             "(画像を退避できませんでした)",
                         )
-                    else:
-                        if len(saved_paths) == 1:
-                            ready_msg = (
-                                f"Saved #{self._shot_count}: "
-                                f"{saved_paths[0].name}"
-                            )
-                        else:
-                            names = " + ".join(p.name for p in saved_paths)
-                            ready_msg = (
-                                f"Saved #{self._shot_count}: {names}"
-                            )
-                        self._emit_status("ready", ready_msg)
+                    elif batch_had_spool:
+                        self._emit_status(
+                            "ready",
+                            "保存失敗 → _recovery に退避 — 保存先を確認",
+                        )
+                    elif batch_summaries:
+                        # Phase 3.20: with a pipelined shot in flight
+                        # the cycle is NOT over — say "shooting" so the
+                        # panel doesn't flash Ready / "LV resuming…"
+                        # between pipelined frames.
+                        self._emit_status(
+                            "shooting" if pipelined_start is not None
+                            else "ready",
+                            "Saved " + " / ".join(batch_summaries),
+                        )
                     # Refresh exposure display — the user may have rolled a
                     # dial between shots.
                     self._emit_exposure(bridge)
@@ -1890,20 +1962,36 @@ class TetherDaemon:
                         self._next_slot = (
                             self._next_slot + len(entries)
                         ) % SIGMA_IMAGE_DB_SLOTS
-                    pending_trigger = "camera_button"
-                    t_shot_start = None
+                    # Phase 3.20: if we pipelined a snap before this
+                    # download, that shot is now in flight — poll for
+                    # it instead of returning to idle bookkeeping.
+                    if pipelined_start is not None:
+                        pending_trigger = "pc_snap"
+                        t_shot_start = pipelined_start
+                        t_last_polling_log = 0.0
+                        if pipelined_watch_slot is not None:
+                            # Watch the in-flight shot's landing slot
+                            # (tail at fire time) — overrides the
+                            # post-download head resync, which points
+                            # at drained history, not the future.
+                            self._next_slot = pipelined_watch_slot
+                    else:
+                        pending_trigger = "camera_button"
+                        t_shot_start = None
 
                     # ----- Arm the burst-aware quiet window -----
                     # Tick the burst counter once per file written —
                     # DNG+JPG counts as 2 ticks because the camera
                     # commits twice the image_db state per shutter,
                     # roughly doubling deep-commit work. If no
-                    # further snap is queued, arm a window scaled to
-                    # the (file-aware) burst length and reset the
-                    # counter.
+                    # further snap is queued AND nothing is in flight
+                    # (Phase 3.20: a pipelined shot must keep the
+                    # polls running — the window would add its length
+                    # to every pipelined cycle), arm a window scaled
+                    # to the (file-aware) burst length.
                     for _ in range(len(entries)):
                         self._record_shot()
-                    if self._snap_queue.empty():
+                    if self._snap_queue.empty() and t_shot_start is None:
                         self._arm_quiet_window()
                     # Tight loop — image may already be there for next shot
                     continue

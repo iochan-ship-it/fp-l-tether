@@ -50,6 +50,12 @@
 # 永続キャッシュから再生してファームの PC モードリセットを打ち消す。
 # preserve_user_settings = true
 
+# Phase 3.20 (実験的・既定 off): パイプライン撮影。image-ready 時に
+# 次のキュー済みスナップを先行発火し、露光とダウンロードを並行させる。
+# busy 中の Space が「無視」から「キュー (上限2)」になる。不調なら
+# この行を消すか false に。
+# pipelined_capture = false
+
 # 撮影後の quiet window: バースト終了後
 #   base + per_shot × (バースト枚数 - 1) 秒
 # の間 PTP 通信を全停止し、ImageDB 整理中のエンドポイント wedge を防ぐ。

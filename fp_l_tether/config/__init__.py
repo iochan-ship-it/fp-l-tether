@@ -148,6 +148,17 @@ class CameraConfig(_ValidatedModel):
     # to defaults (rare, e.g. studio reproducibility scenarios).
     preserve_user_settings: bool = True
 
+    # Phase 3.20 (EXPERIMENTAL, default off — and MEASURED INEFFECTIVE
+    # on the fp L): fire a queued snap at image-ready, before
+    # downloading, to overlap exposure with transfer. Hardware verdict
+    # 2026-07-18: the fp L firmware rejects SnapCommand with 0x6004
+    # whenever undownloaded images remain in the ImageDB — even on a
+    # freshly power-cycled body — so the early fire can never succeed
+    # there. Kept behind this flag for other bodies/firmware; leave
+    # off on the fp L. (The serial burst path is fast regardless:
+    # ~2.4 s/JPG, ~8 s/DNG+JPG measured the same day.)
+    pipelined_capture: bool = False
+
     # Burst-aware post-capture quiet window (see TetherDaemon._arm_quiet_window).
     # After a burst settles (snap queue drains), the daemon enforces
     # a no-PTP-traffic window of

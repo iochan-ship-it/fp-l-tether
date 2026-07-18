@@ -328,6 +328,9 @@ class FloatingTetherPanel(NSObject):
         # dispatch_after closure only writes if its captured token still
         # matches the latest, coalescing rapid drag/resize bursts.
         self._pending_save_token: int = 0
+        # Phase 3.20d: while > now, the LV staleness watchdog leaves the
+        # veil down (post-save quiet window = frames expected to stall).
+        self._suppress_stale_until: float = 0.0
 
         self._build_window()
         self._wire_callbacks()
@@ -768,6 +771,10 @@ class FloatingTetherPanel(NSObject):
         the UI never shows the raw machine name to the user.
         """
         state, message = tup
+        # Phase 3.20: remember the raw daemon state — the busy gate is
+        # binary, but snap-queueing during busy is only safe in the
+        # active-capture states (see _may_queue_snap).
+        self._last_daemon_state = state
         dot_color, label_text = STATUS_PRESETS.get(
             state, (C_FG_TERTIARY, state.title() if state else "—")
         )
@@ -794,6 +801,24 @@ class FloatingTetherPanel(NSObject):
             # Transient states (focusing, connecting, initializing) —
             # keep current dim state, just refresh the hint label.
             self._refresh_hint(state)
+
+    def _may_queue_snap(self) -> bool:
+        """Phase 3.20: may a Space press QUEUE during busy?
+
+        Only with pipelined capture enabled, and only in the
+        active-capture states — a queued snap there feeds the
+        pipeline (bounded to 2 by the daemon). Never in
+        error/disconnected/recovering, where a queued press would
+        recreate the phantom-shutter-after-recovery bug (A16).
+        """
+        try:
+            if not self._cfg.camera.pipelined_capture:
+                return False
+        except AttributeError:
+            return False
+        return getattr(self, "_last_daemon_state", "") in (
+            "shooting", "downloading", "focusing",
+        )
 
     def _set_overlay_label(self, text: str) -> None:
         """Set the LV pause-overlay caption (Phase 3.15).
@@ -899,10 +924,6 @@ class FloatingTetherPanel(NSObject):
         elif state == "error":
             self._set_overlay_label("Camera unresponsive")
         elif state == "ready":
-            # Phase 3.19: the save is DONE at this point — the overlay
-            # only remains because LV sits out the post-capture quiet
-            # window. Say so instead of a stale "Saving…" (the panel
-            # showing Ready while the LV claimed Saving read as a bug).
             self._set_overlay_label("LV resuming…")
 
         if busy:
@@ -912,6 +933,20 @@ class FloatingTetherPanel(NSObject):
             # on the next focus-point event or when LV resumes.
             self._lv_overlay.setHidden_(False)
             self._af_marker_view.setHidden_(True)
+        elif state == "ready":
+            # Phase 3.20d: the save is DONE — drop the dark veil NOW
+            # and let the frozen last LV frame show through while the
+            # post-capture quiet window runs out (LV frames resume a
+            # few seconds later). A camera freezing its preview
+            # between shots is natural; a black "Saving…" veil over a
+            # Ready panel read as a hang. The staleness watchdog is
+            # suppressed for the window's worst case so it doesn't
+            # slam the veil back over the frozen frame; if LV is
+            # genuinely dead it re-engages after the suppression
+            # lapses.
+            self._suppress_stale_until = time.monotonic() + 8.0
+            self._lv_overlay.setHidden_(True)
+            self._reposition_af_marker()
 
     @objc.signature(b"v@:@")
     def updateShot_(self, tup) -> None:
@@ -1450,6 +1485,12 @@ class FloatingTetherPanel(NSObject):
         )
         is_hidden = bool(self._lv_overlay.isHidden())
         if stale and is_hidden:
+            # Phase 3.20d: post-save grace — the quiet window means
+            # frames are EXPECTED to stall for a few seconds; keep
+            # showing the frozen frame instead of slamming the veil
+            # back. Re-engages automatically once the grace lapses.
+            if time.monotonic() < getattr(self, "_suppress_stale_until", 0.0):
+                return
             # Phase 3.15 (D): a stalled stream is not a save. Busy
             # states own their own label (set in _set_controls_busy);
             # a watchdog-triggered pause reads "LV paused".
@@ -2034,8 +2075,9 @@ class FloatingTetherPanel(NSObject):
                     self._panel.makeFirstResponder_(None)
                     # Phase 3.15 (A2): the commit half always runs, but
                     # the shoot half honours the busy gate (same rule
-                    # as the disabled Shoot button).
-                    if not self._controls_busy:
+                    # as the disabled Shoot button). Phase 3.20: with
+                    # pipelined capture, busy presses queue instead.
+                    if not self._controls_busy or self._may_queue_snap():
                         self._daemon.request_snap()
                     return None  # consume
                 # All other keys (letters, digits, Return, Tab, arrows)
@@ -2046,9 +2088,12 @@ class FloatingTetherPanel(NSObject):
             # Phase 3.15 (A2): Space/A respect the busy gate — the
             # buttons they mirror are disabled during commit/recovery
             # precisely because queued requests into a busy camera
-            # cascade into FW wedge (2026-05-13).
+            # cascade into FW wedge (2026-05-13). Phase 3.20: with
+            # pipelined capture enabled, a Space during the capture
+            # cycle QUEUES (bounded) instead of being swallowed —
+            # that queue is what feeds the pipeline.
             if key == " ":
-                if not self._controls_busy:
+                if not self._controls_busy or self._may_queue_snap():
                     self._daemon.request_snap()
                 return None  # consume
             if key == "a":
