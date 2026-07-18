@@ -430,6 +430,81 @@ class USBBridge:
             payload=payload[: length - PTP_HEADER_SIZE],
         )
 
+    # ----- transaction hygiene (Phase 3.17 / B1) -----------------------
+
+    # How many consecutive foreign-txid containers we tolerate before
+    # declaring the pipe desynced. 4 covers the worst realistic orphan
+    # (an abandoned DATA + RESPONSE pair from each of two transactions).
+    _STALE_READ_LIMIT = 4
+
+    def _drain_bulk_in(self, max_reads: int = 8, timeout_ms: int = 150) -> int:
+        """Best-effort flush of BULK_IN after a faulted transaction.
+
+        Phase 3.17 (B1): when a read phase dies mid-transaction (timeout,
+        short read), the camera may still deliver that transaction's
+        DATA/RESPONSE containers later — and before this existed, the
+        NEXT command consumed them as its own reply, producing the
+        "Expected DATA or RESPONSE" bounces and stale-frame confusion
+        we used to blame entirely on camera doze. Reading with a short
+        timeout until the pipe goes quiet costs at most
+        ``max_reads × timeout_ms`` (~1.2 s) and only runs on paths that
+        were already failing. Never raises.
+        """
+        if self._ep_in is None:
+            return 0
+        drained = 0
+        for _ in range(max_reads):
+            try:
+                chunk = bytes(self._ep_in.read(64 * 1024, timeout=timeout_ms))
+            except Exception:  # noqa: BLE001 — timeout = pipe quiet; done
+                break
+            if not chunk:
+                break
+            drained += len(chunk)
+        if drained:
+            logger.warning(
+                "B1 drain: flushed %d stale bytes from BULK_IN after fault",
+                drained,
+            )
+        return drained
+
+    def _read_validated(
+        self, expected_txid: int, opcode: int, timeout_ms: int | None = None
+    ) -> PTPContainer:
+        """Read one container belonging to THIS transaction (B1).
+
+        Containers whose ``transaction_id`` doesn't match are orphans
+        from an earlier aborted transaction — logged and discarded, up
+        to ``_STALE_READ_LIMIT`` in a row. Beyond that the pipe is
+        declared desynced (recoverable ``USBBridgeError`` → the
+        watcher's reconnect path owns it).
+
+        A DATA container with the right txid but a foreign opcode is
+        accepted with a warning (txid is the strong key; PTP requires
+        DATA.code == opcode, but we haven't catalogued every Sigma
+        firmware quirk and refusing here would turn a cosmetic
+        violation into a failed transaction).
+        """
+        for _ in range(self._STALE_READ_LIMIT):
+            c = self._read_container(timeout_ms=timeout_ms)
+            if c.transaction_id == expected_txid:
+                if c.is_data and c.code != opcode:
+                    logger.warning(
+                        "B1: DATA code 0x%04X != opcode 0x%04X (txid=%d) — "
+                        "accepting on txid match",
+                        c.code, opcode, expected_txid,
+                    )
+                return c
+            logger.warning(
+                "B1: stale PTP container discarded: type=%d code=0x%04X "
+                "txid=%d (expected txid=%d)",
+                c.container_type, c.code, c.transaction_id, expected_txid,
+            )
+        raise USBBridgeError(
+            f"PTP pipe desynced: {self._STALE_READ_LIMIT} consecutive "
+            f"stale containers while waiting for txid={expected_txid}"
+        )
+
     # ----- high-level: session ----------------------------------------
 
     def open_session(self, session_id: int = 1) -> None:
@@ -524,27 +599,46 @@ class USBBridge:
                 self._write(data_container, timeout_ms=timeout_ms)
 
             # 3. Incoming data phase + response
+            # Phase 3.17 (B1): reads are txid-validated, and any
+            # transport fault mid-read flushes BULK_IN before
+            # propagating — so an abandoned transaction's late
+            # containers can never be consumed as the next command's
+            # reply. PTPError is NOT caught here: a parsed non-OK
+            # response means the pipe itself is healthy.
             in_data = b""
             response: PTPContainer | None = None
 
-            if data_phase_in:
-                first = self._read_container(timeout_ms=timeout_ms)
-                if first.is_data:
-                    in_data = first.payload
-                    logger.debug("← DATA %d bytes", len(in_data))
-                    response = self._read_container(timeout_ms=timeout_ms)
-                elif first.is_response:
-                    # Some ops with data_phase_in=True actually return no data
-                    response = first
-                else:
-                    raise USBBridgeError(
-                        f"Expected DATA or RESPONSE container, got {first}"
+            try:
+                if data_phase_in:
+                    first = self._read_validated(
+                        txid, opcode, timeout_ms=timeout_ms
                     )
-            else:
-                response = self._read_container(timeout_ms=timeout_ms)
+                    if first.is_data:
+                        in_data = first.payload
+                        logger.debug("← DATA %d bytes", len(in_data))
+                        response = self._read_validated(
+                            txid, opcode, timeout_ms=timeout_ms
+                        )
+                    elif first.is_response:
+                        # Some ops with data_phase_in=True actually return no data
+                        response = first
+                    else:
+                        raise USBBridgeError(
+                            f"Expected DATA or RESPONSE container, got {first}"
+                        )
+                else:
+                    response = self._read_validated(
+                        txid, opcode, timeout_ms=timeout_ms
+                    )
+            except (USBBridgeError, usb.core.USBError):
+                self._drain_bulk_in()
+                raise
 
             assert response is not None
             if not response.is_response:
+                # Same-txid but wrong phase (e.g. duplicate DATA) —
+                # desync class; flush before surfacing (B1).
+                self._drain_bulk_in()
                 raise USBBridgeError(f"Expected RESPONSE container, got {response}")
 
             # Parse response params (0-5 uint32 LE)
