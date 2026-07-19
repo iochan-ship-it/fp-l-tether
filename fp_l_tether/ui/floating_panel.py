@@ -116,10 +116,31 @@ NSFontWeightBold = 0.4
 # hero exposure popups (the title text itself is the affordance).
 _NS_POPUP_NO_ARROW = 0
 
+# Compositing op for the focus-zoom crop blit (Phase 3.22). The name
+# moved across AppKit versions (NSCompositeCopy → NSCompositingOperationCopy)
+# so import defensively and fall back to the documented raw value.
+try:
+    from AppKit import NSCompositingOperationCopy as _NS_COMPOSITE_COPY
+except ImportError:  # pragma: no cover — old PyObjC metadata
+    _NS_COMPOSITE_COPY = 1
+
+# Autoresizing masks (documented literal values — the names aren't
+# exported by every PyObjC build). Pin-top-right = flexible left +
+# flexible bottom margin; pin-top-left = flexible right + bottom.
+_NS_PIN_TOP_RIGHT = 1 | 8   # NSViewMinXMargin | NSViewMinYMargin
+_NS_PIN_TOP_LEFT = 4 | 8    # NSViewMaxXMargin | NSViewMinYMargin
+
 from fp_l_tether.camera.sigma_datagroup import (
+    EXP_COMP_CODES,
+    EXPOSURE_MODE_CODES,
     apex_to_aperture,
     apex_to_iso,
     apex_to_shutter,
+    battery_describe,
+    battery_label,
+    battery_level_class,
+    expcomp_label,
+    exposure_mode_label,
     image_quality_label,
     resolution_label,
     wb_label,
@@ -193,6 +214,9 @@ F_LABEL = NSFont.systemFontOfSize_weight_(10, NSFontWeightMedium)
 F_BODY = NSFont.systemFontOfSize_weight_(12, NSFontWeightRegular)
 F_BUTTON = NSFont.systemFontOfSize_weight_(13, NSFontWeightSemibold)
 F_HINT = NSFont.systemFontOfSize_weight_(10, NSFontWeightRegular)
+# Phase 3.22 — tiny mono font for the on-LV badges (battery pill,
+# focus-zoom "100%" marker).
+F_BADGE = NSFont.monospacedSystemFontOfSize_weight_(10, NSFontWeightMedium)
 
 # Status-row presets — keep the daemon's internal state names (these
 # match the keys the daemon emits through on_status) but render with
@@ -347,6 +371,17 @@ class FloatingTetherPanel(NSObject):
         self._flash_text: str = ""
         self._flash_until: float = 0.0
         self._last_status_message: str = ""
+        # Phase 3.22: focus-zoom state, battery cache, review overlay.
+        # _lv_zoom is the magnification factor (0 = off, 4, 8 — same
+        # ladder as the body's MF assist); truthiness = "zoom active".
+        # _zoom_hist_was_visible remembers the histogram strip so
+        # exiting zoom restores the user's own H toggle, not the cfg
+        # default. _review_view is lazily created on the first shot.
+        self._lv_zoom: int = 0
+        self._zoom_hist_was_visible: bool = False
+        self._review_view = None
+        self._review_token: int = 0
+        self._last_battery_raw: int | None = None
 
         self._build_window()
         self._install_context_menu()
@@ -442,6 +477,52 @@ class FloatingTetherPanel(NSObject):
             lv_layer.setCornerRadius_(4.0)
             lv_layer.setMasksToBounds_(True)
         content.addSubview_(self._live_view)
+
+        # ----- LV badges (Phase 3.22) ------------------------------
+        # Battery pill (top-right) + focus-zoom marker (top-left).
+        # Both are subviews of the LV view itself, so they travel with
+        # detach/reattach for free and autoresize against the detached
+        # window. _ClickThroughView keeps the click-to-AF surface
+        # intact underneath.
+        self._battery_pill = _make_lv_badge(
+            LV_WIDTH - _BADGE_W_BAT - _BADGE_M,
+            LV_HEIGHT - _BADGE_H - _BADGE_M,
+            _BADGE_W_BAT,
+            mask=_NS_PIN_TOP_RIGHT,
+        )
+        self._battery_label = self._battery_pill.subviews()[0]
+        self._battery_pill.setHidden_(True)  # until DG1 reports a value
+        self._live_view.addSubview_(self._battery_pill)
+
+        # Exposure-mode chip (Phase 3.22c) — top-left. The body's own
+        # mode display is unreachable mid-tether (controls locked, LCD
+        # dark), and the PC-mode template + cache replay clobber any
+        # mode dialled while the app was down, so the app must both
+        # SHOW the live mode and (via right-click menu) SET it.
+        self._mode_chip = _make_lv_badge(
+            _BADGE_M,
+            LV_HEIGHT - _BADGE_H - _BADGE_M,
+            _BADGE_W_MODE,
+            mask=_NS_PIN_TOP_LEFT,
+        )
+        self._mode_chip_label = self._mode_chip.subviews()[0]
+        self._mode_chip.setToolTip_(
+            "Exposure mode — right-click the panel to change"
+        )
+        self._mode_chip.setHidden_(True)  # until DG2 reports a mode
+        self._live_view.addSubview_(self._mode_chip)
+
+        self._zoom_badge = _make_lv_badge(
+            _BADGE_M + _BADGE_W_MODE + 4,
+            LV_HEIGHT - _BADGE_H - _BADGE_M,
+            _BADGE_W_ZOOM,
+            mask=_NS_PIN_TOP_LEFT,
+        )
+        _zoom_lbl = self._zoom_badge.subviews()[0]
+        _zoom_lbl.setStringValue_("×4")  # placeholder — set per level
+        _zoom_lbl.setTextColor_(C_AMBER)
+        self._zoom_badge.setHidden_(True)  # only while Z-zoom active
+        self._live_view.addSubview_(self._zoom_badge)
 
         # ----- Composition grid (Phase 3.11) -----------------------
         # Full-LV-area overlay; drawRect is a no-op when mode == "off"
@@ -612,26 +693,38 @@ class FloatingTetherPanel(NSObject):
         )
         content.addSubview_(self._av_dropdown)
 
-        # ----- Secondary row (WB / Format / Size) ------------------
+        # ----- Secondary row (WB / Format / Size / EV) -------------
+        # Phase 3.22 adds a 4th popup for exposure compensation.
+        # Widths are asymmetric — sized to each popup's longest label
+        # ("Fluorescent", "DNG+JPG", "S", "−3.0") — and still span
+        # LV_WIDTH exactly: 84+78+48+60 + 3×6 gaps = 288.
         sec_gap = 6
-        sec_w = (LV_WIDTH - 2 * sec_gap) // 3  # 92
-        sec_xs = [
-            LV_X,
-            LV_X + sec_w + sec_gap,
-            LV_X + 2 * (sec_w + sec_gap),
-        ]
+        sec_ws = (84, 78, 48, 60)
+        sec_xs = []
+        _sx = LV_X
+        for _sw in sec_ws:
+            sec_xs.append(_sx)
+            _sx += _sw + sec_gap
         self._wb_dropdown = _make_secondary_popup(
-            sec_xs[0], SEC_Y, sec_w, SEC_H, self, "wbChanged:"
+            sec_xs[0], SEC_Y, sec_ws[0], SEC_H, self, "wbChanged:"
         )
+        self._wb_dropdown.setToolTip_("White balance")
         content.addSubview_(self._wb_dropdown)
         self._fmt_dropdown = _make_secondary_popup(
-            sec_xs[1], SEC_Y, sec_w, SEC_H, self, "fmtChanged:"
+            sec_xs[1], SEC_Y, sec_ws[1], SEC_H, self, "fmtChanged:"
         )
+        self._fmt_dropdown.setToolTip_("File format")
         content.addSubview_(self._fmt_dropdown)
         self._size_dropdown = _make_secondary_popup(
-            sec_xs[2], SEC_Y, sec_w, SEC_H, self, "sizeChanged:"
+            sec_xs[2], SEC_Y, sec_ws[2], SEC_H, self, "sizeChanged:"
         )
+        self._size_dropdown.setToolTip_("Image size (JPG)")
         content.addSubview_(self._size_dropdown)
+        self._ev_dropdown = _make_secondary_popup(
+            sec_xs[3], SEC_Y, sec_ws[3], SEC_H, self, "evChanged:"
+        )
+        self._ev_dropdown.setToolTip_("Exposure compensation (EV)")
+        content.addSubview_(self._ev_dropdown)
 
         # ----- Subject field ---------------------------------------
         # Composite: a dark inset container holds an inline uppercase
@@ -753,7 +846,14 @@ class FloatingTetherPanel(NSObject):
     def _on_shot_threadsafe(self, event) -> None:  # type: ignore[no-untyped-def]
         self.performSelectorOnMainThread_withObject_waitUntilDone_(
             "updateShot:",
-            (event.shot_index, event.saved_path.name, event.size, event.mbps),
+            (
+                event.shot_index,
+                event.saved_path.name,
+                event.size,
+                event.mbps,
+                # Phase 3.22 — full path string for the review overlay.
+                str(event.saved_path),
+            ),
             False,
         )
 
@@ -769,6 +869,11 @@ class FloatingTetherPanel(NSObject):
                 s.wb_raw,
                 s.file_format_raw,
                 s.image_size_raw,
+                # Phase 3.22 — exp-comp + battery ride the same event;
+                # 3.22c appends the exposure mode.
+                getattr(s, "exp_comp_raw", 0),
+                getattr(s, "battery_raw", -1),
+                getattr(s, "exposure_mode_raw", 0),
             ),
             False,
         )
@@ -892,8 +997,34 @@ class FloatingTetherPanel(NSObject):
         add("Shoot  (Space)", "shootClicked:")
         add("Focus  (A)", "afClicked:")
         menu.addItem_(NSMenuItem.separatorItem())
+
+        # Exposure-mode submenu (Phase 3.22c). The body's MODE button
+        # is locked during tether AND the PC-mode template + settings
+        # cache clobber any mode dialled while the app was down — so
+        # the app is the authoritative place to pick P/A/S/M. The
+        # selection round-trips through the camera (checkmark follows
+        # the re-read) and lands in the settings cache, so it survives
+        # reconnects.
+        mode_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Exposure Mode", None, ""
+        )
+        mode_menu = NSMenu.alloc().initWithTitle_("Exposure Mode")
+        self._mode_items = {}
+        for label, code in EXPOSURE_MODE_CODES:
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "menuExposureModeSelect:", ""
+            )
+            it.setTarget_(self)
+            it.setTag_(code)
+            mode_menu.addItem_(it)
+            self._mode_items[code] = it
+        mode_root.setSubmenu_(mode_menu)
+        menu.addItem_(mode_root)
+        menu.addItem_(NSMenuItem.separatorItem())
+
         add("Histogram", "menuToggleHistogram:", "h", 0)
         add("Grid", "menuCycleGrid:", "g", 0)
+        add("Focus Zoom ×4 / ×8", "menuToggleZoom:", "z", 0)
         add("Detach / Reattach LV", "menuToggleDetach:", "d",
             NSEventModifierFlagCommand)
         menu.addItem_(NSMenuItem.separatorItem())
@@ -938,6 +1069,9 @@ class FloatingTetherPanel(NSObject):
     def menuCycleGrid_(self, sender) -> None:  # type: ignore[no-untyped-def]
         self._cycle_grid()
 
+    def menuToggleZoom_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._toggle_focus_zoom()
+
     def menuToggleDetach_(self, sender) -> None:  # type: ignore[no-untyped-def]
         self._toggle_lv_detached()
 
@@ -946,6 +1080,20 @@ class FloatingTetherPanel(NSObject):
 
     def menuQuit_(self, sender) -> None:  # type: ignore[no-untyped-def]
         self.stop()
+
+    def menuExposureModeSelect_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        """Write DG2.ExposureMode from the context menu (Phase 3.22c).
+
+        Optimistically checkmarks the pick for instant feedback; the
+        daemon's post-write re-read emits a fresh ExposureEvent that
+        settles the checkmark + chip on what the camera actually
+        accepted (a rejected write snaps them back).
+        """
+        if self._controls_busy:
+            return
+        code = int(sender.tag())
+        self._sync_exposure_mode(code)
+        self._daemon.request_set_exposure(2, {"ExposureMode": code})
 
     def menuIntervalSelect_(self, sender) -> None:  # type: ignore[no-untyped-def]
         secs = int(sender.tag())
@@ -998,6 +1146,16 @@ class FloatingTetherPanel(NSObject):
             self._hint_label.setStringValue_(self._flash_text)
             self._hint_label.setTextColor_(C_AMBER)
             return
+        # Phase 3.22: active focus-zoom announces itself + the way out
+        # (also outranked by error / recovery guidance).
+        zoom_f = getattr(self, "_lv_zoom", 0)
+        if zoom_f and state not in ("error", "disconnected", "recovering"):
+            nxt = "×8" if zoom_f == 4 else "off"
+            self._hint_label.setStringValue_(
+                f"Focus zoom ×{zoom_f} — Z: {nxt} · click LV: exit"
+            )
+            self._hint_label.setTextColor_(C_AMBER)
+            return
         if state in ("shooting", "downloading"):
             text = "Camera busy — release space to wait"
             color = C_STATE_BUSY
@@ -1047,6 +1205,7 @@ class FloatingTetherPanel(NSObject):
             self._wb_dropdown,
             self._fmt_dropdown,
             self._size_dropdown,
+            self._ev_dropdown,
         ):
             dd.setEnabled_(enabled)
 
@@ -1061,6 +1220,7 @@ class FloatingTetherPanel(NSObject):
             self._wb_dropdown,
             self._fmt_dropdown,
             self._size_dropdown,
+            self._ev_dropdown,
             self._item_field,
             self._shoot_btn,
             self._af_btn,
@@ -1122,7 +1282,13 @@ class FloatingTetherPanel(NSObject):
         the default view per the v2 mockup — only the count remains.
         The detail still flows through the daemon's structured log.
         """
-        idx, name, size, _mbps = tup
+        # Phase 3.22 grew the tuple 4→5 (saved-path string for the
+        # review overlay). Tolerate the old shape.
+        if len(tup) >= 5:
+            idx, name, size, _mbps, path_str = tup[:5]
+        else:
+            idx, name, size, _mbps = tup
+            path_str = None
         self._shot_count = max(int(idx), self._shot_count + 1)
         plural = "shot" if self._shot_count == 1 else "shots"
         self._shot_label.setStringValue_(f"{self._shot_count} {plural}")
@@ -1148,6 +1314,107 @@ class FloatingTetherPanel(NSObject):
         except Exception:  # noqa: BLE001
             pass
 
+        # Phase 3.22 — post-shot review overlay.
+        if path_str:
+            self._show_review(str(path_str))
+
+    # ----- post-shot review (Phase 3.22) ------------------------------
+
+    def _show_review(self, path_str: str) -> None:
+        """Flash the just-saved frame over the LV for a beat.
+
+        Tether-style capture review: after every shutter the viewport
+        shows WHAT was captured, full-size, for 2.5 s — the sharpness
+        / framing glance no longer needs Lightroom. The JPG half of a
+        DNG+JPG pair is used (identical basename per the B5 pair
+        guarantee); DNG-only shots skip review, since decoding a
+        60 MB raw on the main thread would stall the LV for ~1 s.
+        """
+        try:
+            p = Path(path_str)
+            if p.suffix.lower() != ".jpg":
+                for cand in (p.with_suffix(".JPG"), p.with_suffix(".jpg")):
+                    if cand.exists():
+                        p = cand
+                        break
+                else:
+                    return  # DNG-only — no cheap preview to show
+            if not p.exists():
+                return
+            image = NSImage.alloc().initWithContentsOfFile_(str(p))
+            if image is None:
+                return
+        except Exception:  # noqa: BLE001
+            return
+
+        try:
+            view = self._ensure_review_view()
+            if view is None:
+                return
+            view.setImage_(image)
+            view.setToolTip_(p.name)
+            view.setHidden_(False)
+            # Token-guarded auto-hide: a burst of shots keeps replacing
+            # the image and pushes the hide-out, instead of the first
+            # shot's timer chopping the last shot's review short.
+            self._review_token += 1
+            token = self._review_token
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                2.5, False,
+                lambda _t: (
+                    self._hide_review()
+                    if self._review_token == token
+                    else None
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _ensure_review_view(self):  # type: ignore[no-untyped-def]
+        """(Re)parent the lazily-created review view over the LV.
+
+        The LV's superview changes across detach/reattach, so the
+        review view re-homes itself to wherever the LV currently
+        lives and mirrors its frame on every show.
+        """
+        superview = self._live_view.superview()
+        if superview is None:
+            return None
+        view = self._review_view
+        if view is None:
+            view = _ReviewImageView.alloc().initWithFrame_(
+                self._live_view.frame()
+            )
+            view.setEditable_(False)
+            view.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+            view.setWantsLayer_(True)
+            layer = view.layer()
+            if layer is not None:
+                layer.setBackgroundColor_(C_BG_LV_FRAME.CGColor())
+                layer.setCornerRadius_(4.0)
+                layer.setMasksToBounds_(True)
+                # Amber hairline = "this is a capture, not live view".
+                layer.setBorderColor_(C_AMBER.CGColor())
+                layer.setBorderWidth_(1.0)
+            self._review_view = view
+        if view.superview() is not superview:
+            try:
+                view.removeFromSuperview()
+            except Exception:  # noqa: BLE001
+                pass
+            superview.addSubview_(view)
+        view.setFrame_(self._live_view.frame())
+        return view
+
+    def _hide_review(self) -> bool:
+        """Hide the review overlay. Returns True if it was visible."""
+        view = self._review_view
+        if view is None or view.isHidden():
+            return False
+        self._review_token += 1  # cancels any pending auto-hide
+        view.setHidden_(True)
+        return True
+
     @objc.signature(b"v@:@")
     def updateExposure_(self, tup) -> None:
         """Sync the dropdowns to the camera's reported exposure.
@@ -1156,7 +1423,19 @@ class FloatingTetherPanel(NSObject):
         doesn't recursively re-queue writes when it programmatically
         selects items.
         """
-        iso_raw, iso_auto, ss_raw, av_raw, wb_raw, fmt_raw, size_raw = tup
+        # Phase 3.22 grew the tuple 7→9 (exp-comp + battery); 3.22c
+        # 9→10 (exposure mode). Tolerate older shapes for any marshal
+        # in flight across a reload.
+        mode_raw = None
+        if len(tup) >= 10:
+            (iso_raw, iso_auto, ss_raw, av_raw, wb_raw, fmt_raw,
+             size_raw, ec_raw, bat_raw, mode_raw) = tup[:10]
+        elif len(tup) >= 9:
+            (iso_raw, iso_auto, ss_raw, av_raw, wb_raw, fmt_raw,
+             size_raw, ec_raw, bat_raw) = tup[:9]
+        else:
+            iso_raw, iso_auto, ss_raw, av_raw, wb_raw, fmt_raw, size_raw = tup
+            ec_raw, bat_raw = 0, None
         self._exposure_raw = {
             "ISOSpeed": iso_raw,
             "ISOAuto": iso_auto,
@@ -1165,7 +1444,10 @@ class FloatingTetherPanel(NSObject):
             "WhiteBalance": wb_raw,
             "ImageQuality": fmt_raw,
             "Resolution": size_raw,
+            "ExpComp": ec_raw,
         }
+        if mode_raw is not None:
+            self._exposure_raw["ExposureMode"] = mode_raw
         self._suppress_action = True
         try:
             # ISO dropdown — represented value is the raw byte; "Auto"
@@ -1180,8 +1462,57 @@ class FloatingTetherPanel(NSObject):
             self._select_dropdown_by_repr(self._wb_dropdown, wb_raw)
             self._select_dropdown_by_repr(self._fmt_dropdown, fmt_raw)
             self._select_dropdown_by_repr(self._size_dropdown, size_raw)
+            self._select_dropdown_by_repr(self._ev_dropdown, ec_raw)
         finally:
             self._suppress_action = False
+
+        # Battery pill (Phase 3.22) — refresh outside the suppress
+        # block; it's display-only and never fires an action.
+        if bat_raw is not None:
+            self._update_battery(int(bat_raw))
+        # Exposure-mode chip + menu checkmarks (Phase 3.22c).
+        if mode_raw is not None:
+            self._sync_exposure_mode(int(mode_raw))
+
+    def _sync_exposure_mode(self, mode_raw: int) -> None:
+        """Reflect DG2.ExposureMode into the LV chip + context menu."""
+        letter = exposure_mode_label(mode_raw)
+        try:
+            self._mode_chip_label.setStringValue_(letter)
+            self._mode_chip.setHidden_(letter == "—")
+            for code, item in getattr(self, "_mode_items", {}).items():
+                item.setState_(1 if code == mode_raw else 0)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _update_battery(self, raw: int) -> None:
+        """Render DG1.BatteryState into the LV pill (Phase 3.22b).
+
+        3-segment gauge matching the body's own indicator, coloured by
+        severity (white = ok, amber = low, red = empty). Unknown raw
+        values hide the pill rather than guess. The tooltip headline
+        is a plain reading ("Battery level 1/3") with the raw byte in
+        parentheses for ongoing field calibration.
+        """
+        if raw == self._last_battery_raw:
+            return
+        self._last_battery_raw = raw
+        text = battery_label(raw)
+        try:
+            self._battery_label.setStringValue_(text)
+            tip = battery_describe(raw)
+            self._battery_pill.setToolTip_(tip)
+            self._battery_label.setToolTip_(tip)
+            klass = battery_level_class(raw)
+            if klass == "critical":
+                self._battery_label.setTextColor_(C_STATE_ERROR)
+            elif klass == "low":
+                self._battery_label.setTextColor_(C_AMBER_BRIGHT)
+            else:
+                self._battery_label.setTextColor_(C_FG_PRIMARY)
+            self._battery_pill.setHidden_(not text)
+        except Exception:  # noqa: BLE001
+            pass
 
     @objc.signature(b"v@:@")
     def updateCanSetInfo_(self, tup) -> None:
@@ -1231,6 +1562,17 @@ class FloatingTetherPanel(NSObject):
                 self._size_dropdown,
                 [(resolution_label(c), c) for c in info.resolution_codes],
             )
+
+            # Exposure compensation (Phase 3.22). CamCanSetInfo5 does
+            # NOT advertise ExpComp codes on fp L V90, so the ladder
+            # is static: ±3 EV in 1/3 steps, same as the body dial.
+            self._fill_dropdown(
+                self._ev_dropdown,
+                [(expcomp_label(c), c) for c in EXP_COMP_CODES],
+            )
+            # Default to ±0 until the first exposure event lands —
+            # _fill_dropdown's index-0 selection would show "+3.0".
+            self._select_dropdown_by_repr(self._ev_dropdown, 0)
         finally:
             self._suppress_action = False
 
@@ -1245,6 +1587,9 @@ class FloatingTetherPanel(NSObject):
                     self._exposure_raw.get("WhiteBalance", 0),
                     self._exposure_raw.get("ImageQuality", 0),
                     self._exposure_raw.get("Resolution", 0),
+                    self._exposure_raw.get("ExpComp", 0),
+                    None,  # battery unchanged — pill keeps last value
+                    self._exposure_raw.get("ExposureMode", None),
                 )
             )
 
@@ -1271,6 +1616,12 @@ class FloatingTetherPanel(NSObject):
             return
         if self._controls_busy:
             # Stale-info gate — reticle reappears once LV resumes.
+            self._af_marker_view.setHidden_(True)
+            return
+        if self._lv_zoom:
+            # Phase 3.22 — the reticle's mapping assumes the full
+            # frame; on a zoom crop the AF point IS the crop centre,
+            # so the corner ticks would just mislead.
             self._af_marker_view.setHidden_(True)
             return
         cam_x, cam_y = self._focus_xy
@@ -1356,6 +1707,12 @@ class FloatingTetherPanel(NSObject):
             # truncated frame during mode transitions). Keep the
             # previous image up so the viewport doesn't flicker.
             return
+        # Phase 3.22 — focus zoom: swap in a ×4/×8 crop around the AF
+        # point. Falls back to the full frame on any crop failure.
+        if self._lv_zoom:
+            zoomed = self._zoom_crop(image, width, height)
+            if zoomed is not None:
+                image = zoomed
         self._live_view.setImage_(image)
 
         # Push the side-channel histogram snapshot into the bottom-strip
@@ -1501,10 +1858,37 @@ class FloatingTetherPanel(NSObject):
                 2, {"Resolution": int(repr_obj)}
             )
 
+    @objc.signature(b"v@:@")
+    def evChanged_(self, sender) -> None:
+        """Exposure compensation (DG1.ExpComp, APEX 1/8-stop, 2's-comp).
+
+        Phase 3.22. In M mode without auto-ISO the camera treats
+        ExpComp as a metering readout, so a write may be ignored — the
+        daemon's post-write re-read emits what actually took effect
+        and the dropdown snaps back, which is the honest behaviour.
+        """
+        if self._suppress_action:
+            return
+        repr_obj = self._selected_repr(sender)
+        if isinstance(repr_obj, int):
+            self._daemon.request_set_exposure(
+                1, {"ExpComp": int(repr_obj)}
+            )
+
     # --- AF point (LV click → camera) -------------------------------
 
     def commit_focus_point(self, cam_x: int, cam_y: int) -> None:
         """Push a new AF point to the camera (called from LV mouse handler)."""
+        # Phase 3.22 click precedence: a review thumbnail on top of
+        # the LV means the click-point isn't the live scene — dismiss
+        # the review instead of blindly moving AF. Likewise while
+        # focus-zoomed the click mapping assumes the full frame, so a
+        # click exits the zoom rather than jumping the AF point.
+        if self._hide_review():
+            return
+        if self._lv_zoom:
+            self._set_zoom_factor(0)
+            return
         # Clamp to the camera-reported bounds so we never send out-of-range.
         info = self._can_set_info
         if info is not None:
@@ -1597,6 +1981,11 @@ class FloatingTetherPanel(NSObject):
             return
         new_visible = bool(view.isHidden())  # toggle
         view.setHidden_(not new_visible)
+        # Phase 3.22: an explicit H during focus-zoom overrides the
+        # zoom's force-hide — keep the zoom-exit restore in sync with
+        # the user's latest intent rather than the pre-zoom snapshot.
+        if getattr(self, "_lv_zoom", False):
+            self._zoom_hist_was_visible = new_visible
         try:
             self._daemon.set_histogram_enabled(new_visible)
         except Exception as e:  # noqa: BLE001
@@ -1636,6 +2025,105 @@ class FloatingTetherPanel(NSObject):
             )
         except Exception:  # noqa: BLE001
             pass
+
+    # ----- focus zoom (Phase 3.22) ------------------------------------
+
+    def _toggle_focus_zoom(self) -> None:
+        """Hotkey Z — cycle AF-point magnification off → ×4 → ×8 → off.
+
+        Same ladder as the body's own MF assist. Repro / product work
+        needs pixel-level focus confirmation that a proportional fit
+        can't show. While zoomed: ``updateLiveFrame_`` crops 1/f of
+        the frame around ``_focus_xy`` (so the magnification is
+        relative to the full view and works at ANY viewport size,
+        attached or detached); grid + reticle hide (their geometry is
+        meaningless on a crop); an amber ×4/×8 badge marks the state;
+        Z cycles onward, a click on the LV exits.
+
+        (v1 defined zoom as a 1:1 device-pixel crop — on a large
+        detached LV window the full frame is already ≥ native, so
+        the zoom visibly did nothing. Factor-based is what a
+        photographer means by "zoom".)
+        """
+        self._set_zoom_factor({0: 4, 4: 8}.get(self._lv_zoom, 0))
+
+    def _set_zoom_factor(self, factor: int) -> None:
+        if factor == self._lv_zoom:
+            return
+        was_off = not self._lv_zoom
+        self._lv_zoom = factor
+        try:
+            if factor:
+                self._zoom_badge.subviews()[0].setStringValue_(f"×{factor}")
+                self._zoom_badge.setHidden_(False)
+                self._grid_view.setHidden_(True)
+                if was_off:
+                    self._zoom_hist_was_visible = (
+                        not self._hist_view.isHidden()
+                    )
+                self._hist_view.setHidden_(True)
+                self._af_marker_view.setHidden_(True)
+            else:
+                self._zoom_badge.setHidden_(True)
+                self._grid_view.setHidden_(False)
+                if self._zoom_hist_was_visible:
+                    self._hist_view.setHidden_(False)
+                self._zoom_hist_was_visible = False
+                self._reposition_af_marker()
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_hint(getattr(self, "_last_daemon_state", "ready"))
+
+    def _zoom_crop(self, image, src_w: int, src_h: int):  # type: ignore[no-untyped-def]
+        """Crop 1/factor of ``image`` around the AF point (Phase 3.22b).
+
+        The crop fills the viewport afterwards, so the net effect is
+        ×factor magnification relative to the full-frame fit —
+        independent of viewport size, which is what fixed the
+        "detached window zoom does nothing" report. Returns None on
+        any failure so the caller falls back to the plain fit.
+        """
+        factor = self._lv_zoom
+        if not factor:
+            return None
+        try:
+            # Prefer the image's own coordinate space over the parsed
+            # SOF dims — identical for the fp L's 72-dpi LV JPEGs, but
+            # drawInRect fromRect is defined in image-size units.
+            isz = image.size()
+            iw = float(isz.width) or float(src_w)
+            ih = float(isz.height) or float(src_h)
+            if iw <= 0 or ih <= 0:
+                return None
+            cw = max(1.0, iw / factor)
+            ch = max(1.0, ih / factor)
+            # Centre on the AF point (camera coords → normalised).
+            if self._focus_xy is not None:
+                x_min, x_max, y_min, y_max = self.af_bounds()
+                nx = (self._focus_xy[0] - x_min) / max(1, x_max - x_min)
+                ny = (self._focus_xy[1] - y_min) / max(1, y_max - y_min)
+                nx = max(0.0, min(1.0, nx))
+                ny = max(0.0, min(1.0, ny))
+            else:
+                nx = ny = 0.5
+            cx = nx * iw
+            cy_td = ny * ih          # camera Y is top-down
+            x0 = max(0.0, min(iw - cw, cx - cw / 2.0))
+            y0 = max(0.0, min(ih - ch, (ih - cy_td) - ch / 2.0))  # flip Y
+            out = NSImage.alloc().initWithSize_(NSMakeSize(cw, ch))
+            out.lockFocus()
+            try:
+                image.drawInRect_fromRect_operation_fraction_(
+                    NSMakeRect(0, 0, cw, ch),
+                    NSMakeRect(x0, y0, cw, ch),
+                    _NS_COMPOSITE_COPY,
+                    1.0,
+                )
+            finally:
+                out.unlockFocus()
+            return out
+        except Exception:  # noqa: BLE001
+            return None
 
     # ----- live-view staleness watchdog -------------------------------
 
@@ -1761,6 +2249,11 @@ class FloatingTetherPanel(NSObject):
         if self._lv_window is not None:
             return  # already detached, no-op
 
+        # Phase 3.22: drop any visible review overlay first — it's
+        # parented to the LV's *current* superview and would otherwise
+        # linger over the shrunken panel. It re-homes on next show.
+        self._hide_review()
+
         content = self._panel.contentView()
 
         # Step 1: lift the 5 LV-area views off the panel content. We
@@ -1848,6 +2341,9 @@ class FloatingTetherPanel(NSObject):
         """Reverse of ``_detach_lv``. Idempotent if already attached."""
         if self._lv_window is None:
             return
+
+        # Phase 3.22: same review-overlay hygiene as _detach_lv.
+        self._hide_review()
 
         content = self._panel.contentView()
 
@@ -2293,6 +2789,10 @@ class FloatingTetherPanel(NSObject):
             if key == "g":
                 self._cycle_grid()
                 return None  # consume
+            # Phase 3.22 — focus zoom (1:1 crop around the AF point).
+            if key == "z":
+                self._toggle_focus_zoom()
+                return None  # consume
             return event
 
         # Local monitor (when our panel has focus) — returns event or None
@@ -2454,6 +2954,59 @@ class _ClickThroughView(NSView):
 
     def hitTest_(self, point):  # type: ignore[no-untyped-def]
         return None
+
+
+class _ReviewImageView(NSImageView):
+    """Post-shot review overlay — never intercepts clicks (Phase 3.22).
+
+    hitTest → None lets a click fall through to the LiveViewImageView
+    underneath; its ``commit_focus_point`` path dismisses the review
+    first (a blind AF move under a covered LV would be a surprise).
+    """
+
+    def hitTest_(self, point):  # type: ignore[no-untyped-def]
+        return None
+
+
+# On-LV badge geometry (Phase 3.22) — shared by the battery pill, the
+# exposure-mode chip, and the focus-zoom marker so the LV corners stay
+# visually symmetric.
+_BADGE_H = 16
+_BADGE_M = 6
+_BADGE_W_BAT = 56
+_BADGE_W_ZOOM = 34
+_BADGE_W_MODE = 24
+
+
+def _make_lv_badge(x: float, y: float, w: float, *, mask: int) -> "NSView":
+    """Small dark pill with a centred mono label, for LV corner chrome.
+
+    Returns a ``_ClickThroughView`` whose single subview is the
+    NSTextField label (callers reach it via ``subviews()[0]``).
+    """
+    pill = _ClickThroughView.alloc().initWithFrame_(
+        NSMakeRect(x, y, w, _BADGE_H)
+    )
+    pill.setWantsLayer_(True)
+    layer = pill.layer()
+    if layer is not None:
+        layer.setBackgroundColor_(
+            NSColor.colorWithCalibratedWhite_alpha_(0.0, 0.45).CGColor()
+        )
+        layer.setCornerRadius_(_BADGE_H / 2.0)
+    try:
+        pill.setAutoresizingMask_(mask)
+    except Exception:  # noqa: BLE001
+        pass
+    label = NSTextField.alloc().initWithFrame_(
+        NSMakeRect(0, 1, w, _BADGE_H - 2)
+    )
+    _make_label(label, "")
+    label.setFont_(F_BADGE)
+    label.setTextColor_(C_FG_PRIMARY)
+    label.setAlignment_(NSTextAlignmentCenter)
+    pill.addSubview_(label)
+    return pill
 
 
 def _build_corner_reticle(

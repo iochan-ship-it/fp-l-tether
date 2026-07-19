@@ -332,6 +332,20 @@ class ExposureSettings:
     file_format_raw: int = 0
     image_size: str = "—"
     image_size_raw: int = 0
+    # Phase 3.22: exposure compensation (DG1.ExpComp, 8-bit APEX in
+    # 1/8-stop units, two's complement). In M mode the camera reports
+    # the metered deviation from AE-correct instead of a user dial.
+    exp_comp: str = "±0"
+    exp_comp_raw: int = 0
+    # Phase 3.22: DG1.BatteryState raw byte. Scale is undocumented in
+    # public sources — the UI renders conservatively (see
+    # battery_label) and logs the raw value for calibration. -1 = not
+    # yet read.
+    battery_raw: int = -1
+    # Phase 3.22c: DG2.ExposureMode (1=P 2=A 3=S 4=M). Surfaced so the
+    # panel can show/set the mode — the body's own mode selection gets
+    # clobbered by the PC-mode template + cache replay on connect.
+    exposure_mode_raw: int = 0
 
     def short(self) -> str:
         """One-line label, e.g. ``ISO 100 · 1/125 · f/2.8 · WB Auto``."""
@@ -607,6 +621,134 @@ def read_focus_point(bridge: "USBBridge") -> tuple[int, int] | None:
     return x, y
 
 
+def expcomp_label(v: int) -> str:
+    """Format DG1.ExpComp (8-bit APEX, 1/8-stop, two's complement).
+
+    0x00 → "±0", +8 → "+1.0", 0xF8 (−8) → "−1.0". Sigma's 1/3-stop
+    ladder uses offsets 3/5/8 within each stop (0.3 / 0.7 / 1.0);
+    half-stop bodies use 4 (0.5).
+    """
+    signed = v - 256 if v > 127 else v
+    if signed == 0:
+        return "±0"
+    sign = "+" if signed > 0 else "−"
+    n = abs(signed)
+    whole, frac_units = divmod(n, 8)
+    frac = {0: 0.0, 3: 0.3, 4: 0.5, 5: 0.7}.get(frac_units)
+    if frac is None:
+        # Non-canonical step — show the exact eighth-stop value.
+        return f"{sign}{n / 8.0:.2f}"
+    return f"{sign}{whole + frac:.1f}"
+
+
+# Standard fp L exposure-compensation ladder: +3 EV → −3 EV in 1/3 steps
+# (dropdown top-to-bottom, matching the body's own dial range).
+# CamCanSetInfo5 doesn't advertise ExpComp codes, so this list is static.
+# Codes are APEX 1/8-stop two's-complement: +1/3 = 0x03, +2/3 = 0x05,
+# +1.0 = 0x08, −1/3 = 0xFD, −1.0 = 0xF8, etc.
+EXP_COMP_CODES: list[int] = [
+    0x18,  # +3.0
+    0x15,  # +2.7
+    0x13,  # +2.3
+    0x10,  # +2.0
+    0x0D,  # +1.7
+    0x0B,  # +1.3
+    0x08,  # +1.0
+    0x05,  # +0.7
+    0x03,  # +0.3
+    0x00,  # ±0
+    0xFD,  # −0.3
+    0xFB,  # −0.7
+    0xF8,  # −1.0
+    0xF5,  # −1.3
+    0xF3,  # −1.7
+    0xF0,  # −2.0
+    0xED,  # −2.3
+    0xEB,  # −2.7
+    0xE8,  # −3.0
+]
+
+
+def exposure_mode_label(v: int) -> str:
+    """DG2.ExposureMode → dial letter (Phase 3.22c).
+
+    sigma-ptpy enum: 1 = Program, 2 = Aperture priority, 3 = Shutter
+    priority, 4 = Manual. 0 / unknown render as an em-dash so the UI
+    can show "not yet read" without inventing a mode.
+    """
+    return {1: "P", 2: "A", 3: "S", 4: "M"}.get(v, "—")
+
+
+# DG2.ExposureMode codes for the in-app mode selector, in dial order.
+# The fp L firmware replays the PC-mode template (and our settings
+# cache) on every USB connect, so a mode set on the body while the
+# app is down gets clobbered — the tether-native way to pick a mode
+# is from the app, which also keeps the cache in sync.
+EXPOSURE_MODE_CODES: tuple[tuple[str, int], ...] = (
+    ("P — Program", 1),
+    ("A — Aperture priority", 2),
+    ("S — Shutter priority", 3),
+    ("M — Manual", 4),
+)
+
+
+def battery_label(raw: int) -> str:
+    """Render DG1.BatteryState as a 3-segment gauge (Phase 3.22b).
+
+    The public scale is undocumented, but the fp L body's own battery
+    indicator is a 3-segment icon, and the DG1 byte most plausibly
+    mirrors it (observed live: raw=1). Small values render as x/3
+    segments (4-5 clamp to full — harmless under either a 3- or
+    5-level hypothesis); 6-100 renders as a percentage in case some
+    firmware reports one; anything else renders empty rather than
+    lying. Field-calibration ongoing — see battery_describe.
+    """
+    if raw == 0:
+        return "▯▯▯"
+    if 1 <= raw <= 5:
+        seg = min(raw, 3)
+        return "▮" * seg + "▯" * (3 - seg)
+    if 6 <= raw <= 100:
+        return f"{raw}%"
+    return ""
+
+
+def battery_level_class(raw: int) -> str:
+    """Coarse severity for UI colouring: ok / low / critical / unknown.
+
+    0 (empty gauge) and single-digit percentages are critical; the
+    bottom segment / ≤25% is low; anything healthy is ok. Unknown
+    values stay unknown so the UI can hide rather than guess.
+    """
+    if raw == 0:
+        return "critical"
+    if raw == 1:
+        return "low"
+    if 2 <= raw <= 5:
+        return "ok"
+    if 6 <= raw <= 100:
+        if raw <= 10:
+            return "critical"
+        if raw <= 25:
+            return "low"
+        return "ok"
+    return "unknown"
+
+
+def battery_describe(raw: int) -> str:
+    """Human-readable battery tooltip, raw value included.
+
+    The raw byte stays visible (in parentheses) because the scale is
+    still being field-calibrated against the body indicator — but the
+    headline is now a plain reading, not a bare number.
+    """
+    if 0 <= raw <= 5:
+        return f"Battery level {min(raw, 3)}/3 (camera raw: {raw})"
+    if 6 <= raw <= 100:
+        return f"Battery {raw}% (camera raw: {raw})"
+    return f"Battery unknown (camera raw: {raw})"
+
+
 def read_exposure(bridge: "USBBridge") -> ExposureSettings:
     """Pull DG1 + DG2 from the camera and decode the displayable fields.
 
@@ -623,6 +765,9 @@ def read_exposure(bridge: "USBBridge") -> ExposureSettings:
     wb_raw = dg2.get("WhiteBalance", 0)
     quality_raw = dg2.get("ImageQuality", 0)
     resolution_raw = dg2.get("Resolution", 0)
+    exp_comp_raw = dg1.get("ExpComp", 0)
+    battery_raw = dg1.get("BatteryState", -1)
+    exposure_mode_raw = dg2.get("ExposureMode", 0)
 
     return ExposureSettings(
         iso=("Auto" if iso_auto else apex_to_iso(iso_raw)),
@@ -638,4 +783,8 @@ def read_exposure(bridge: "USBBridge") -> ExposureSettings:
         file_format_raw=quality_raw,
         image_size=resolution_label(resolution_raw),
         image_size_raw=resolution_raw,
+        exp_comp=expcomp_label(exp_comp_raw),
+        exp_comp_raw=exp_comp_raw,
+        battery_raw=battery_raw,
+        exposure_mode_raw=exposure_mode_raw,
     )
