@@ -241,6 +241,10 @@ class TetherDaemon:
         self._liveview: LiveViewStream | None = None
         # Phase 3.16 (A13): dead-stream restarts this session (cap 3).
         self._lv_restarts: int = 0
+        # Phase 3.21: interval shooting. 0.0 = off. Fires through the
+        # normal snap queue so every safety gate applies unchanged.
+        self._interval_s: float = 0.0
+        self._last_interval_fire: float = 0.0
         # USB keep-alive heartbeat — same lifecycle as the LV stream.
         self._heartbeat: HeartbeatThread | None = None
 
@@ -328,6 +332,25 @@ class TetherDaemon:
             return
         self._snap_queue.put(None)
         self.log.info("snap_requested", source="pc")
+
+    def set_interval(self, seconds: float) -> None:
+        """Enable/disable interval shooting (Phase 3.21). 0 = off.
+
+        The first frame fires on the next idle loop iteration; after
+        that, one shot per ``seconds``, timed from each fire. Runs
+        through the ordinary snap queue, so busy/quiet/recovery gates
+        all apply — an interval can never out-shoot the pipeline.
+        """
+        self._interval_s = max(0.0, float(seconds))
+        self._last_interval_fire = 0.0
+        if self._interval_s > 0:
+            self.log.info("interval_enabled", seconds=self._interval_s)
+            self._emit_status(
+                "ready", f"インターバル撮影: {int(self._interval_s)}秒ごと"
+            )
+        else:
+            self.log.info("interval_disabled")
+            self._emit_status("ready", "インターバル撮影: OFF")
 
     def request_af(self) -> None:
         """Queue a PC-side AF-only drive (no capture). Non-blocking.
@@ -903,6 +926,39 @@ class TetherDaemon:
 
     # ----- main loop ---------------------------------------------------
 
+    def _sweep_orphan_tmp(self) -> None:
+        """Remove leftover atomic-write temp files (Phase 3.21).
+
+        A SIGKILL / power loss mid-write leaks hidden ``.*.tmp`` files
+        into the watch / session folders forever (invisible in Finder,
+        confusing in Lightroom's folder counts). Swept once per daemon
+        start; never raises.
+        """
+        removed = 0
+        try:
+            roots = {
+                Path(str(self.cfg.lightroom.watch_folder)).expanduser(),
+                Path(str(self.cfg.output.root)).expanduser(),
+            }
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                candidates = list(root.glob(".*.tmp"))
+                for sub in root.iterdir():
+                    if sub.is_dir():
+                        candidates.extend(sub.glob(".*.tmp"))
+                for tmp_file in candidates:
+                    try:
+                        tmp_file.unlink()
+                        removed += 1
+                    except OSError:
+                        pass
+        except Exception as e:  # noqa: BLE001
+            self.log.warning("tmp_sweep_failed", error=str(e))
+            return
+        if removed:
+            self.log.info("tmp_sweep_removed", count=removed)
+
     def _run(self) -> None:
         """Worker thread entry point.
 
@@ -921,6 +977,9 @@ class TetherDaemon:
         reconnect_failure_cap = 5
         reconnect_failures = 0
         first_attempt = True
+
+        # Phase 3.21: clean out atomic-write leftovers once per start.
+        self._sweep_orphan_tmp()
 
         while not self._stop_event.is_set():
             if first_attempt:
@@ -1355,6 +1414,26 @@ class TetherDaemon:
                             self.log.error("af_failed", error=str(e))
                             self._emit_status("error", f"AF失敗: {e}")
                         # USBBridgeError / usb.core.USBError propagates → reconnect
+
+                # ----- 1a-int. Interval shooting (Phase 3.21) -----
+                # Enqueue one snap per period while idle. Timed from
+                # the previous FIRE, so slow downloads simply delay
+                # the next frame instead of stacking a backlog.
+                if (
+                    self._interval_s > 0
+                    and t_shot_start is None
+                    and self._snap_queue.empty()
+                ):
+                    _now_int = time.monotonic()
+                    if (
+                        _now_int - self._last_interval_fire
+                        >= self._interval_s
+                    ):
+                        self._last_interval_fire = _now_int
+                        self._snap_queue.put(None)
+                        self.log.info(
+                            "interval_snap", interval_s=self._interval_s,
+                        )
 
                 # ----- 1b. Drain snap queue ONLY if no shot is in flight ---
                 # If we already fired a PC snap and haven't seen its image

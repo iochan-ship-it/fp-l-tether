@@ -65,6 +65,35 @@ def info(
         print(f"  ✗ {e}")
 
 
+_INSTANCE_LOCK = None  # module-global: keeps the flock fd alive
+
+
+def _acquire_single_instance_lock():  # type: ignore[no-untyped-def]
+    """Phase 3.21: refuse a second concurrent daemon.
+
+    Two daemons fight over the single USB interface and last-writer-win
+    the settings cache — a confusing failure for anyone who double-
+    clicks the launcher twice. flock on ~/.fp-l-tether/daemon.lock;
+    the lock dies with the process, so stale locks cannot happen.
+    Returns the open file (keep it referenced) or None if another
+    instance holds the lock.
+    """
+    import fcntl
+
+    lock_dir = Path.home() / ".fp-l-tether"
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        f = open(lock_dir / "daemon.lock", "w")
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        try:
+            f.close()  # type: ignore[possibly-undefined]
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    return f
+
+
 @app.command()
 def start(
     session: str = typer.Option("default", "--session", "-s", help="session name"),
@@ -80,6 +109,14 @@ def start(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Boot the tether daemon. Camera shutter button just works™."""
+    global _INSTANCE_LOCK
+    _INSTANCE_LOCK = _acquire_single_instance_lock()
+    if _INSTANCE_LOCK is None:
+        print(
+            "✗ fp-l-tether は既に起動しています。"
+            "二重起動は USB の取り合いになるため中止しました。"
+        )
+        raise typer.Exit(1)
     cfg = _load(config, verbose)
     # Phase 3.15 (A18): only override snap_mode when the user actually
     # passed a flag. The old ``False`` default was indistinguishable

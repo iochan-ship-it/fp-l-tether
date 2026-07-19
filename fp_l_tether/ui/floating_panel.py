@@ -67,6 +67,7 @@ from AppKit import (
     NSKernAttributeName,
     NSMakeRect,
     NSMakeSize,
+    NSMenu,
     NSMenuItem,
     NSMutableParagraphStyle,
     NSPanel,
@@ -82,6 +83,7 @@ from AppKit import (
     NSTitledWindowMask,
     NSUtilityWindowMask,
     NSView,
+    NSWorkspace,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorFullScreenAuxiliary,
     NSWindowCollectionBehaviorStationary,
@@ -91,7 +93,16 @@ from AppKit import (
     NSWindowStyleMaskTitled,
     NSWindowStyleMaskUtilityWindow,
 )
-from Foundation import NSAttributedString, NSData, NSObject, NSPointInRect, NSTimer
+from pathlib import Path
+
+from Foundation import (
+    NSAttributedString,
+    NSData,
+    NSObject,
+    NSPointInRect,
+    NSTimer,
+    NSURL,
+)
 
 # Font-weight constants — usually exported from AppKit, but the names
 # vary by PyObjC version. Use the documented literal values so the
@@ -331,8 +342,14 @@ class FloatingTetherPanel(NSObject):
         # Phase 3.20d: while > now, the LV staleness watchdog leaves the
         # veil down (post-save quiet window = frames expected to stall).
         self._suppress_stale_until: float = 0.0
+        # Phase 3.21: save-confirmation footer flash + last raw status
+        # message (surfaced for error states instead of being dropped).
+        self._flash_text: str = ""
+        self._flash_until: float = 0.0
+        self._last_status_message: str = ""
 
         self._build_window()
+        self._install_context_menu()
         self._wire_callbacks()
         self._install_hotkeys()
         self._install_lv_staleness_watch()
@@ -517,14 +534,44 @@ class FloatingTetherPanel(NSObject):
         content.addSubview_(self._status_label)
 
         # Shot counter — right-aligned, mono digits, tertiary colour.
+        # Phase 3.21: narrowed to make room for the gear button.
         self._shot_label = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(LV_X + LV_WIDTH - 110, STATUS_Y, 110, STATUS_H)
+            NSMakeRect(LV_X + LV_WIDTH - 24 - 86, STATUS_Y, 86, STATUS_H)
         )
         _make_label(self._shot_label, "0 shots")
         self._shot_label.setFont_(F_NUMERIC)
         self._shot_label.setTextColor_(C_FG_TERTIARY)
         self._shot_label.setAlignment_(NSTextAlignmentRight)
         content.addSubview_(self._shot_label)
+
+        # Phase 3.21: a VISIBLE entrance to Preferences. Hotkeys are a
+        # power-user layer — a fresh install must be explorable with a
+        # mouse alone. Monochrome SF Symbol, tertiary tint, tooltip
+        # teaches the shortcut.
+        gear = NSButton.alloc().initWithFrame_(
+            NSMakeRect(LV_X + LV_WIDTH - 18, STATUS_Y - 1, 18, STATUS_H + 2)
+        )
+        gear.setBordered_(False)
+        _gear_img = None
+        try:
+            _gear_img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+                "gearshape", "Preferences"
+            )
+        except Exception:  # noqa: BLE001 — pre-11 AppKit
+            _gear_img = None
+        if _gear_img is not None:
+            gear.setImage_(_gear_img)
+            try:
+                gear.setContentTintColor_(C_FG_TERTIARY)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            gear.setTitle_("\u2699\ufe0e")  # text-presentation gear glyph
+        gear.setTarget_(self)
+        gear.setAction_("prefsButtonClicked:")
+        gear.setToolTip_("Preferences (\u2318,)")
+        content.addSubview_(gear)
+        self._gear_btn = gear
 
         # ----- Exposure hero block ---------------------------------
         # Top + bottom 1pt strokes; label row (uppercase) above value
@@ -771,6 +818,7 @@ class FloatingTetherPanel(NSObject):
         the UI never shows the raw machine name to the user.
         """
         state, message = tup
+        self._last_status_message = str(message or "")
         # Phase 3.20: remember the raw daemon state — the busy gate is
         # binary, but snap-queueing during busy is only safe in the
         # active-capture states (see _may_queue_snap).
@@ -820,6 +868,109 @@ class FloatingTetherPanel(NSObject):
             "shooting", "downloading", "focusing",
         )
 
+    @objc.python_method
+    def _install_context_menu(self) -> None:
+        """Right-click menu over the whole panel (Phase 3.21).
+
+        Every action lists its keyboard shortcut, so the menu doubles
+        as the discoverability layer for the hotkey set — a fresh
+        install can drive everything by mouse and LEARN the keys in
+        passing. macOS-native NSMenu, no custom chrome (質実剛健).
+        """
+        menu = NSMenu.alloc().initWithTitle_("fp-l-tether")
+
+        def add(title, action, key="", mask=0):  # noqa: ANN001
+            item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                title, action, key
+            )
+            if key:
+                item.setKeyEquivalentModifierMask_(mask)
+            item.setTarget_(self)
+            menu.addItem_(item)
+            return item
+
+        add("Shoot  (Space)", "shootClicked:")
+        add("Focus  (A)", "afClicked:")
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("Histogram", "menuToggleHistogram:", "h", 0)
+        add("Grid", "menuCycleGrid:", "g", 0)
+        add("Detach / Reattach LV", "menuToggleDetach:", "d",
+            NSEventModifierFlagCommand)
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Interval shooting submenu (Phase 3.21) — a tether staple for
+        # product / repro work. Daemon-side timer feeds the normal
+        # snap queue, so every safety gate applies unchanged.
+        interval_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Interval Shooting", None, ""
+        )
+        interval_menu = NSMenu.alloc().initWithTitle_("Interval")
+        self._interval_items = {}
+        for label, secs in (
+            ("Off", 0), ("5 s", 5), ("10 s", 10), ("30 s", 30), ("60 s", 60),
+        ):
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "menuIntervalSelect:", ""
+            )
+            it.setTarget_(self)
+            it.setTag_(secs)
+            interval_menu.addItem_(it)
+            self._interval_items[secs] = it
+        self._interval_items[0].setState_(1)
+        interval_root.setSubmenu_(interval_menu)
+        menu.addItem_(interval_root)
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("Reveal Shots Folder in Finder", "menuRevealShots:")
+        add("Preferences\u2026", "menuOpenPrefs:", ",",
+            NSEventModifierFlagCommand)
+        menu.addItem_(NSMenuItem.separatorItem())
+        add("Quit fp-l-tether", "menuQuit:", "q", NSEventModifierFlagCommand)
+
+        self._panel.contentView().setMenu_(menu)
+        self._context_menu = menu
+
+    def prefsButtonClicked_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._open_preferences()
+
+    def menuToggleHistogram_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._toggle_histogram()
+
+    def menuCycleGrid_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._cycle_grid()
+
+    def menuToggleDetach_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._toggle_lv_detached()
+
+    def menuOpenPrefs_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._open_preferences()
+
+    def menuQuit_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self.stop()
+
+    def menuIntervalSelect_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        secs = int(sender.tag())
+        try:
+            self._daemon.set_interval(float(secs))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("set_interval failed: %s", e)
+            return
+        for s_key, item in self._interval_items.items():
+            item.setState_(1 if s_key == secs else 0)
+
+    def menuRevealShots_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        """Open the folder the NEXT shot will land in (Phase 3.21)."""
+        try:
+            if self._cfg.lightroom.mode == "watch":
+                folder = Path(str(self._cfg.lightroom.watch_folder)).expanduser()
+            else:
+                folder = Path(str(self._cfg.output.root)).expanduser()
+            folder.mkdir(parents=True, exist_ok=True)
+            NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(
+                [NSURL.fileURLWithPath_(str(folder))]
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("reveal_in_finder_failed: %s", e)
+
     def _set_overlay_label(self, text: str) -> None:
         """Set the LV pause-overlay caption (Phase 3.15).
 
@@ -838,6 +989,15 @@ class FloatingTetherPanel(NSObject):
         Default reads ``␣ shoot · A/⌘A focus · ⌘Q quit`` (the keymap).
         During capture / recovery it switches to a guidance string.
         """
+        # Phase 3.21: a just-saved flash outranks the keymap (but
+        # never outranks error / recovery guidance).
+        if (
+            time.monotonic() < getattr(self, "_flash_until", 0.0)
+            and state not in ("error", "disconnected", "recovering")
+        ):
+            self._hint_label.setStringValue_(self._flash_text)
+            self._hint_label.setTextColor_(C_AMBER)
+            return
         if state in ("shooting", "downloading"):
             text = "Camera busy — release space to wait"
             color = C_STATE_BUSY
@@ -845,7 +1005,13 @@ class FloatingTetherPanel(NSObject):
             text = "Settings preserved · auto-resume"
             color = C_STATE_RECOVER
         elif state == "error" or state == "disconnected":
-            text = "Quit and relaunch after power cycle"
+            # Phase 3.21: show the daemon's actual message — the
+            # generic power-cycle line hid WHAT went wrong.
+            msg = getattr(self, "_last_status_message", "")
+            if msg:
+                text = msg if len(msg) <= 64 else (msg[:63] + "\u2026")
+            else:
+                text = "Quit and relaunch after power cycle"
             color = C_STATE_ERROR
         else:
             detach_word = "reattach" if self._lv_window is not None else "detach"
@@ -956,11 +1122,31 @@ class FloatingTetherPanel(NSObject):
         the default view per the v2 mockup — only the count remains.
         The detail still flows through the daemon's structured log.
         """
-        idx, _name, _size, _mbps = tup
+        idx, name, size, _mbps = tup
         self._shot_count = max(int(idx), self._shot_count + 1)
         plural = "shot" if self._shot_count == 1 else "shots"
         self._shot_label.setStringValue_(f"{self._shot_count} {plural}")
         self._shot_label.setTextColor_(C_FG_SECONDARY)
+
+        # Phase 3.21: save-confirmation flash. For a few seconds the
+        # footer shows exactly WHAT was saved — the "did that actually
+        # take?" glance no longer needs Lightroom or a log window.
+        try:
+            size_mb = float(size) / (1024 * 1024)
+            self._flash_text = f"\u2713 #{int(idx)}  {name}  \u00b7  {size_mb:.1f} MB"
+        except Exception:  # noqa: BLE001
+            self._flash_text = f"\u2713 #{int(idx)}  {name}"
+        self._flash_until = time.monotonic() + 4.0
+        self._refresh_hint(getattr(self, "_last_daemon_state", "ready"))
+        try:
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                4.2, False,
+                lambda _t: self._refresh_hint(
+                    getattr(self, "_last_daemon_state", "")
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     @objc.signature(b"v@:@")
     def updateExposure_(self, tup) -> None:
