@@ -96,6 +96,7 @@ from AppKit import (
 from pathlib import Path
 
 from Foundation import (
+    NSAffineTransform,
     NSAttributedString,
     NSData,
     NSObject,
@@ -154,6 +155,7 @@ from fp_l_tether.storage import (
 from fp_l_tether.ui.grid_overlay import GridOverlayView, cycle_mode as _grid_cycle
 from fp_l_tether.ui.histogram_view import HistogramView
 from fp_l_tether.ui.lv_attached_pane import LVDetachedPlaceholder
+from fp_l_tether.ui.lv_geometry import fit_rect, rotate_forward, rotate_inverse
 from fp_l_tether.ui.lv_window import LVDetachedWindow
 from fp_l_tether.ui.preferences_window import PreferencesWindow
 
@@ -379,6 +381,14 @@ class FloatingTetherPanel(NSObject):
         # default. _review_view is lazily created on the first shot.
         self._lv_zoom: int = 0
         self._zoom_hist_was_visible: bool = False
+        # Phase 3.23: manual LV rotation, clockwise degrees applied to
+        # the displayed frame (0 / 90 / 180 / 270). The fp L exposes no
+        # attitude data over PTP (confirmed Phase 3.11c) AND its LV
+        # stream is always sensor-native landscape, so a body turned to
+        # portrait shows the subject lying on its side. Nothing can
+        # detect that for us — the user picks the rotation with R.
+        # AF click / reticle mapping is transformed to match.
+        self._lv_rotation: int = 0
         self._review_view = None
         self._review_token: int = 0
         self._last_battery_raw: int | None = None
@@ -1025,6 +1035,34 @@ class FloatingTetherPanel(NSObject):
         add("Histogram", "menuToggleHistogram:", "h", 0)
         add("Grid", "menuCycleGrid:", "g", 0)
         add("Focus Zoom ×4 / ×8", "menuToggleZoom:", "z", 0)
+
+        # LV rotation submenu (Phase 3.23). The fp L streams live view
+        # sensor-native landscape whatever way the body is held, and
+        # publishes no attitude data over PTP — so shooting portrait
+        # puts the subject on its side and only the user can say which
+        # way is up. R cycles; the submenu is for picking directly.
+        rot_root = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "LV Rotation", None, ""
+        )
+        rot_menu = NSMenu.alloc().initWithTitle_("LV Rotation")
+        self._rotation_items = {}
+        for label, deg in (
+            ("0°  (landscape)", 0),
+            ("90° CW  (R)", 90),
+            ("180°", 180),
+            ("270° CW", 270),
+        ):
+            it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                label, "menuRotationSelect:", ""
+            )
+            it.setTarget_(self)
+            it.setTag_(deg)
+            rot_menu.addItem_(it)
+            self._rotation_items[deg] = it
+        self._rotation_items[0].setState_(1)
+        rot_root.setSubmenu_(rot_menu)
+        menu.addItem_(rot_root)
+
         add("Detach / Reattach LV", "menuToggleDetach:", "d",
             NSEventModifierFlagCommand)
         menu.addItem_(NSMenuItem.separatorItem())
@@ -1071,6 +1109,9 @@ class FloatingTetherPanel(NSObject):
 
     def menuToggleZoom_(self, sender) -> None:  # type: ignore[no-untyped-def]
         self._toggle_focus_zoom()
+
+    def menuRotationSelect_(self, sender) -> None:  # type: ignore[no-untyped-def]
+        self._set_lv_rotation(int(sender.tag()))
 
     def menuToggleDetach_(self, sender) -> None:  # type: ignore[no-untyped-def]
         self._toggle_lv_detached()
@@ -1653,9 +1694,13 @@ class FloatingTetherPanel(NSObject):
         ny = (cam_y - y_min) / max(1, (y_max - y_min))
         nx = max(0.0, min(1.0, nx))
         ny = max(0.0, min(1.0, ny))
+        # Phase 3.23 — the displayed frame may be turned 90/180/270°;
+        # the reticle has to travel with the picture, not the sensor.
+        nx, ny = self._rot_fwd(nx, ny)
         lv = self._live_view.frame()
-        vx = lv.origin.x + nx * lv.size.width
-        vy = lv.origin.y + (1.0 - ny) * lv.size.height  # flip Y (AppKit Y goes up)
+        ox, oy, fw, fh = self.lv_fit_rect(lv.size.width, lv.size.height)
+        vx = lv.origin.x + ox + nx * fw
+        vy = lv.origin.y + oy + (1.0 - ny) * fh  # flip Y (AppKit Y goes up)
         return vx, vy
 
     @objc.signature(b"v@:@")
@@ -1713,6 +1758,10 @@ class FloatingTetherPanel(NSObject):
             zoomed = self._zoom_crop(image, width, height)
             if zoomed is not None:
                 image = zoomed
+        # Phase 3.23 — manual rotation LAST, so the zoom crop above
+        # keeps working in unrotated camera coords (where _focus_xy
+        # lives) and only the presentation is turned.
+        image = self._rotate_image(image)
         self._live_view.setImage_(image)
 
         # Push the side-channel histogram snapshot into the bottom-strip
@@ -2124,6 +2173,114 @@ class FloatingTetherPanel(NSObject):
             return out
         except Exception:  # noqa: BLE001
             return None
+
+    # ----- LV rotation (Phase 3.23) -----------------------------------
+
+    def _cycle_lv_rotation(self) -> None:
+        """Hotkey R — rotate the LV 90° clockwise, cycling back to 0°.
+
+        Why manual: the fp L's live-view stream is always delivered in
+        sensor-native landscape and the body publishes no attitude /
+        level data over PTP (Phase 3.11c settled that — it isn't in
+        any DataGroup), so there is nothing to auto-detect from. One
+        keystroke per quarter-turn is the honest UI.
+        """
+        self._set_lv_rotation((self._lv_rotation + 90) % 360)
+
+    def _set_lv_rotation(self, degrees: int) -> None:
+        degrees = int(degrees) % 360
+        if degrees not in (0, 90, 180, 270) or degrees == self._lv_rotation:
+            return
+        self._lv_rotation = degrees
+        # Menu checkmarks + reticle follow immediately; the image
+        # itself picks it up on the next LV frame (≤100 ms at 10 fps).
+        for deg, item in getattr(self, "_rotation_items", {}).items():
+            item.setState_(1 if deg == degrees else 0)
+        self._reposition_af_marker()
+        try:
+            self._hint_label.setStringValue_(
+                f"LV rotation: {degrees}°    R rotate · ␣ shoot · "
+                f"A focus · Z zoom · ⌘D detach"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _rotate_image(self, image):  # type: ignore[no-untyped-def]
+        """Return ``image`` rotated ``self._lv_rotation`` degrees clockwise.
+
+        Returns the input unchanged at 0° (the common case — no
+        per-frame allocation when rotation is off) and on any failure,
+        so a bad rotate degrades to an unrotated LV rather than a
+        frozen one.
+        """
+        deg = self._lv_rotation
+        if not deg:
+            return image
+        try:
+            isz = image.size()
+            w = float(isz.width)
+            h = float(isz.height)
+            if w <= 0 or h <= 0:
+                return image
+            swapped = deg in (90, 270)
+            out_w, out_h = (h, w) if swapped else (w, h)
+            out = NSImage.alloc().initWithSize_(NSMakeSize(out_w, out_h))
+            out.lockFocus()
+            try:
+                xform = NSAffineTransform.transform()
+                # Rotate about the destination centre, then step back
+                # by half the SOURCE size so the drawn rect lands
+                # centred. AppKit's rotateByDegrees_ is CCW-positive,
+                # so a clockwise turn is a negative angle.
+                xform.translateXBy_yBy_(out_w / 2.0, out_h / 2.0)
+                xform.rotateByDegrees_(-deg)
+                xform.translateXBy_yBy_(-w / 2.0, -h / 2.0)
+                xform.concat()
+                image.drawInRect_fromRect_operation_fraction_(
+                    NSMakeRect(0, 0, w, h),
+                    NSMakeRect(0, 0, w, h),
+                    _NS_COMPOSITE_COPY,
+                    1.0,
+                )
+            finally:
+                out.unlockFocus()
+            return out
+        except Exception:  # noqa: BLE001
+            return image
+
+    def _rot_fwd(self, nx: float, ny: float) -> tuple[float, float]:
+        """Image-normalised (x right, y down) → displayed-normalised."""
+        return rotate_forward(self._lv_rotation, nx, ny)
+
+    def _rot_inv(self, dx: float, dy: float) -> tuple[float, float]:
+        """Displayed-normalised → image-normalised. Inverse of _rot_fwd."""
+        return rotate_inverse(self._lv_rotation, dx, dy)
+
+    def lv_fit_rect(
+        self, container_w: float, container_h: float
+    ) -> tuple[float, float, float, float]:
+        """Where the LV image actually lands inside a container rect.
+
+        ``NSImageScaleProportionallyUpOrDown`` centres the frame and
+        letterboxes the remainder, so view coords are NOT image coords
+        whenever the aspect ratios differ. That was a small error
+        before (LV JPEG vs the 288×200 viewport); with a 90° rotation
+        it becomes a large one — a portrait frame in a landscape box
+        is mostly black bar, and an AF click in the bar used to map to
+        a bogus sensor coord. Returns (ox, oy, w, h) in the
+        container's own coordinate space, origin bottom-left.
+        """
+        fallback = (0.0, 0.0, container_w, container_h)
+        try:
+            img = self._live_view.image()
+            if img is None:
+                return fallback
+            isz = img.size()
+            return fit_rect(
+                container_w, container_h, float(isz.width), float(isz.height)
+            )
+        except Exception:  # noqa: BLE001
+            return fallback
 
     # ----- live-view staleness watchdog -------------------------------
 
@@ -2793,6 +2950,10 @@ class FloatingTetherPanel(NSObject):
             if key == "z":
                 self._toggle_focus_zoom()
                 return None  # consume
+            # Phase 3.23 — rotate LV 90° CW per press (portrait shooting).
+            if key == "r":
+                self._cycle_lv_rotation()
+                return None  # consume
             return event
 
         # Local monitor (when our panel has focus) — returns event or None
@@ -3201,6 +3362,15 @@ class LiveViewImageView(NSImageView):
         # in-range AF point.
         nx = max(0.0, min(1.0, local.x / max(1.0, w)))
         ny = max(0.0, min(1.0, 1.0 - local.y / max(1.0, h)))  # flip Y
+        # Phase 3.23 — undo any manual LV rotation before handing the
+        # point to the camera: the user clicks what they SEE, the
+        # camera only understands sensor-native coords.
+        try:
+            nx, ny = self._owner._rot_inv(nx, ny)
+        except Exception:  # noqa: BLE001
+            pass
+        nx = max(0.0, min(1.0, nx))
+        ny = max(0.0, min(1.0, ny))
         cam_x = int(round(nx * (x_max - x_min) + x_min))
         cam_y = int(round(ny * (y_max - y_min) + y_min))
         self._owner.commit_focus_point(cam_x, cam_y)

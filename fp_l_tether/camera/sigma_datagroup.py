@@ -34,6 +34,7 @@ need re-derivation): ExpComp (DG1 bit 0x2000), DriveMode (DG2 bit
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -266,6 +267,15 @@ def apex_to_shutter(v: int) -> str:
     return f"1/{nearest}"
 
 
+# Canonical 1/3-stop f-number series (ISO 517 / the numbers printed on
+# lens barrels). Used to label aperture bytes — see apex_to_aperture.
+_CANONICAL_APERTURES: tuple[float, ...] = (
+    1.0, 1.1, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.5, 2.8, 3.2, 3.5,
+    4.0, 4.5, 5.0, 5.6, 6.3, 7.1, 8.0, 9.0, 10.0, 11.0, 13.0, 14.0,
+    16.0, 18.0, 20.0, 22.0, 25.0, 29.0, 32.0, 36.0, 40.0, 45.0,
+)
+
+
 def apex_to_aperture(v: int) -> str:
     """Format Sigma APEX 8-bit aperture as ``f/2.8``.
 
@@ -275,9 +285,14 @@ def apex_to_aperture(v: int) -> str:
     if v == 0x00:
         return "—"
     f_number = 2.0 ** ((v - 0x08) / 16.0)
-    if f_number < 10:
-        return f"f/{f_number:.1f}"
-    return f"f/{f_number:.0f}"
+    # Snap to the canonical 1/3-stop f-number series the way
+    # apex_to_iso does for ISO — the raw powers of 2 land on values no
+    # photographer writes ("f/5.7", "f/23"). Nearest in LOG space, so
+    # the choice is stop-symmetric rather than biased to big numbers.
+    nearest = min(_CANONICAL_APERTURES, key=lambda c: abs(math.log(c / f_number)))
+    if nearest >= 10 or float(nearest).is_integer():
+        return f"f/{nearest:g}"
+    return f"f/{nearest:.1f}"
 
 
 def apex_to_iso(v: int) -> str:
@@ -498,6 +513,25 @@ def _tv256_to_shutter_byte(tv256: int) -> int:
     return max(0, min(0xFF, round(0x38 + tv256 / 32)))
 
 
+def _av256_to_aperture_byte(av256: int) -> int:
+    """Convert sigma-ptpy Av*256 to our DG1 APEX byte (8 per Av, f/1.0=0x08).
+
+    Av = 2·log2(f), so one Av unit is HALF an f-number doubling while
+    our byte uses 16 per doubling — i.e. 8 per Av, exactly like the
+    shutter and ISO converters above. byte = 0x08 + av256/32.
+
+    Live check against fp L V90 + a 2.8–22 lens (2026-08-16 dump):
+    FValue = [768, 2304, 85] ⇒ 768/32+8 = 0x20 = f/2.8 (wide open),
+    2304/32+8 = 0x50 = f/22 (minimum), step 85 ≈ 1/3 stop.
+
+    Phase 3.23 bugfix: this used to divide by 16, which doubled the
+    exponent and SQUARED every f-number — the f/2.8–f/22 range above
+    rendered as f/8–f/512, so the widest aperture the user could pick
+    from the panel was f/8.
+    """
+    return max(0, min(0xFF, round(0x08 + av256 / 32)))
+
+
 def _default_aperture_codes() -> list[int]:
     """Synthesised aperture list when the lens/camera doesn't report one.
 
@@ -544,10 +578,8 @@ def parse_can_set_info5(buf: bytes) -> CanSetInfo:
     if av is not None and isinstance(av.value, list) and len(av.value) >= 3:
         mn, mx = av.value[0], av.value[1]
         step = av.value[-1]
-        # Aperture: Av step is the same 256-per-stop scale; our byte uses
-        # 16 per stop with baseline 0x08 = f/1.0.
         codes = [
-            max(0, min(0xFF, round(0x08 + v / 16)))
+            _av256_to_aperture_byte(v)
             for v in _expand_range_in_thirds(mn, mx, step)
         ]
         info.aperture_codes = list(dict.fromkeys(codes))
